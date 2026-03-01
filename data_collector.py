@@ -12,6 +12,12 @@ from sports_db import (
     get_team_id, init_database
 )
 
+# optional NHL helper library for newer API endpoints
+try:
+    from nhlpy import NHLClient
+except ImportError:  # package not installed, we'll fall back to raw HTTP
+    NHLClient = None
+
 
 class SportDataCollector:
     """Collects sports data from various APIs."""
@@ -126,47 +132,126 @@ class SportDataCollector:
     
     def collect_nhl_data(self, season=2024):
         """
-        Collect NHL hockey data using free NHL API.
-        NHL provides excellent free public API with no authentication needed.
+        Collect NHL hockey data using the `nhlpy` helper package if available.
+        The wrapper hides the details of the underlying NHL endpoints and
+        provides higher‑level helpers for teams, schedules, stats, etc.
+
+        If `nhlpy` isn't installed we fall back to the original direct HTTP
+        requests against `statsapi.web.nhl.com` (which may be subject to DNS
+        issues as you've experienced).
         """
         print(f"Collecting NHL data for season {season}...")
-        
-        # Initialize database
+
+        # Make sure the database exists
         init_database()
-        
+
+        nhl_teams = {}
         try:
-            base_url = "https://statsapi.web.nhl.com/api/v1"
-            
-            # Get all NHL teams
-            teams_url = f"{base_url}/teams"
-            response = requests.get(teams_url)
-            response.raise_for_status()
-            teams_data = response.json()
-            
-            # Add teams to database
-            nhl_teams = {}
-            for team in teams_data['teams']:
-                if team['active']:
+            if NHLClient is not None:
+                # use nhlpy for all calls
+                client = NHLClient()
+
+                print("Fetching NHL teams via nhlpy...")
+                teams_list = client.teams.teams()
+
+                # teams_list is a simple list of team dicts
+                for t in teams_list:
+                    # name, abbreviation, maybe country
+                    country = t.get("country", "USA/Canada")
                     team_id = add_team(
-                        name=team['name'],
-                        sport='Hockey',
-                        league='NHL',
-                        country='USA/Canada'
+                        name=t.get("name", ""),
+                        sport="Hockey",
+                        league="NHL",
+                        country=country,
                     )
-                    nhl_teams[team['id']] = team_id
-            
-            print(f"Added {len(nhl_teams)} NHL teams to database")
-            
-            # Get games for the season
-            # Note: Free NHL API has limited historical odds data
-            print("⚠️  Note: NHL API provides game results but limited betting odds.")
-            print("   For historical betting lines, consider purchasing from:")
-            print("   - Sports-Reference.com")
-            print("   - Covers.com (web scraping required)")
-            print("   - The Odds API (paid tier)")
-            
-            return True
-            
+                    # store by abbreviation so we can look teams up later
+                    nhl_teams[t.get("abbr")] = team_id
+                    print(f"  Added: {t.get('name')} ({t.get('abbr')})")
+
+                print(f"\n✓ Added {len(nhl_teams)} NHL teams to database")
+
+                # optionally pull schedule/games for the season; nhlpy exposes
+                # several helper methods, e.g. calendar_schedule() for a given
+                # date or team_season_schedule(team_abbr, season_str).
+                # We'll fetch the full season schedule for each team and insert
+                # matches/results where available, similar to the old code.
+
+                season_str = f"{season}{season+1:04d}"
+                print(f"Fetching season schedules ({season_str})...")
+
+                games_added = 0
+                for abbr, team_db_id in nhl_teams.items():
+                    sched = client.schedule.team_season_schedule(
+                        team_abbr=abbr, season=season_str
+                    )
+
+                    # sched is a dict containing a 'games' list
+                    for game in sched.get("games", []):
+                        home = game.get("homeTeam")
+                        away = game.get("awayTeam")
+                        # map abbreviation to our database id
+                        home_id = nhl_teams.get(home.get("abbr"))
+                        away_id = nhl_teams.get(away.get("abbr"))
+                        if not home_id or not away_id:
+                            continue
+
+                        status = "completed" if game.get("gameState") in [
+                            "FINAL", "LIVE"
+                        ] else "scheduled"
+
+                        match_date = game.get("startTimeUTC")
+                        match_id = add_match(
+                            sport="Hockey",
+                            league="NHL",
+                            season=season,
+                            home_team_id=home_id,
+                            away_team_id=away_id,
+                            match_date=match_date,
+                            status=status,
+                        )
+
+                        # update result if finished
+                        if status == "completed":
+                            home_score = home.get("score", 0)
+                            away_score = away.get("score", 0)
+                            update_match_result(
+                                match_id, home_score=home_score, away_score=away_score
+                            )
+
+                        games_added += 1
+
+                print(f"✓ Added {games_added} NHL games from schedules")
+                print(
+                    "\n⚠️  Note: nhlpy (and the NHL API) still do not provide "
+                    "betting odds.  You'll need a separate source for lines."
+                )
+
+                return True
+
+            else:
+                # fallback to raw HTTP call if nhlpy not installed
+                print("nhlpy not available; falling back to direct NHL API")
+                base_url = "https://statsapi.web.nhl.com/api/v1"
+
+                teams_url = f"{base_url}/teams"
+                response = requests.get(teams_url)
+                response.raise_for_status()
+                teams_data = response.json()
+
+                for team in teams_data["teams"]:
+                    if team.get("active"):
+                        team_id = add_team(
+                            name=team.get("name"),
+                            sport="Hockey",
+                            league="NHL",
+                            country="USA/Canada",
+                        )
+                        nhl_teams[team["id"]] = team_id
+
+                print(f"Added {len(nhl_teams)} NHL teams to database")
+                print("⚠️  Note: NHL API provides game results but limited betting odds.")
+                return True
+
         except Exception as e:
             print(f"Error collecting NHL data: {e}")
             return False

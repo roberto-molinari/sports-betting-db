@@ -71,10 +71,24 @@ headers = {
 
 #### Option B: NHL API (Free, No Auth Required)
 
+The repository now supports the `nhl-api-py` package (imported as `nhlpy`),
+which wraps the official NHL web endpoints and handles rate‑limits and
+pagination for you. Install it in your virtual environment:
+
+```bash
+pip install nhl-api-py
+```
+
+Once the package is available the collector will automatically use it when
+fetching teams and schedules.  Usage remains the same:
+
 ```python
 collector = SportDataCollector()
 collector.collect_nhl_data(season=2024)
 ```
+
+If `nhlpy` is not installed the code falls back to the older `requests`
+implementation against `statsapi.web.nhl.com`.
 
 #### Option C: Manual Data Import
 

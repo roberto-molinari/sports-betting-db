@@ -110,6 +110,8 @@ def main():
    
    For NHL (Hockey):
    - NHL API is free at https://statsapi.web.nhl.com/api/v1
+   - optionally install `nhl-api-py` (imported as `nhlpy`) for easier
+     access to the latest endpoints
    - Run: collector.collect_nhl_data(season=2024)
 
 2. ADD HISTORICAL BETTING ODDS:
