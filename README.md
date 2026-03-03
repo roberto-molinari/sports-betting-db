@@ -90,6 +90,30 @@ collector.collect_nhl_data(season=2024)
 If `nhlpy` is not installed the code falls back to the older `requests`
 implementation against `statsapi.web.nhl.com`.
 
+##### Load Historical NHL Game Results
+
+To build a database of past NHL games with scores (e.g., for analysis and backtesting),
+use the dedicated historical data collection method:
+
+```python
+from data_collector import SportDataCollector
+
+collector = SportDataCollector()
+
+# Load the last 2 complete seasons (2023-2024 and 2024-2025)
+# This inserts ~5,800 completed games with final scores
+collector.collect_nhl_historical_data()
+
+# Or specify custom seasons
+collector.collect_nhl_historical_data(seasons=['20232024', '20242025', '20212022'])
+```
+
+**Note:** 
+- Requires `nhl-api-py` (install with: `pip install nhl-api-py`)
+- Seasons are specified in `YYYYYYYY` format (e.g., `20242025` for 2024–2025)
+- Only completed games with final scores are inserted into the `matches` table
+- Existing games are skipped gracefully, so you can safely re-run the method
+
 #### Option C: Manual Data Import
 
 You can also manually import historical data using CSV:

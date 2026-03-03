@@ -256,6 +256,142 @@ class SportDataCollector:
             print(f"Error collecting NHL data: {e}")
             return False
     
+    def collect_nhl_historical_data(self, seasons=None):
+        """
+        Collect and insert NHL game results from historical seasons.
+        By default fetches the past 2 complete seasons (2023-2024 and 2024-2025).
+        
+        Args:
+            seasons (list): List of season strings in YYYYYYYY format
+                           (e.g., ['20232024', '20242025']).
+                           If None, defaults to past 2 seasons.
+        
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        if seasons is None:
+            # Default: fetch last 2 complete seasons
+            # Current date is March 2026, so past 2 complete seasons are
+            # 2023-2024 and 2024-2025
+            seasons = ['20232024', '20242025']
+        
+        print(f"\nCollecting historical NHL data for seasons: {seasons}")
+        init_database()
+        
+        try:
+            if NHLClient is None:
+                print("⚠️  nhlpy not available; cannot collect historical data")
+                return False
+            
+            client = NHLClient()
+            
+            # Fetch all teams once (reuse across seasons)
+            print("Fetching NHL teams...")
+            teams_list = client.teams.teams()
+            nhl_teams_by_abbr = {}
+            
+            for t in teams_list:
+                abbr = t.get('abbr')
+                name = t.get('name', '')
+                country = t.get('country', 'USA/Canada')
+                
+                # Try to get existing team or add new one
+                team_id = get_team_id(name)
+                if team_id is None:
+                    team_id = add_team(
+                        name=name,
+                        sport='Hockey',
+                        league='NHL',
+                        country=country
+                    )
+                    print(f"  Added: {name}")
+                else:
+                    print(f"  Found existing: {name}")
+                
+                nhl_teams_by_abbr[abbr] = team_id
+            
+            print(f"✓ Total {len(nhl_teams_by_abbr)} NHL teams in database\n")
+            
+            # For each season, fetch all team schedules
+            total_games_added = 0
+            for season_str in seasons:
+                print(f"Fetching schedules for season {season_str}...")
+                season_int = int(season_str[:4])
+                games_this_season = 0
+                
+                # Fetch schedule for each team
+                for abbr, team_id in nhl_teams_by_abbr.items():
+                    try:
+                        sched = client.schedule.team_season_schedule(
+                            team_abbr=abbr, season=season_str
+                        )
+                        
+                        for game in sched.get('games', []):
+                            # Only insert completed games with results
+                            game_state = game.get('gameState', '')
+                            if game_state not in ['FINAL', 'OFF']:
+                                # Skip unfinished games
+                                continue
+                            
+                            home_team = game.get('homeTeam', {})
+                            away_team = game.get('awayTeam', {})
+                            
+                            home_abbr = home_team.get('abbrev')
+                            away_abbr = away_team.get('abbrev')
+                            
+                            home_id = nhl_teams_by_abbr.get(home_abbr)
+                            away_id = nhl_teams_by_abbr.get(away_abbr)
+                            
+                            if not home_id or not away_id:
+                                continue
+                            
+                            match_date = game.get('startTimeUTC')
+                            home_score = home_team.get('score')
+                            away_score = away_team.get('score')
+                            
+                            # Skip if scores are missing
+                            if home_score is None or away_score is None:
+                                continue
+                            
+                            try:
+                                match_id = add_match(
+                                    sport='Hockey',
+                                    league='NHL',
+                                    season=season_int,
+                                    home_team_id=home_id,
+                                    away_team_id=away_id,
+                                    match_date=match_date,
+                                    status='completed'
+                                )
+                                
+                                # Insert final score
+                                update_match_result(
+                                    match_id,
+                                    home_score=home_score,
+                                    away_score=away_score
+                                )
+                                
+                                games_this_season += 1
+                            except Exception as e:
+                                # Handle duplicate matches gracefully
+                                if 'UNIQUE constraint failed' in str(e):
+                                    pass  # Already in database
+                                else:
+                                    print(f"  Error adding match: {e}")
+                    
+                    except Exception as e:
+                        print(f"  Error fetching schedule for {abbr}: {e}")
+                
+                print(f"  ✓ Added {games_this_season} games for season {season_str}")
+                total_games_added += games_this_season
+            
+            print(f"\n✓ Total games added: {total_games_added}")
+            return True
+        
+        except Exception as e:
+            print(f"❌ Error collecting historical NHL data: {e}")
+            return False
+
     def add_sample_data(self):
         """
         Add sample data for demonstration and testing.

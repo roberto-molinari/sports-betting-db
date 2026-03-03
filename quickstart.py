@@ -32,6 +32,14 @@ def main():
     collector = SportDataCollector()
     collector.add_sample_data()
     print("✓ Sample data added\n")
+
+    # Optional: Load historical NHL data (2 seasons)
+    # Uncomment the lines below to load ~5,800 real NHL games from the past 2 years
+    # This requires nhl-api-py to be installed: pip install nhl-api-py
+    #
+    # print("Loading historical NHL data (2023-2024 and 2024-2025 seasons)...")
+    # collector.collect_nhl_historical_data(seasons=['20232024', '20242025'])
+    # print("✓ Historical NHL data loaded\n")
     
     # Step 3: Verify data
     print("Step 3: Verifying data...\n")
