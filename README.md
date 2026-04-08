@@ -249,9 +249,18 @@ analyzer.generate_summary_report('NHL', 'Hockey')
 
 ## Data Sources for Historical Betting Odds
 
-Since free APIs have limited historical odds data, here are recommended sources:
+### Current Source (NHL Data)
 
-### Free/Affordable Options:
+**Kaggle: NHL Historical Game Data**
+- Source: https://www.kaggle.com/datasets/jonathanncoletti/nhl-historical-game-data
+- File: `nhl_data_extensive_last_two_years.csv`
+- Contains: 2+ seasons of NHL games with ESPN betting odds (moneylines, spreads, over/under)
+- Imported via: `import_betting_odds.py`
+- Note: Includes spread values and favorite moneyline, but NOT spread odds or over/under odds (these would need to be sourced separately)
+
+### Additional Data Sources for Reference
+
+Since free APIs have limited historical odds data, here are other recommended sources:
 
 1. **The Odds API** (https://theoddsapi.com/)
    - Current odds for multiple sportsbooks
