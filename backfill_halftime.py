@@ -11,10 +11,42 @@ import sys
 import time
 import sqlite3
 import requests
+from datetime import datetime, timedelta
 from sports_db import DATABASE_PATH
 
 API_BASE = "https://api.football-data.org/v4"
 COMPETITION = "SA"
+
+# Map football-data.org team names → canonical DB names
+TEAM_NAME_MAP = {
+    "FC Internazionale Milano": "Inter",
+    "Inter Milan": "Inter",
+    "Juventus FC": "Juventus",
+    "SSC Napoli": "Napoli",
+    "SS Lazio": "Lazio",
+    "Atalanta BC": "Atalanta",
+    "ACF Fiorentina": "Fiorentina",
+    "Hellas Verona FC": "Hellas Verona",
+    "Bologna FC 1909": "Bologna",
+    "Empoli FC": "Empoli",
+    "Torino FC": "Torino",
+    "Udinese Calcio": "Udinese",
+    "US Sassuolo Calcio": "Sassuolo",
+    "US Cremonese": "Cremonese",
+    "US Lecce": "Lecce",
+    "US Salernitana 1919": "Salernitana",
+    "Spezia Calcio": "Spezia",
+    "AC Monza": "Monza",
+    "Cagliari Calcio": "Cagliari",
+    "Genoa CFC": "Genoa",
+    "Frosinone Calcio": "Frosinone",
+    "AC Milan": "Milan",
+    "AS Roma": "Roma",
+    "ACF Fiorentina": "Fiorentina",
+    "Venezia FC": "Venezia",
+    "Parma Calcio 1913": "Parma",
+    "Como 1907": "Como",
+}
 
 
 def fetch_season(api_key: str, season: int) -> list:
@@ -54,7 +86,8 @@ def backfill(api_key: str):
         print(f"\nFetching season {season}...")
         matches = fetch_season(api_key, season)
 
-        # Build lookup: (home_team_name, away_team_name, date) -> halftime scores
+        # Build lookup: (home_team_name, away_team_name) -> list of (date, hhs, has_)
+        # Using a list because theoretically two fixtures could exist, but in practice one per season
         ht_lookup: dict = {}
         for m in matches:
             if m.get("status") != "FINISHED":
@@ -65,10 +98,10 @@ def backfill(api_key: str):
             has_ = ht.get("away")
             if hhs is None or has_ is None:
                 continue
-            home = m["homeTeam"]["name"]
-            away = m["awayTeam"]["name"]
+            home = TEAM_NAME_MAP.get(m["homeTeam"]["name"], m["homeTeam"]["name"])
+            away = TEAM_NAME_MAP.get(m["awayTeam"]["name"], m["awayTeam"]["name"])
             date = m["utcDate"][:10]
-            ht_lookup[(home, away, date)] = (hhs, has_)
+            ht_lookup.setdefault((home, away), []).append((date, hhs, has_))
 
         # Fetch rows needing update for this season
         cur.execute("""
@@ -86,10 +119,19 @@ def backfill(api_key: str):
         updated = 0
         not_found = 0
         for match_id, match_date, home_name, away_name in rows:
-            date_str = match_date[:10]
-            key = (home_name, away_name, date_str)
-            if key in ht_lookup:
-                hhs, has_ = ht_lookup[key]
+            db_date = datetime.strptime(match_date[:10], "%Y-%m-%d")
+            home_norm = TEAM_NAME_MAP.get(home_name, home_name)
+            away_norm = TEAM_NAME_MAP.get(away_name, away_name)
+            candidates = ht_lookup.get((home_norm, away_norm), [])
+            # Match within ±3 days to handle matchday date vs actual kickoff date skew
+            matched = None
+            for api_date_str, hhs, has_ in candidates:
+                api_date = datetime.strptime(api_date_str, "%Y-%m-%d")
+                if abs((api_date - db_date).days) <= 3:
+                    matched = (hhs, has_)
+                    break
+            if matched:
+                hhs, has_ = matched
                 cur.execute("""
                     UPDATE soccer_matches
                     SET halftime_home_score = ?, halftime_away_score = ?
