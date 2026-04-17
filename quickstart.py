@@ -1,161 +1,125 @@
-#!/usr/bin/env python3
 """
-Quick Start Script for Sports Betting Database
-Run this to initialize and test the system
+quickstart.py — Overview of the sports-betting-db database.
+
+Demonstrates how to query the sport-specific tables introduced in the
+schema migration. Run with:
+
+    python quickstart.py
 """
 
-from sports_db import init_database, get_all_teams, get_matches_by_league_and_date
-from data_collector import SportDataCollector
-from betting_analyzer import BettingAnalyzer
-from datetime import datetime, timedelta
+import sqlite3
+from sports_db import DATABASE_PATH
 
 
-def print_header(title):
-    """Print formatted section header."""
-    print(f"\n{'='*70}")
+def print_header(title: str):
+    print(f"\n{'=' * 60}")
     print(f"  {title}")
-    print(f"{'='*70}\n")
+    print('=' * 60)
+
+
+def summary(conn: sqlite3.Connection):
+    print_header("Database summary")
+    cur = conn.cursor()
+    for table in [
+        'soccer_teams', 'nhl_teams',
+        'soccer_matches', 'nhl_matches',
+        'soccer_betting_odds', 'nhl_betting_odds',
+    ]:
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        print(f"  {table:<25} {cur.fetchone()[0]:>6} rows")
+
+
+def recent_soccer_matches(conn: sqlite3.Connection, n: int = 5):
+    print_header(f"Recent {n} completed Serie A matches (with halftime)")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.match_date,
+               ht.name  AS home,
+               at.name  AS away,
+               m.home_score, m.away_score,
+               m.halftime_home_score, m.halftime_away_score
+        FROM   soccer_matches m
+        JOIN   soccer_teams ht ON ht.team_id = m.home_team_id
+        JOIN   soccer_teams at ON at.team_id = m.away_team_id
+        WHERE  m.match_status = 'completed'
+        ORDER  BY m.match_date DESC
+        LIMIT  ?
+    """, (n,))
+    for date, home, away, hs, as_, hhs, has_ in cur.fetchall():
+        ht_str = f"  (HT {hhs}-{has_})" if hhs is not None else ""
+        print(f"  {date[:10]}  {home:<25} {hs}-{as_}  {away}{ht_str}")
+
+
+def recent_nhl_matches(conn: sqlite3.Connection, n: int = 5):
+    print_header(f"Recent {n} completed NHL matches")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.match_date,
+               ht.name  AS home,
+               at.name  AS away,
+               m.home_score, m.away_score
+        FROM   nhl_matches m
+        JOIN   nhl_teams ht ON ht.team_id = m.home_team_id
+        JOIN   nhl_teams at ON at.team_id = m.away_team_id
+        WHERE  m.match_status = 'completed'
+        ORDER  BY m.match_date DESC
+        LIMIT  ?
+    """, (n,))
+    for date, home, away, hs, as_ in cur.fetchall():
+        print(f"  {date[:10]}  {home:<30} {hs}-{as_}  {away}")
+
+
+def sample_nhl_odds(conn: sqlite3.Connection, n: int = 5):
+    print_header(f"Sample NHL betting odds ({n} rows)")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.match_date,
+               ht.name  AS home,
+               at.name  AS away,
+               o.sportsbook,
+               o.home_moneyline, o.away_moneyline,
+               o.over_under
+        FROM   nhl_betting_odds o
+        JOIN   nhl_matches m  ON m.match_id  = o.match_id
+        JOIN   nhl_teams ht   ON ht.team_id  = m.home_team_id
+        JOIN   nhl_teams at   ON at.team_id  = m.away_team_id
+        ORDER  BY m.match_date DESC
+        LIMIT  ?
+    """, (n,))
+    for date, home, away, book, hml, aml, ou in cur.fetchall():
+        print(f"  {date[:10]}  {home:<26} vs {away:<26}  "
+              f"{book:<12} ML {int(hml):+d}/{int(aml):+d}  O/U {ou}")
+
+
+def halftime_coverage(conn: sqlite3.Connection):
+    print_header("Halftime score coverage (soccer_matches)")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT season,
+               COUNT(*) AS total,
+               SUM(CASE WHEN halftime_home_score IS NOT NULL THEN 1 ELSE 0 END) AS with_ht
+        FROM   soccer_matches
+        WHERE  match_status = 'completed'
+        GROUP  BY season
+        ORDER  BY season
+    """)
+    for season, total, with_ht in cur.fetchall():
+        pct = 100 * with_ht // total if total else 0
+        print(f"  Season {season}: {with_ht}/{total} ({pct}%)")
 
 
 def main():
-    """Run quick start setup and demo."""
-    
-    print_header("SPORTS BETTING DATABASE - QUICK START")
-    
-    # Step 1: Initialize database
-    print("Step 1: Initializing database...")
-    init_database()
-    print("✓ Database initialized\n")
-    
-    # Step 2: Add sample data
-    print("Step 2: Adding sample data...")
-    collector = SportDataCollector()
-    collector.add_sample_data()
-    print("✓ Sample data added\n")
-
-    # Optional: Load historical NHL data (2 seasons)
-    # Uncomment the lines below to load ~5,800 real NHL games from the past 2 years
-    # This requires nhl-api-py to be installed: pip install nhl-api-py
-    #
-    # print("Loading historical NHL data (2023-2024 and 2024-2025 seasons)...")
-    # collector.collect_nhl_historical_data(seasons=['20232024', '20242025'])
-    # print("✓ Historical NHL data loaded\n")
-    
-    # Step 3: Verify data
-    print("Step 3: Verifying data...\n")
-    
-    # Show Serie A teams
-    serie_a_teams = get_all_teams(league='Serie A')
-    print(f"Serie A Teams ({len(serie_a_teams)}):")
-    for team in serie_a_teams:
-        print(f"  • {team['name']}")
-    
-    # Show NHL teams
-    nhl_teams = get_all_teams(league='NHL')
-    print(f"\nNHL Teams ({len(nhl_teams)}):")
-    for team in nhl_teams:
-        print(f"  • {team['name']}")
-    
-    # Show recent matches
-    print_header("Recent Matches")
-    
-    end_date = datetime.now().isoformat()
-    start_date = (datetime.now() - timedelta(days=90)).isoformat()
-    
-    matches = get_matches_by_league_and_date('Serie A', start_date, end_date)
-    if matches:
-        print("Recent Serie A Matches:")
-        for match in matches[-3:]:
-            score = f"{match['home_score']}-{match['away_score']}" if match['home_score'] is not None else "TBD"
-            print(f"  • {match['home_team_name']} vs {match['away_team_name']} - {score}")
-    
-    matches = get_matches_by_league_and_date('NHL', start_date, end_date)
-    if matches:
-        print("\nRecent NHL Matches:")
-        for match in matches[-3:]:
-            score = f"{match['home_score']}-{match['away_score']}" if match['home_score'] is not None else "TBD"
-            print(f"  • {match['home_team_name']} vs {match['away_team_name']} - {score}")
-    
-    # Step 4: Run analysis
-    print_header("Running Analysis")
-    
-    analyzer = BettingAnalyzer()
-    
-    # Serie A analysis
-    print("Serie A Analysis:")
-    print("-" * 70)
-    ml_analysis = analyzer.analyze_moneyline_accuracy('Serie A', 'Soccer', days=365)
-    if 'total_games' in ml_analysis:
-        print(f"Total matches analyzed: {ml_analysis['total_games']}")
-        if ml_analysis['total_games'] > 0:
-            print(f"Favorite win rate: {ml_analysis['favorite_win_rate']}")
-            print(f"Upsets: {ml_analysis['upset_count']}")
-    else:
-        print(ml_analysis.get('status', 'Analysis unavailable'))
-    
-    # NHL analysis
-    print("\nNHL Analysis:")
-    print("-" * 70)
-    ml_analysis = analyzer.analyze_moneyline_accuracy('NHL', 'Hockey', days=365)
-    if 'total_games' in ml_analysis:
-        print(f"Total matches analyzed: {ml_analysis['total_games']}")
-        if ml_analysis['total_games'] > 0:
-            print(f"Favorite win rate: {ml_analysis['favorite_win_rate']}")
-            print(f"Upsets: {ml_analysis['upset_count']}")
-    else:
-        print(ml_analysis.get('status', 'Analysis unavailable'))
-    
-    # Step 5: Next steps
-    print_header("Next Steps")
-    
-    print("""
-1. POPULATE WITH REAL DATA:
-   
-   For Serie A (Soccer):
-   - Register at https://www.football-data.org/ for free API key
-   - Update data_collector.py with your API key
-   - Run: collector.collect_serie_a_data(season=2024)
-   
-   For NHL (Hockey):
-   - NHL API is free at https://statsapi.web.nhl.com/api/v1
-   - optionally install `nhl-api-py` (imported as `nhlpy`) for easier
-     access to the latest endpoints
-   - Run: collector.collect_nhl_data(season=2024)
-
-2. ADD HISTORICAL BETTING ODDS:
-   
-   - Get data from The Odds API (theoddsapi.com)
-   - Or manually import from Covers.com or Sports-Reference
-   - Use add_betting_odds() to populate the database
-
-3. RUN ANALYSIS:
-   
-   analyzer = BettingAnalyzer()
-   analyzer.analyze_moneyline_accuracy('Serie A', 'Soccer', days=365)
-   analyzer.analyze_spread_covering('NHL', 'Hockey', days=365)
-   analyzer.identify_line_movement_opportunities('Serie A', days=30)
-
-4. EXPORT RESULTS:
-   
-   - Use SQL queries to extract specific data
-   - Generate CSV reports for further analysis
-   - Create visualizations with pandas/matplotlib
-
-For detailed documentation, see: README.md
-    """)
-    
-    print_header("Setup Complete!")
-    print("Database is ready for use. See README for API usage and examples.\n")
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        summary(conn)
+        recent_soccer_matches(conn)
+        recent_nhl_matches(conn)
+        sample_nhl_odds(conn)
+        halftime_coverage(conn)
+    finally:
+        conn.close()
+    print()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"\n❌ Error during setup: {e}")
-        print("\nTroubleshooting:")
-        print("1. Ensure all files are in the same directory")
-        print("2. Check Python version (3.8+)")
-        print("3. Verify no database file is locked")
-        import traceback
-        traceback.print_exc()
+    main()

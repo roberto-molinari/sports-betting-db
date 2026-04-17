@@ -3,7 +3,7 @@ Weekly Serie A Results Updater
 ==============================
 Syncs the local database with football-data.org for a given Serie A season:
   - Inserts any fixtures not yet in the database
-  - Scores already available (FINISHED) are written immediately on insert
+  - Scores (full-time + half-time) are written on insert for FINISHED matches
   - Updates existing 'scheduled' records whose matches are now FINISHED
   - Adds any new teams encountered (e.g. newly promoted clubs)
 
@@ -54,7 +54,7 @@ def season_from_date(utc_date_str):
 def load_team_map(conn):
     """Return {team_name: team_id} for all Serie A teams in the DB."""
     cur = conn.cursor()
-    cur.execute("SELECT name, team_id FROM teams WHERE league = 'Serie A'")
+    cur.execute("SELECT name, team_id FROM soccer_teams WHERE league = 'Serie A'")
     return dict(cur.fetchall())
 
 
@@ -64,7 +64,7 @@ def ensure_team(conn, team_map, name):
         return team_map[name]
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO teams (name, sport, league, country) VALUES (?, 'Soccer', 'Serie A', 'Italy')",
+        "INSERT INTO soccer_teams (name, league, country) VALUES (?, 'Serie A', 'Italy')",
         (name,)
     )
     conn.commit()
@@ -76,20 +76,17 @@ def ensure_team(conn, team_map, name):
 
 def load_existing_matches(conn):
     """
-    Return a set of (home_team_id, away_team_id, date_str) for all Serie A
-    matches already in the DB, plus a dict match_id -> match_status for
-    quick stale-check lookups.
+    Return a dict (home_team_id, away_team_id, date_str) -> (match_id, match_status)
+    for all Serie A matches already in the DB.
     """
     cur = conn.cursor()
     cur.execute("""
         SELECT match_id, home_team_id, away_team_id,
                DATE(match_date), match_status
-        FROM matches
-        WHERE league = 'Serie A'
+        FROM soccer_matches
     """)
     rows = cur.fetchall()
-    existing = {(r[1], r[2], r[3]): (r[0], r[4]) for r in rows}
-    return existing
+    return {(r[1], r[2], r[3]): (r[0], r[4]) for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +130,6 @@ def sync_season(api_key, season):
         team_map = load_team_map(conn)
         existing = load_existing_matches(conn)
 
-        # Fetch from API
         _, api_matches = fetch_season_data(api_key, season)
 
         inserted = 0
@@ -143,31 +139,34 @@ def sync_season(api_key, season):
         cur = conn.cursor()
 
         for m in api_matches:
-            home_name = m['homeTeam']['name']
-            away_name = m['awayTeam']['name']
-            utc_date  = m['utcDate']             # e.g. "2025-09-14T18:45:00Z"
-            date_str  = utc_date[:10]            # "2025-09-14"
-            api_status = m['status']             # FINISHED / SCHEDULED / TIMED / etc.
+            home_name  = m['homeTeam']['name']
+            away_name  = m['awayTeam']['name']
+            utc_date   = m['utcDate']        # e.g. "2025-09-14T18:45:00Z"
+            date_str   = utc_date[:10]       # "2025-09-14"
+            api_status = m['status']         # FINISHED / SCHEDULED / TIMED / etc.
 
-            # Resolve (or create) team IDs
             home_id = ensure_team(conn, team_map, home_name)
             away_id = ensure_team(conn, team_map, away_name)
 
             key = (home_id, away_id, date_str)
 
             if key in existing:
-                # Match is already in the DB
                 match_id, db_status = existing[key]
                 if api_status == 'FINISHED' and db_status != 'completed':
-                    score = m.get('score', {}).get('fullTime', {})
-                    hs, as_ = score.get('home'), score.get('away')
+                    score   = m.get('score', {})
+                    ft      = score.get('fullTime', {})
+                    ht      = score.get('halfTime', {})
+                    hs, as_ = ft.get('home'), ft.get('away')
+                    hhs, has_ = ht.get('home'), ht.get('away')
                     if hs is not None and as_ is not None:
                         cur.execute("""
-                            UPDATE matches
-                            SET home_score = ?, away_score = ?, match_status = 'completed'
+                            UPDATE soccer_matches
+                            SET home_score = ?, away_score = ?,
+                                halftime_home_score = ?, halftime_away_score = ?,
+                                match_status = 'completed'
                             WHERE match_id = ?
-                        """, (hs, as_, match_id))
-                        print(f"  ✓ Updated  [{match_id}] {home_name} {hs}–{as_} {away_name}")
+                        """, (hs, as_, hhs, has_, match_id))
+                        print(f"  Updated  [{match_id}] {home_name} {hs}-{as_} {away_name}")
                         updated += 1
                     else:
                         skipped += 1
@@ -175,35 +174,38 @@ def sync_season(api_key, season):
                     skipped += 1
             else:
                 # New fixture — insert it
-                db_status = 'completed' if api_status == 'FINISHED' else 'scheduled'
+                db_status    = 'completed' if api_status == 'FINISHED' else 'scheduled'
                 match_season = season_from_date(utc_date)
 
                 cur.execute("""
-                    INSERT INTO matches
-                        (sport, league, season, home_team_id, away_team_id,
+                    INSERT INTO soccer_matches
+                        (league, season, home_team_id, away_team_id,
                          match_date, match_status)
-                    VALUES ('Soccer', 'Serie A', ?, ?, ?, ?, ?)
+                    VALUES ('Serie A', ?, ?, ?, ?, ?)
                 """, (match_season, home_id, away_id, utc_date, db_status))
                 match_id = cur.lastrowid
 
                 score_str = ''
                 if api_status == 'FINISHED':
-                    score = m.get('score', {}).get('fullTime', {})
-                    hs, as_ = score.get('home'), score.get('away')
+                    score   = m.get('score', {})
+                    ft      = score.get('fullTime', {})
+                    ht      = score.get('halfTime', {})
+                    hs, as_ = ft.get('home'), ft.get('away')
+                    hhs, has_ = ht.get('home'), ht.get('away')
                     if hs is not None and as_ is not None:
                         cur.execute("""
-                            UPDATE matches
-                            SET home_score = ?, away_score = ?
+                            UPDATE soccer_matches
+                            SET home_score = ?, away_score = ?,
+                                halftime_home_score = ?, halftime_away_score = ?
                             WHERE match_id = ?
-                        """, (hs, as_, match_id))
-                        score_str = f" [{hs}–{as_}]"
+                        """, (hs, as_, hhs, has_, match_id))
+                        score_str = f" [{hs}-{as_}]"
 
-                print(f"  + Inserted [{match_id}] {date_str}  {home_name} vs {away_name}{score_str}")
+                print(f"  Inserted [{match_id}] {date_str}  {home_name} vs {away_name}{score_str}")
                 existing[key] = (match_id, db_status)
                 inserted += 1
 
         conn.commit()
-
         print(f"\nSeason {season}: {inserted} inserted, {updated} updated, {skipped} unchanged.")
 
     finally:
@@ -222,7 +224,7 @@ def main():
     parser.add_argument(
         '--season', type=int, default=None,
         metavar='YYYY',
-        help=f'Season start year to sync (default: current season)'
+        help='Season start year to sync (default: current season)'
     )
     args = parser.parse_args()
 

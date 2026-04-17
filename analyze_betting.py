@@ -28,8 +28,7 @@ def run_analysis():
             COUNT(DISTINCT DATE(m.match_date)) as unique_dates,
             MIN(m.match_date) as earliest_game,
             MAX(m.match_date) as latest_game
-        FROM matches m
-        WHERE m.sport = 'Hockey'
+        FROM nhl_matches m
     ''', conn)
     
     print(f"Total games: {result['total_games'].iloc[0]:,}")
@@ -43,10 +42,9 @@ def run_analysis():
     result = pd.read_sql('''
         SELECT 
             COUNT(DISTINCT m.match_id) as games_with_odds,
-            COUNT(DISTINCT m.match_id) * 100.0 / (SELECT COUNT(*) FROM matches WHERE sport = 'Hockey') as coverage_pct
-        FROM matches m
-        WHERE m.sport = 'Hockey'
-        AND EXISTS (SELECT 1 FROM betting_odds bo WHERE bo.match_id = m.match_id)
+            COUNT(DISTINCT m.match_id) * 100.0 / (SELECT COUNT(*) FROM nhl_matches) as coverage_pct
+        FROM nhl_matches m
+        WHERE EXISTS (SELECT 1 FROM nhl_betting_odds bo WHERE bo.match_id = m.match_id)
     ''', conn)
     
     print(f"Games with odds: {result['games_with_odds'].iloc[0]:,}")
@@ -62,8 +60,8 @@ def run_analysis():
             COUNT(*) as games,
             SUM(CASE WHEN home_score > away_score THEN 1 ELSE 0 END) as wins,
             ROUND(SUM(CASE WHEN home_score > away_score THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as win_pct
-        FROM matches
-        WHERE sport = 'Hockey' AND home_score IS NOT NULL
+        FROM nhl_matches
+        WHERE home_score IS NOT NULL
         
         UNION ALL
         
@@ -72,8 +70,8 @@ def run_analysis():
             COUNT(*) as games,
             SUM(CASE WHEN away_score > home_score THEN 1 ELSE 0 END) as wins,
             ROUND(SUM(CASE WHEN away_score > home_score THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as win_pct
-        FROM matches
-        WHERE sport = 'Hockey' AND home_score IS NOT NULL
+        FROM nhl_matches
+        WHERE home_score IS NOT NULL
     ''', conn)
     
     print(result.to_string(index=False))
@@ -94,9 +92,9 @@ def run_analysis():
                 CASE WHEN (bo.home_moneyline < bo.away_moneyline AND m.home_score > m.away_score)
                      OR (bo.home_moneyline >= bo.away_moneyline AND m.away_score > m.home_score)
                 THEN 1 ELSE 0 END as favorite_won
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            WHERE m.home_score IS NOT NULL
         )
         SELECT 
             'FAVORITES' as bet_type,
@@ -131,9 +129,9 @@ def run_analysis():
                 CASE WHEN m.home_score - m.away_score > bo.spread_home THEN 1
                      WHEN m.home_score - m.away_score <= bo.spread_home THEN 0
                      ELSE NULL END as home_covered
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL AND bo.spread_home IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            WHERE m.home_score IS NOT NULL AND bo.spread_home IS NOT NULL
         )
         SELECT 
             'HOME COVERS' as outcome,
@@ -165,9 +163,9 @@ def run_analysis():
                 CASE WHEN (m.home_score + m.away_score) > bo.over_under THEN 'OVER'
                      WHEN (m.home_score + m.away_score) < bo.over_under THEN 'UNDER'
                      ELSE 'PUSH' END as result
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL AND bo.over_under IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            WHERE m.home_score IS NOT NULL AND bo.over_under IS NOT NULL
         )
         SELECT 
             result,
@@ -192,11 +190,11 @@ def run_analysis():
                 CASE WHEN (bo.home_moneyline < bo.away_moneyline AND m.home_score > m.away_score)
                      OR (bo.home_moneyline >= bo.away_moneyline AND m.away_score > m.home_score)
                 THEN 1 ELSE 0 END as won
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            JOIN teams t_home ON m.home_team_id = t_home.team_id
-            JOIN teams t_away ON m.away_team_id = t_away.team_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            JOIN nhl_teams t_home ON m.home_team_id = t_home.team_id
+            JOIN nhl_teams t_away ON m.away_team_id = t_away.team_id
+            WHERE m.home_score IS NOT NULL
         )
         SELECT 
             team,
@@ -224,11 +222,11 @@ def run_analysis():
                 CASE WHEN (bo.home_moneyline < bo.away_moneyline AND m.home_score > m.away_score)
                      OR (bo.home_moneyline >= bo.away_moneyline AND m.away_score > m.home_score)
                 THEN 1 ELSE 0 END as won
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            JOIN teams t_home ON m.home_team_id = t_home.team_id
-            JOIN teams t_away ON m.away_team_id = t_away.team_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            JOIN nhl_teams t_home ON m.home_team_id = t_home.team_id
+            JOIN nhl_teams t_away ON m.away_team_id = t_away.team_id
+            WHERE m.home_score IS NOT NULL
         )
         SELECT 
             team,
@@ -255,10 +253,10 @@ def run_analysis():
                 m.home_score,
                 m.away_score,
                 bo.home_moneyline
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            JOIN teams t_home ON m.home_team_id = t_home.team_id
-            WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL
+            FROM nhl_matches m
+            JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+            JOIN nhl_teams t_home ON m.home_team_id = t_home.team_id
+            WHERE m.home_score IS NOT NULL
             ORDER BY m.match_date DESC
             LIMIT 30
         )
@@ -285,11 +283,11 @@ def run_analysis():
             CASE WHEN m.home_score > m.away_score THEN t_away.name ELSE t_home.name END as loser,
             m.home_score || '-' || m.away_score as score,
             ROUND(CASE WHEN m.away_score > m.home_score THEN bo.away_moneyline ELSE bo.home_moneyline END, 0) as underdog_odds
-        FROM matches m
-        JOIN betting_odds bo ON m.match_id = bo.match_id
-        JOIN teams t_home ON m.home_team_id = t_home.team_id
-        JOIN teams t_away ON m.away_team_id = t_away.team_id
-        WHERE m.sport = 'Hockey' AND m.home_score IS NOT NULL
+        FROM nhl_matches m
+        JOIN nhl_betting_odds bo ON m.match_id = bo.match_id
+        JOIN nhl_teams t_home ON m.home_team_id = t_home.team_id
+        JOIN nhl_teams t_away ON m.away_team_id = t_away.team_id
+        WHERE m.home_score IS NOT NULL
         AND ((m.away_score > m.home_score AND bo.home_moneyline < bo.away_moneyline)
              OR (m.home_score > m.away_score AND bo.away_moneyline < bo.home_moneyline))
         ORDER BY underdog_odds DESC

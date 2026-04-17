@@ -8,8 +8,9 @@ import json
 import time
 from datetime import datetime, timedelta
 from sports_db import (
-    add_team, add_match, add_betting_odds, update_match_result,
-    get_team_id, init_database
+    ensure_soccer_team, add_soccer_match, update_soccer_match_result,
+    ensure_nhl_team, get_nhl_team_id, add_nhl_match, update_nhl_match_result,
+    init_database
 )
 
 # optional NHL helper library for newer API endpoints
@@ -59,9 +60,8 @@ class SportDataCollector:
             
             team_mapping = {}
             for team in teams_data['teams']:
-                team_id = add_team(
+                team_id = ensure_soccer_team(
                     name=team['name'],
-                    sport='Soccer',
                     league='Serie A',
                     country='Italy'
                 )
@@ -93,8 +93,7 @@ class SportDataCollector:
                 status = 'completed' if match['status'] == 'FINISHED' else 'scheduled'
                 
                 # Add match
-                match_id = add_match(
-                    sport='Soccer',
+                match_id = add_soccer_match(
                     league='Serie A',
                     season=season,
                     home_team_id=team_mapping[home_api_id],
@@ -105,10 +104,13 @@ class SportDataCollector:
                 
                 # Update result if finished
                 if status == 'completed' and match['score']['fullTime']['home'] is not None:
-                    update_match_result(
+                    ht = match['score'].get('halfTime', {})
+                    update_soccer_match_result(
                         match_id,
                         home_score=match['score']['fullTime']['home'],
-                        away_score=match['score']['fullTime']['away']
+                        away_score=match['score']['fullTime']['away'],
+                        halftime_home=ht.get('home'),
+                        halftime_away=ht.get('away')
                     )
                 
                 matches_added += 1
@@ -158,10 +160,8 @@ class SportDataCollector:
                 for t in teams_list:
                     # name, abbreviation, maybe country
                     country = t.get("country", "USA/Canada")
-                    team_id = add_team(
+                    team_id = ensure_nhl_team(
                         name=t.get("name", ""),
-                        sport="Hockey",
-                        league="NHL",
                         country=country,
                     )
                     # store by abbreviation so we can look teams up later
@@ -200,9 +200,7 @@ class SportDataCollector:
                         ] else "scheduled"
 
                         match_date = game.get("startTimeUTC")
-                        match_id = add_match(
-                            sport="Hockey",
-                            league="NHL",
+                        match_id = add_nhl_match(
                             season=season,
                             home_team_id=home_id,
                             away_team_id=away_id,
@@ -214,7 +212,7 @@ class SportDataCollector:
                         if status == "completed":
                             home_score = home.get("score", 0)
                             away_score = away.get("score", 0)
-                            update_match_result(
+                            update_nhl_match_result(
                                 match_id, home_score=home_score, away_score=away_score
                             )
 
@@ -240,10 +238,8 @@ class SportDataCollector:
 
                 for team in teams_data["teams"]:
                     if team.get("active"):
-                        team_id = add_team(
+                        team_id = ensure_nhl_team(
                             name=team.get("name"),
-                            sport="Hockey",
-                            league="NHL",
                             country="USA/Canada",
                         )
                         nhl_teams[team["id"]] = team_id
@@ -296,12 +292,10 @@ class SportDataCollector:
                 country = t.get('country', 'USA/Canada')
                 
                 # Try to get existing team or add new one
-                team_id = get_team_id(name)
+                team_id = get_nhl_team_id(name)
                 if team_id is None:
-                    team_id = add_team(
+                    team_id = ensure_nhl_team(
                         name=name,
-                        sport='Hockey',
-                        league='NHL',
                         country=country
                     )
                     print(f"  Added: {name}")
@@ -354,9 +348,7 @@ class SportDataCollector:
                                 continue
                             
                             try:
-                                match_id = add_match(
-                                    sport='Hockey',
-                                    league='NHL',
+                                match_id = add_nhl_match(
                                     season=season_int,
                                     home_team_id=home_id,
                                     away_team_id=away_id,
@@ -364,8 +356,7 @@ class SportDataCollector:
                                     status='completed'
                                 )
                                 
-                                # Insert final score
-                                update_match_result(
+                                update_nhl_match_result(
                                     match_id,
                                     home_score=home_score,
                                     away_score=away_score
@@ -392,117 +383,6 @@ class SportDataCollector:
             print(f"❌ Error collecting historical NHL data: {e}")
             return False
 
-    def add_sample_data(self):
-        """
-        Add sample data for demonstration and testing.
-        This shows how to structure and populate the database.
-        """
-        print("\nAdding sample data for demonstration...")
-        
-        init_database()
-        
-        # Add Serie A teams
-        serie_a_teams = [
-            ('AC Milan', 'Soccer', 'Serie A', 'Italy'),
-            ('Inter Milan', 'Soccer', 'Serie A', 'Italy'),
-            ('Juventus', 'Soccer', 'Serie A', 'Italy'),
-            ('AS Roma', 'Soccer', 'Serie A', 'Italy'),
-            ('Napoli', 'Soccer', 'Serie A', 'Italy'),
-            ('Lazio', 'Soccer', 'Serie A', 'Italy'),
-            ('Atalanta', 'Soccer', 'Serie A', 'Italy'),
-            ('Fiorentina', 'Soccer', 'Serie A', 'Italy'),
-        ]
-        
-        serie_a_team_ids = {}
-        for name, sport, league, country in serie_a_teams:
-            team_id = add_team(name, sport, league, country)
-            serie_a_team_ids[name] = team_id
-        
-        # Add NHL teams
-        nhl_teams = [
-            ('New York Rangers', 'Hockey', 'NHL', 'USA'),
-            ('Boston Bruins', 'Hockey', 'NHL', 'USA'),
-            ('Toronto Maple Leafs', 'Hockey', 'NHL', 'Canada'),
-            ('Montreal Canadiens', 'Hockey', 'NHL', 'Canada'),
-            ('Pittsburgh Penguins', 'Hockey', 'NHL', 'USA'),
-            ('Philadelphia Flyers', 'Hockey', 'NHL', 'USA'),
-            ('New Jersey Devils', 'Hockey', 'NHL', 'USA'),
-            ('Washington Capitals', 'Hockey', 'NHL', 'USA'),
-        ]
-        
-        nhl_team_ids = {}
-        for name, sport, league, country in nhl_teams:
-            team_id = add_team(name, sport, league, country)
-            nhl_team_ids[name] = team_id
-        
-        # Sample Serie A match
-        match_date = (datetime.now() - timedelta(days=30)).isoformat()
-        match_id = add_match(
-            'Soccer', 'Serie A', 2024,
-            serie_a_team_ids['AC Milan'],
-            serie_a_team_ids['Inter Milan'],
-            match_date,
-            status='completed'
-        )
-        
-        # Add betting odds
-        add_betting_odds(
-            match_id=match_id,
-            sportsbook='DraftKings',
-            odds_date=match_date,
-            home_moneyline=-120,
-            away_moneyline=100,
-            spread_home=-1.5,
-            over_under=2.5,
-            notes='Opening lines'
-        )
-        
-        # Update with result
-        update_match_result(match_id, home_score=2, away_score=1)
-        
-        # Sample NHL match
-        match_date_nhl = (datetime.now() - timedelta(days=15)).isoformat()
-        match_id_nhl = add_match(
-            'Hockey', 'NHL', 2024,
-            nhl_team_ids['New York Rangers'],
-            nhl_team_ids['Boston Bruins'],
-            match_date_nhl,
-            status='completed'
-        )
-        
-        add_betting_odds(
-            match_id=match_id_nhl,
-            sportsbook='FanDuel',
-            odds_date=match_date_nhl,
-            home_moneyline=-150,
-            away_moneyline=130,
-            spread_home=-1.5,
-            over_under=6.5,
-            notes='Opening lines'
-        )
-        
-        update_match_result(match_id_nhl, home_score=3, away_score=2)
-        
-        print("✓ Sample data added successfully")
-
-
 if __name__ == "__main__":
-    collector = SportDataCollector()
-    
-    print("Sports Betting Database - Data Collection")
-    print("=" * 50)
-    
-    # Add sample data for testing
-    collector.add_sample_data()
-    
-    print("\n" + "=" * 50)
-    print("To import real historical data:")
-    print("\n1. For Serie A soccer:")
-    print("   - Register at football-data.org for free API key")
-    print("   - Or use api-football.com")
-    print("\n2. For NHL hockey:")
-    print("   - API available at statsapi.web.nhl.com (free, no auth)")
-    print("\n3. For betting odds:")
-    print("   - The Odds API (https://theoddsapi.com/)")
-    print("   - Sports-Reference historical database")
-    print("   - Covers.com (requires web scraping)")
+    print("SportDataCollector — import and call collect_serie_a_data() or collect_nhl_historical_data().")
+    print("See quickstart.py for usage examples.")

@@ -3,26 +3,27 @@ import sqlite3
 conn = sqlite3.connect("sports_betting.db")
 c = conn.cursor()
 
-print("=== SCHEMA: what data exists per match ===")
-c.execute("PRAGMA table_info(matches)")
+print("=== SCHEMA: soccer_matches ===")
+c.execute("PRAGMA table_info(soccer_matches)")
 for row in c.fetchall():
-    print(f"  {row[1]:20s} {row[2]}")
+    print(f"  {row[1]:25s} {row[2]}")
 
-print("\n=== TEAMS table (for name lookup) ===")
-c.execute("PRAGMA table_info(teams)")
+print("\n=== SCHEMA: soccer_teams ===")
+c.execute("PRAGMA table_info(soccer_teams)")
 for row in c.fetchall():
-    print(f"  {row[1]:20s} {row[2]}")
+    print(f"  {row[1]:25s} {row[2]}")
 
 print("\n=== SAMPLE SERIE A MATCH (with team names) ===")
 c.execute("""
-    SELECT m.match_id, m.match_date, m.season, m.league,
+    SELECT sm.match_id, sm.match_date, sm.season, sm.league,
            ht.name as home_team, at.name as away_team,
-           m.home_score, m.away_score, m.match_status
-    FROM matches m
-    JOIN teams ht ON m.home_team_id = ht.team_id
-    JOIN teams at ON m.away_team_id = at.team_id
-    WHERE m.league = 'Serie A'
-    ORDER BY m.match_date DESC
+           sm.home_score, sm.away_score,
+           sm.halftime_home_score, sm.halftime_away_score,
+           sm.match_status
+    FROM soccer_matches sm
+    JOIN soccer_teams ht ON sm.home_team_id = ht.team_id
+    JOIN soccer_teams at ON sm.away_team_id = at.team_id
+    ORDER BY sm.match_date DESC
     LIMIT 3
 """)
 rows = c.fetchall()
@@ -33,31 +34,31 @@ if rows:
         print("  " + " | ".join(str(x) for x in row))
 
 print("\n=== COVERAGE ===")
-c.execute("SELECT COUNT(*) FROM matches WHERE league='Serie A'")
+c.execute("SELECT COUNT(*) FROM soccer_matches")
 print(f"  Total Serie A games:  {c.fetchone()[0]}")
 
-c.execute("SELECT MIN(match_date), MAX(match_date) FROM matches WHERE league='Serie A'")
+c.execute("SELECT MIN(match_date), MAX(match_date) FROM soccer_matches")
 mn, mx = c.fetchone()
 print(f"  Date range:           {mn}  to  {mx}")
 
-c.execute("SELECT season, COUNT(*) FROM matches WHERE league='Serie A' GROUP BY season ORDER BY season")
+c.execute("SELECT season, COUNT(*) FROM soccer_matches GROUP BY season ORDER BY season")
 for row in c.fetchall():
     print(f"  Season {row[0]}:           {row[1]} games")
 
 print("\n=== SCORE COMPLETENESS ===")
-c.execute("SELECT COUNT(*) FROM matches WHERE league='Serie A' AND home_score IS NULL")
-print(f"  Missing home_score:   {c.fetchone()[0]}")
-c.execute("SELECT COUNT(*) FROM matches WHERE league='Serie A' AND away_score IS NULL")
-print(f"  Missing away_score:   {c.fetchone()[0]}")
-c.execute("SELECT COUNT(*) FROM matches WHERE league='Serie A' AND home_score=0 AND away_score=0")
-print(f"  0-0 scores:           {c.fetchone()[0]}")
-c.execute("SELECT COUNT(*) FROM matches WHERE league='Serie A' AND (home_score < 0 OR away_score < 0)")
-print(f"  Negative scores:      {c.fetchone()[0]}")
+c.execute("SELECT COUNT(*) FROM soccer_matches WHERE home_score IS NULL")
+print(f"  Missing home_score:          {c.fetchone()[0]}")
+c.execute("SELECT COUNT(*) FROM soccer_matches WHERE away_score IS NULL")
+print(f"  Missing away_score:          {c.fetchone()[0]}")
+c.execute("SELECT COUNT(*) FROM soccer_matches WHERE home_score=0 AND away_score=0")
+print(f"  0-0 scores:                  {c.fetchone()[0]}")
+c.execute("SELECT COUNT(*) FROM soccer_matches WHERE halftime_home_score IS NOT NULL")
+print(f"  With halftime scores:        {c.fetchone()[0]}")
 
 print("\n=== SCORE DISTRIBUTION (sanity check) ===")
 c.execute("""
     SELECT home_score + away_score as total, COUNT(*) as games
-    FROM matches WHERE league='Serie A' AND home_score IS NOT NULL
+    FROM soccer_matches WHERE home_score IS NOT NULL
     GROUP BY total ORDER BY total
 """)
 for row in c.fetchall():
@@ -66,20 +67,20 @@ for row in c.fetchall():
 print("\n=== TEAM COVERAGE ===")
 c.execute("""
     SELECT COUNT(DISTINCT team_id) FROM (
-        SELECT home_team_id as team_id FROM matches WHERE league='Serie A'
+        SELECT home_team_id as team_id FROM soccer_matches
         UNION
-        SELECT away_team_id FROM matches WHERE league='Serie A'
+        SELECT away_team_id FROM soccer_matches
     )
 """)
 print(f"  Distinct teams:       {c.fetchone()[0]}  (Serie A has 20)")
 
 print("\n=== ALL TEAMS IN SERIE A DATA ===")
 c.execute("""
-    SELECT DISTINCT t.name FROM teams t
+    SELECT DISTINCT t.name FROM soccer_teams t
     WHERE t.team_id IN (
-        SELECT home_team_id FROM matches WHERE league='Serie A'
+        SELECT home_team_id FROM soccer_matches
         UNION
-        SELECT away_team_id FROM matches WHERE league='Serie A'
+        SELECT away_team_id FROM soccer_matches
     )
     ORDER BY t.name
 """)
@@ -91,25 +92,11 @@ print("\n=== DUPLICATE CHECK ===")
 c.execute("""
     SELECT COUNT(*) FROM (
         SELECT home_team_id, away_team_id, DATE(match_date), COUNT(*) as c
-        FROM matches WHERE league='Serie A'
+        FROM soccer_matches
         GROUP BY home_team_id, away_team_id, DATE(match_date)
         HAVING c > 1
     )
 """)
 print(f"  Duplicate game combos: {c.fetchone()[0]}")
-
-print("\n=== MATCH STATUS BREAKDOWN ===")
-c.execute("SELECT match_status, COUNT(*) FROM matches WHERE league='Serie A' GROUP BY match_status")
-for row in c.fetchall():
-    print(f"  {row[0]:20s}: {row[1]}")
-
-print("\n=== GAMES PER MONTH (gap detection) ===")
-c.execute("""
-    SELECT strftime('%Y-%m', match_date) as month, COUNT(*) as games
-    FROM matches WHERE league='Serie A'
-    GROUP BY month ORDER BY month
-""")
-for row in c.fetchall():
-    print(f"  {row[0]}: {row[1]:4d} games")
 
 conn.close()

@@ -12,38 +12,50 @@ import statistics
 
 class AdvancedBettingAnalyzer:
     """Advanced analysis of betting patterns and team performance against odds."""
-    
+
     def __init__(self):
         self.db_path = DATABASE_PATH
-    
+
     def get_connection(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
-    
-    def analyze_team_performance_vs_odds(self, league='Serie A'):
+
+    @staticmethod
+    def _tables(sport):
+        """Return (matches_tbl, teams_tbl, odds_tbl) for the given sport string."""
+        if (sport or '').lower() in ('soccer', 'football'):
+            return 'soccer_matches', 'soccer_teams', 'soccer_betting_odds'
+        return 'nhl_matches', 'nhl_teams', 'nhl_betting_odds'
+
+    def analyze_team_performance_vs_odds(self, sport='soccer', league=None):
         """Analyze which teams beat the odds most consistently."""
+        mt, tt, ot = self._tables(sport)
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        query = '''
-            SELECT 
+
+        where = "WHERE m.match_status = 'completed' AND m.home_score IS NOT NULL"
+        params = []
+        if league and mt == 'soccer_matches':
+            where += ' AND m.league = ?'
+            params.append(league)
+
+        query = f'''
+            SELECT
                 h.name as home_team,
                 a.name as away_team,
                 m.home_score,
                 m.away_score,
                 bo.home_moneyline,
                 bo.away_moneyline
-            FROM matches m
-            JOIN teams h ON m.home_team_id = h.team_id
-            JOIN teams a ON m.away_team_id = a.team_id
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.league = ?
-            AND m.match_status = 'completed'
-            AND m.home_score IS NOT NULL
+            FROM {mt} m
+            JOIN {tt} h ON m.home_team_id = h.team_id
+            JOIN {tt} a ON m.away_team_id = a.team_id
+            JOIN {ot} bo ON m.match_id = bo.match_id
+            {where}
         '''
-        
-        cursor.execute(query, (league,))
+
+        cursor.execute(query, params)
         matches = cursor.fetchall()
         conn.close()
         
@@ -135,25 +147,30 @@ class AdvancedBettingAnalyzer:
         results.sort(key=lambda x: x['upset_wins'], reverse=True)
         return results
     
-    def analyze_favorite_value(self, league='Serie A'):
+    def analyze_favorite_value(self, sport='soccer', league=None):
         """Analyze if favorites are overvalued or undervalued."""
+        mt, tt, ot = self._tables(sport)
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        query = '''
-            SELECT 
+
+        where = "WHERE m.match_status = 'completed' AND m.home_score IS NOT NULL"
+        params = []
+        if league and mt == 'soccer_matches':
+            where += ' AND m.league = ?'
+            params.append(league)
+
+        query = f'''
+            SELECT
                 bo.home_moneyline,
                 bo.away_moneyline,
                 m.home_score,
                 m.away_score
-            FROM matches m
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.league = ?
-            AND m.match_status = 'completed'
-            AND m.home_score IS NOT NULL
+            FROM {mt} m
+            JOIN {ot} bo ON m.match_id = bo.match_id
+            {where}
         '''
-        
-        cursor.execute(query, (league,))
+
+        cursor.execute(query, params)
         matches = cursor.fetchall()
         conn.close()
         
@@ -212,29 +229,34 @@ class AdvancedBettingAnalyzer:
         
         return results
     
-    def analyze_upset_patterns(self, league='Serie A'):
+    def analyze_upset_patterns(self, sport='soccer', league=None):
         """Analyze what predicts upsets."""
+        mt, tt, ot = self._tables(sport)
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        query = '''
-            SELECT 
+
+        where = "WHERE m.match_status = 'completed' AND m.home_score IS NOT NULL"
+        params = []
+        if league and mt == 'soccer_matches':
+            where += ' AND m.league = ?'
+            params.append(league)
+
+        query = f'''
+            SELECT
                 h.name as home_team,
                 a.name as away_team,
                 m.home_score,
                 m.away_score,
                 bo.home_moneyline,
                 bo.away_moneyline
-            FROM matches m
-            JOIN teams h ON m.home_team_id = h.team_id
-            JOIN teams a ON m.away_team_id = a.team_id
-            JOIN betting_odds bo ON m.match_id = bo.match_id
-            WHERE m.league = ?
-            AND m.match_status = 'completed'
-            AND m.home_score IS NOT NULL
+            FROM {mt} m
+            JOIN {tt} h ON m.home_team_id = h.team_id
+            JOIN {tt} a ON m.away_team_id = a.team_id
+            JOIN {ot} bo ON m.match_id = bo.match_id
+            {where}
         '''
-        
-        cursor.execute(query, (league,))
+
+        cursor.execute(query, params)
         matches = cursor.fetchall()
         conn.close()
         
@@ -308,7 +330,7 @@ def main():
     # Analysis 1: Team performance vs odds
     print("\n📊 WHICH TEAMS BEAT THE ODDS?\n")
     print("-" * 80)
-    teams = analyzer.analyze_team_performance_vs_odds('Serie A')
+    teams = analyzer.analyze_team_performance_vs_odds(sport='soccer', league='Serie A')
     
     print(f"{'Team':<30} {'Games':>6} {'W-L':>8} {'Overall':>8} {'As Fav':>8} {'As Dog':>8}")
     print("-" * 80)
@@ -335,7 +357,7 @@ def main():
     print("="*80 + "\n")
     print("-" * 80)
     
-    fav_analysis = analyzer.analyze_favorite_value('Serie A')
+    fav_analysis = analyzer.analyze_favorite_value(sport='soccer', league='Serie A')
     
     print(f"{'Odds Range':<20} {'Implied %':>12} {'Actual %':>12} {'Games':>8} {'Value':>8}")
     print("-" * 80)
@@ -353,7 +375,7 @@ def main():
     print("  UPSET PATTERNS")
     print("="*80 + "\n")
     
-    upset_data = analyzer.analyze_upset_patterns('Serie A')
+    upset_data = analyzer.analyze_upset_patterns(sport='soccer', league='Serie A')
     
     print(f"Total matches: {upset_data['total_matches']}")
     print(f"Total upsets: {upset_data['upsets']} ({upset_data['upset_rate']:.1%})")
