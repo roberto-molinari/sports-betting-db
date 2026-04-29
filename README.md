@@ -56,18 +56,38 @@ This adds sample Serie A and NHL teams and matches for testing.
 
 ### 3. Import Historical Data
 
-#### Option A: Use Football-Data.org (Serie A)
+#### Option A: Use the Unified Serie A Updater
 
-1. Register for free at https://www.football-data.org/
-2. Get your free API key
-3. Use in data_collector.py:
+The script `update_serie_a_results.py` is the primary way to keep your Serie A match data current. It can use two different data sources, specified with the `--source` flag.
 
-```python
-# Add to data_collector.py
-headers = {
-    "X-Auth-Token": "YOUR_API_KEY"
-}
-```
+**1. API Mode (Default)**
+
+This is the recommended method for automated, recurring updates. It fetches data directly from the `football-data.org` API.
+
+- **Requirements**: A free API key from [football-data.org](https://www.football-data.org/client/register).
+- **Usage**:
+  ```bash
+  # Update the current season's results
+    python update_serie_a_results.py YOUR_API_KEY
+
+  # Update a specific season (e.g., 2024-25)
+    python update_serie_a_results.py YOUR_API_KEY --season 2024
+  ```
+- **Automation**: You can schedule this to run automatically (e.g., via cron) to keep your database fresh.
+
+**2. CSV Mode (Fallback)**
+
+This method provides a reliable, key-free way to update results by downloading the latest season data as a CSV file from `football-data.co.uk`. It's a great manual fallback if the API is unavailable.
+
+- **Requirements**: None (no API key needed).
+- **Usage**:
+  ```bash
+  # Update the current season's results from CSV
+    python update_serie_a_results.py --source csv
+
+  # Update a specific season from CSV
+    python update_serie_a_results.py --source csv --season 2024
+  ```
 
 #### Option B: NHL API (Free, No Auth Required)
 
