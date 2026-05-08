@@ -52,6 +52,7 @@ def init_database():
             sportsbook       TEXT NOT NULL,
             odds_date        TIMESTAMP NOT NULL,
             home_moneyline   REAL,
+            draw_moneyline   REAL,
             away_moneyline   REAL,
             spread_home      REAL,
             spread_away      REAL,
@@ -116,9 +117,31 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_nhl_odds_match       ON nhl_betting_odds(match_id);
     ''')
 
+    ensure_soccer_betting_odds_schema(conn)
+
     conn.commit()
     conn.close()
     print(f"Database initialized at {DATABASE_PATH}")
+
+
+def ensure_soccer_betting_odds_schema(conn=None):
+    """Add newer soccer odds columns to older databases if they are missing."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(soccer_betting_odds)")
+        existing_columns = {row[1] for row in cur.fetchall()}
+
+        if "draw_moneyline" not in existing_columns:
+            cur.execute("ALTER TABLE soccer_betting_odds ADD COLUMN draw_moneyline REAL")
+
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 # ── Soccer helpers ─────────────────────────────────────────────────────────────
@@ -189,7 +212,8 @@ def update_soccer_match_result(match_id, home_score, away_score,
 
 
 def add_soccer_betting_odds(match_id, sportsbook, odds_date,
-                             home_moneyline=None, away_moneyline=None,
+                             home_moneyline=None, draw_moneyline=None,
+                             away_moneyline=None,
                              spread_home=None, spread_away=None,
                              spread_home_odds=None, spread_away_odds=None,
                              over_under=None, over_odds=None, under_odds=None,
@@ -198,15 +222,16 @@ def add_soccer_betting_odds(match_id, sportsbook, odds_date,
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
+        ensure_soccer_betting_odds_schema(conn)
         cur.execute(
             """INSERT INTO soccer_betting_odds
                (match_id, sportsbook, odds_date,
-                home_moneyline, away_moneyline,
+            home_moneyline, draw_moneyline, away_moneyline,
                 spread_home, spread_away, spread_home_odds, spread_away_odds,
                 over_under, over_odds, under_odds, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (match_id, sportsbook, odds_date,
-             home_moneyline, away_moneyline,
+             home_moneyline, draw_moneyline, away_moneyline,
              spread_home, spread_away, spread_home_odds, spread_away_odds,
              over_under, over_odds, under_odds, notes)
         )

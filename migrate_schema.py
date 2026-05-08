@@ -103,6 +103,7 @@ def migrate():
             sportsbook      TEXT NOT NULL,
             odds_date       TIMESTAMP NOT NULL,
             home_moneyline  REAL,
+            draw_moneyline  REAL,
             away_moneyline  REAL,
             spread_home     REAL,
             spread_away     REAL,
@@ -203,11 +204,11 @@ def migrate():
     cur.execute("""
         INSERT INTO soccer_betting_odds
             (odds_id, match_id, sportsbook, odds_date,
-             home_moneyline, away_moneyline, spread_home, spread_away,
+              home_moneyline, draw_moneyline, away_moneyline, spread_home, spread_away,
              spread_home_odds, spread_away_odds, over_under,
              over_odds, under_odds, notes, created_at)
         SELECT bo.odds_id, bo.match_id, bo.sportsbook, bo.odds_date,
-               bo.home_moneyline, bo.away_moneyline, bo.spread_home, bo.spread_away,
+             bo.home_moneyline, NULL, bo.away_moneyline, bo.spread_home, bo.spread_away,
                bo.spread_home_odds, bo.spread_away_odds, bo.over_under,
                bo.over_odds, bo.under_odds, bo.notes, bo.created_at
         FROM _old_betting_odds bo
