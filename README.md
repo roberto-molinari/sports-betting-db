@@ -60,6 +60,13 @@ This adds sample Serie A and NHL teams and matches for testing.
 
 The script `update_serie_a_results.py` is the primary way to keep your Serie A match data current. It can use two different data sources, specified with the `--source` flag.
 
+What it updates in `sports_betting.db`:
+- Final score (`home_score`, `away_score`)
+- Halftime score (`halftime_home_score`, `halftime_away_score`) when the source provides it
+- Match status (`scheduled` -> `completed`)
+
+It is safe to re-run. If a match is already marked `completed` but is still missing halftime scores, the updater will now backfill those fields instead of skipping the row.
+
 **1. API Mode (Default)**
 
 This is the recommended method for automated, recurring updates. It fetches data directly from the `football-data.org` API.
@@ -67,11 +74,14 @@ This is the recommended method for automated, recurring updates. It fetches data
 - **Requirements**: A free API key from [football-data.org](https://www.football-data.org/client/register).
 - **Usage**:
   ```bash
+  # Activate the virtual environment first
+  source .venv/bin/activate
+
   # Update the current season's results
-    python update_serie_a_results.py YOUR_API_KEY
+  python update_serie_a_results.py YOUR_API_KEY
 
   # Update a specific season (e.g., 2024-25)
-    python update_serie_a_results.py YOUR_API_KEY --season 2024
+  python update_serie_a_results.py YOUR_API_KEY --season 2024
   ```
 - **Automation**: You can schedule this to run automatically (e.g., via cron) to keep your database fresh.
 
@@ -79,15 +89,41 @@ This is the recommended method for automated, recurring updates. It fetches data
 
 This method provides a reliable, key-free way to update results by downloading the latest season data as a CSV file from `football-data.co.uk`. It's a great manual fallback if the API is unavailable.
 
+- **Note**: The CSV feed can lag behind the actual match completion time. If a just-finished match is still missing scores after a CSV sync, re-run later or use another verified source for a one-off manual repair.
+
 - **Requirements**: None (no API key needed).
 - **Usage**:
   ```bash
+  # Activate the virtual environment first
+  source .venv/bin/activate
+
   # Update the current season's results from CSV
-    python update_serie_a_results.py --source csv
+  python update_serie_a_results.py --source csv
 
   # Update a specific season from CSV
-    python update_serie_a_results.py --source csv --season 2024
+  python update_serie_a_results.py --source csv --season 2024
   ```
+
+#### Quick Verification
+
+After an update run, you can verify that completed matches have both final and halftime scores:
+
+```bash
+sqlite3 sports_betting.db <<'SQL'
+.headers on
+.mode column
+SELECT COUNT(*) AS completed_missing_scores
+FROM soccer_matches
+WHERE league = 'Serie A'
+  AND match_status = 'completed'
+  AND (
+    home_score IS NULL OR away_score IS NULL OR
+    halftime_home_score IS NULL OR halftime_away_score IS NULL
+  );
+SQL
+```
+
+If that query returns `0`, there are no completed Serie A matches missing score fields.
 
 #### Option B: NHL API (Free, No Auth Required)
 

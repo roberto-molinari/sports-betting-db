@@ -147,20 +147,24 @@ def ensure_team(conn, team_map, name):
 
 def load_existing_matches(conn, season):
     """
-    Return a dict (home_team_id, away_team_id) -> list of (match_id, date_str, match_status)
+    Return a dict (home_team_id, away_team_id) -> list of
+    (match_id, date_str, match_status, halftime_home_score, halftime_away_score)
     for a given Serie A season. Fuzzy date matching is used later to handle date discrepancies.
     """
     cur = conn.cursor()
     cur.execute("""
         SELECT match_id, home_team_id, away_team_id,
-               DATE(match_date), match_status
+               DATE(match_date), match_status,
+               halftime_home_score, halftime_away_score
         FROM soccer_matches
         WHERE league = 'Serie A' AND season = ?
     """, (season,))
     rows = cur.fetchall()
     result = {}
-    for match_id, home_id, away_id, date_str, status in rows:
-        result.setdefault((home_id, away_id), []).append((match_id, date_str, status))
+    for match_id, home_id, away_id, date_str, status, halftime_home, halftime_away in rows:
+        result.setdefault((home_id, away_id), []).append(
+            (match_id, date_str, status, halftime_home, halftime_away)
+        )
     return result
 
 
@@ -225,15 +229,16 @@ def sync_from_api(api_key, season):
             # Fuzzy match: same teams, date within ±3 days
             api_date = datetime.strptime(date_str, '%Y-%m-%d')
             existing_entry = None
-            for match_id, db_date_str, db_status in existing.get((home_id, away_id), []):
+            for match_id, db_date_str, db_status, db_halftime_home, db_halftime_away in existing.get((home_id, away_id), []):
                 db_date = datetime.strptime(db_date_str, '%Y-%m-%d')
                 if abs((api_date - db_date).days) <= 3:
-                    existing_entry = (match_id, db_status)
+                    existing_entry = (match_id, db_status, db_halftime_home, db_halftime_away)
                     break
 
             if existing_entry is not None:
-                match_id, db_status = existing_entry
-                if api_status == 'FINISHED' and db_status != 'completed':
+                match_id, db_status, db_halftime_home, db_halftime_away = existing_entry
+                halftime_missing = db_halftime_home is None or db_halftime_away is None
+                if api_status == 'FINISHED' and (db_status != 'completed' or halftime_missing):
                     score = m.get('score', {})
                     ft = score.get('fullTime', {})
                     ht = score.get('halfTime', {})
@@ -283,7 +288,7 @@ def sync_from_api(api_key, season):
                         score_str = f" [{hs}-{as_}]"
 
                 print(f"  Inserted [{match_id}] {date_str}  {home_name} vs {away_name}{score_str}")
-                existing.setdefault((home_id, away_id), []).append((match_id, date_str, db_status))
+                existing.setdefault((home_id, away_id), []).append((match_id, date_str, db_status, hhs, has_))
                 inserted += 1
 
         conn.commit()
@@ -359,15 +364,16 @@ def sync_from_csv(season):
 
             # Fuzzy match: same teams, date within ±3 days
             existing_entry = None
-            for match_id, db_date_str, db_status in existing.get((home_id, away_id), []):
+            for match_id, db_date_str, db_status, db_halftime_home, db_halftime_away in existing.get((home_id, away_id), []):
                 db_date = datetime.strptime(db_date_str, '%Y-%m-%d').date()
                 if abs((date - db_date).days) <= 3:
-                    existing_entry = (match_id, db_status)
+                    existing_entry = (match_id, db_status, db_halftime_home, db_halftime_away)
                     break
 
             if existing_entry:
-                match_id, db_status = existing_entry
-                if db_status != 'completed':
+                match_id, db_status, db_halftime_home, db_halftime_away = existing_entry
+                halftime_missing = db_halftime_home is None or db_halftime_away is None
+                if db_status != 'completed' or halftime_missing:
                     cur.execute("""
                         UPDATE soccer_matches
                         SET home_score = ?, away_score = ?,
