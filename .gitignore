@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.backup*
 .DS_Store
+notes.txt

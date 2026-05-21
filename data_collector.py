@@ -190,8 +190,8 @@ class SportDataCollector:
                         home = game.get("homeTeam")
                         away = game.get("awayTeam")
                         # map abbreviation to our database id
-                        home_id = nhl_teams.get(home.get("abbr"))
-                        away_id = nhl_teams.get(away.get("abbr"))
+                        home_id = nhl_teams.get(home.get("abbrev") or home.get("abbr"))
+                        away_id = nhl_teams.get(away.get("abbrev") or away.get("abbr"))
                         if not home_id or not away_id:
                             continue
 

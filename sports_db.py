@@ -115,6 +115,8 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_nhl_season           ON nhl_matches(season);
         CREATE INDEX IF NOT EXISTS idx_nhl_team_name        ON nhl_teams(name);
         CREATE INDEX IF NOT EXISTS idx_nhl_odds_match       ON nhl_betting_odds(match_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_nhl_match_unique
+            ON nhl_matches(season, home_team_id, away_team_id, match_date);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
@@ -277,11 +279,19 @@ def get_soccer_matches(league=None, season=None, status=None):
 
 # ── NHL helpers ────────────────────────────────────────────────────────────────
 
+def canonical_nhl_team_name(team_name):
+    """Normalize known NHL naming variants used by external feeds."""
+    aliases = {
+        "Montreal Canadiens": "Montréal Canadiens",
+    }
+    return aliases.get(team_name, team_name)
+
 def get_nhl_team_id(team_name):
     """Return team_id for an NHL team, or None if not found."""
+    canonical_name = canonical_nhl_team_name(team_name)
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT team_id FROM nhl_teams WHERE name = ?", (team_name,))
+    cur.execute("SELECT team_id FROM nhl_teams WHERE name = ?", (canonical_name,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
@@ -289,17 +299,18 @@ def get_nhl_team_id(team_name):
 
 def ensure_nhl_team(name, country=None):
     """Insert an NHL team if it doesn't exist; return its team_id."""
+    canonical_name = canonical_nhl_team_name(name)
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
         cur.execute(
             "INSERT INTO nhl_teams (name, country) VALUES (?, ?)",
-            (name, country)
+            (canonical_name, country)
         )
         conn.commit()
         return cur.lastrowid
     except sqlite3.IntegrityError:
-        cur.execute("SELECT team_id FROM nhl_teams WHERE name = ?", (name,))
+        cur.execute("SELECT team_id FROM nhl_teams WHERE name = ?", (canonical_name,))
         return cur.fetchone()[0]
     finally:
         conn.close()
@@ -307,10 +318,29 @@ def ensure_nhl_team(name, country=None):
 
 def add_nhl_match(season, home_team_id, away_team_id, match_date,
                   status="scheduled"):
-    """Insert an NHL match; return its match_id."""
+    """Insert or reuse an NHL match; return its match_id."""
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
+        cur.execute(
+            """SELECT match_id, match_status FROM nhl_matches
+               WHERE season = ? AND home_team_id = ? AND away_team_id = ?
+                 AND match_date = ?""",
+            (season, home_team_id, away_team_id, match_date)
+        )
+        existing = cur.fetchone()
+        if existing:
+            match_id, existing_status = existing
+            if existing_status != status:
+                cur.execute(
+                    """UPDATE nhl_matches
+                       SET match_status = ?
+                       WHERE match_id = ?""",
+                    (status, match_id)
+                )
+                conn.commit()
+            return match_id
+
         cur.execute(
             """INSERT INTO nhl_matches
                (season, home_team_id, away_team_id, match_date, match_status)

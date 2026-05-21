@@ -475,3 +475,83 @@ If certain fields are NULL:
 
 **Last Updated**: February 2025
 **Database Version**: 1.0
+
+### 4. Import Serie A Odds (All-in-One)
+
+The script `import_serie_a_odds.py` lets you import Serie A betting odds using the appropriate backend for the job:
+- historical/completed-fixture odds are pulled from football-data.co.uk
+- future/upcoming odds are pulled from The Odds API
+- local CSV import is still available when you explicitly provide a file
+
+**Recommended: Auto-download and import odds for a season**
+
+```bash
+# Activate the virtual environment first
+source .venv/bin/activate
+
+# Download and import odds for the 2024-25 season (season code: 2024)
+python import_serie_a_odds.py --download --season 2024
+
+# Download and import odds for multiple seasons
+python import_serie_a_odds.py --download --season 2023 2024
+```
+
+**If you want future odds (for example, next matchday):**
+
+```bash
+# Import upcoming odds from The Odds API
+python import_serie_a_odds.py --season 2025 --future-only
+```
+
+- `--future-only` automatically uses The Odds API and reads `THE_ODDS_API_KEY` from your environment.
+- If you explicitly pass a CSV file with `--future-only`, the script will import from that file instead.
+- If you do not specify `--sportsbook`, future imports default to `Pinnacle` because `Bet365` is not present in the current Odds API feed.
+
+- `--season` uses the season start year (for example, `2025` means 2025-26).
+- Historical odds can be fetched from football-data.co.uk and imported directly into your database.
+
+**Import from a local CSV file (advanced/manual):**
+
+```bash
+python import_serie_a_odds.py --season 2024 I1.csv
+```
+
+- You must specify the season for each file.
+- The script will match and import odds for all Serie A matches in the database.
+
+**Options:**
+- `--insert-missing`: Insert missing matches from CSV rows that include a result.
+- `--sportsbook`: Set the preferred sportsbook name. Historical imports default to `Bet365`; future Odds API imports default to `Pinnacle` unless you specify another available bookmaker.
+- `--future-only`: Import odds only for matches on/after today.
+
+---
+
+### 5. Import NHL Odds
+
+**Future odds via The Odds API (recommended):**
+
+```bash
+python import_nhl_odds.py --future-only
+```
+
+- Automatically fetches upcoming NHL game odds from The Odds API.
+- Requires `THE_ODDS_API_KEY` set in your environment.
+- Default sportsbook is `DraftKings` (US region). Pass `--sportsbook` to select another.
+- There is no free recurring source for NHL historical odds, so `--download` is not supported.
+
+**Import from a local CSV file (e.g. a Kaggle export):**
+
+```bash
+python import_nhl_odds.py --season 2023 nhl_games_with_odds.csv
+```
+
+- `--season` is required and uses the season start year (e.g. `2023` for 2023-24).
+- The CSV is expected to have columns matching the Kaggle NHL odds export format:
+  `home_team`, `away_team`, `match_date`, `sportsbook`, `odds_date`,
+  `home_moneyline`, `away_moneyline`, `spread_home`, `spread_away`,
+  `spread_home_odds`, `spread_away_odds`, `over_under`, `over_odds`, `under_odds`, `notes`.
+
+**Options:**
+- `--sportsbook`: Override the preferred sportsbook for the import.
+- `--future-only`: When combined with a CSV file, skips any past matches in the file.
+
