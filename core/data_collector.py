@@ -7,11 +7,11 @@ import requests
 import json
 import time
 from datetime import datetime, timedelta
-from sports_db import (
+from core.sports_db import (
     ensure_soccer_team, add_soccer_match, update_soccer_match_result,
     init_database
 )
-from nhl_results_sync import sync_many_nhl_seasons, sync_nhl_results
+from core.nhl_results_sync import sync_many_nhl_seasons, sync_nhl_results
 
 
 class SportDataCollector:

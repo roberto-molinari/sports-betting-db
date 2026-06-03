@@ -8,9 +8,9 @@ import requests
 import csv
 import io
 from datetime import datetime
-from sports_db import add_betting_odds, get_team_id
+from core.sports_db import add_betting_odds, get_team_id
 import sqlite3
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def download_serie_a_odds(season):

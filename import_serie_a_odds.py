@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 import requests
 
-from sports_db import DATABASE_PATH, ensure_soccer_betting_odds_schema
+from core.sports_db import DATABASE_PATH, ensure_soccer_betting_odds_schema
 from update_serie_a_results import CSV_TEAM_NAME_MAP
 
 

@@ -16,11 +16,10 @@ This snapshot reflects the latest verification queries run against `sports_betti
 
 ## System Overview
 
-This system consists of three main components:
+This system now has two layers:
 
-1. **sports_db.py** - Database schema and core functions
-2. **data_collector.py** - Data collection from sports APIs
-3. **betting_analyzer.py** - Analysis and opportunity identification
+1. **core/** - Shared database, collection, sync, and modeling code
+2. **root scripts** - Runnable entrypoints for imports, analysis, validation, and maintenance
 
 ## Database Schema
 
@@ -181,7 +180,7 @@ Script roles:
 - `update_nhl_results.py`: user-facing unified updater for NHL fixtures and final scores.
 - `import_nhl_odds.py`: imports NHL odds from The Odds API (`--future-only`) or local CSV input.
 - `validate_nhl_odds_coverage.py`: tracks progress to full odds coverage by market type.
-- `nhl_results_sync.py`: shared internal sync logic used by the updater and collector modules.
+- `core/nhl_results_sync.py`: shared internal sync logic used by the updater and collector modules.
 
 The repository now supports the `nhl-api-py` package (imported as `nhlpy`),
 which wraps the official NHL web endpoints and handles rate‑limits and

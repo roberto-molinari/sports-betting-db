@@ -10,7 +10,7 @@ Tables:
 import sqlite3
 from pathlib import Path
 
-DATABASE_PATH = Path(__file__).parent / "sports_betting.db"
+DATABASE_PATH = Path(__file__).resolve().parent.parent / "sports_betting.db"
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────────

@@ -9,8 +9,8 @@ Builds a ranked card for the next Serie A match window with:
 
 import sqlite3
 from datetime import datetime, timezone, timedelta
-from sports_db import DATABASE_PATH
-from poisson_model import analyse_match
+from core.sports_db import DATABASE_PATH
+from core.poisson_model import analyse_match
 
 # Card rules
 EXTRA_PICK_EV = 0.08

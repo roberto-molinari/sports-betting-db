@@ -6,7 +6,7 @@ Uses sport-specific tables: soccer_* or nhl_*
 
 import sqlite3
 from datetime import datetime, timedelta
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 from collections import defaultdict
 import statistics
 

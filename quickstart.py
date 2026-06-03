@@ -8,7 +8,7 @@ schema migration. Run with:
 """
 
 import sqlite3
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def print_header(title: str):
@@ -86,9 +86,13 @@ def sample_nhl_odds(conn: sqlite3.Connection, n: int = 5):
         ORDER  BY m.match_date DESC
         LIMIT  ?
     """, (n,))
+
+    def format_moneyline(value):
+        return f"{int(value):+d}" if value is not None else "N/A"
+
     for date, home, away, book, hml, aml, ou in cur.fetchall():
         print(f"  {date[:10]}  {home:<26} vs {away:<26}  "
-              f"{book:<12} ML {int(hml):+d}/{int(aml):+d}  O/U {ou}")
+              f"{book:<12} ML {format_moneyline(hml)}/{format_moneyline(aml)}  O/U {ou}")
 
 
 def halftime_coverage(conn: sqlite3.Connection):

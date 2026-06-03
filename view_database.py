@@ -2,7 +2,7 @@
 """View current database contents."""
 
 import sqlite3
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def print_section(title):

@@ -6,9 +6,9 @@ Download the CSV manually and this script will import it
 
 import csv
 from datetime import datetime
-from sports_db import add_betting_odds
+from core.sports_db import add_betting_odds
 import sqlite3
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def normalize_team_name(name):

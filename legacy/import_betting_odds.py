@@ -7,7 +7,7 @@ import pandas as pd
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def import_betting_odds_from_csv(csv_path, sportsbook="ESPN"):

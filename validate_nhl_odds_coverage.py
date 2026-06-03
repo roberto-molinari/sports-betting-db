@@ -9,7 +9,7 @@ Usage:
 import argparse
 import sqlite3
 
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 
 def latest_season(conn):

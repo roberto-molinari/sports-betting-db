@@ -5,8 +5,8 @@ Runs the full backtest for each combination and prints a summary table sorted by
 
 import sqlite3
 import itertools
-from sports_db import DATABASE_PATH
-import poisson_model as pm
+from core.sports_db import DATABASE_PATH
+import core.poisson_model as pm
 from backtest import load_test_matches
 
 # ---------------------------------------------------------------------------

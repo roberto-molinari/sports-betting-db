@@ -8,7 +8,7 @@ Low Value: 0% ≤ EV < 5%
 
 import sqlite3
 from datetime import datetime
-from poisson_model import analyse_match, american_to_decimal
+from core.poisson_model import analyse_match, american_to_decimal
 
 DB_PATH = 'sports_betting.db'
 MATCH_DATE = '2026-05-17'

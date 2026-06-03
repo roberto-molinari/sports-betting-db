@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from sports_db import DATABASE_PATH, canonical_nhl_team_name
+from core.sports_db import DATABASE_PATH, canonical_nhl_team_name
 
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds"
 ODDS_API_DEFAULT_BOOK = "DraftKings"

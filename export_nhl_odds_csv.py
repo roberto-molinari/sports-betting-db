@@ -1,7 +1,7 @@
 import sqlite3
 import csv
 from pathlib import Path
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 conn = sqlite3.connect(DATABASE_PATH)
 conn.row_factory = sqlite3.Row

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check current odds in database"""
 import sqlite3
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 
 conn = sqlite3.connect(DATABASE_PATH)
 cursor = conn.cursor()

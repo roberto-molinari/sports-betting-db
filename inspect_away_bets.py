@@ -26,8 +26,8 @@ import argparse
 import sqlite3
 from collections import defaultdict
 
-from poisson_model import analyse_match
-from sports_db import DATABASE_PATH
+from core.poisson_model import analyse_match
+from core.sports_db import DATABASE_PATH
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ Usage:
 import argparse
 from datetime import datetime
 
-from nhl_results_sync import current_nhl_season_year, sync_nhl_results
+from core.nhl_results_sync import current_nhl_season_year, sync_nhl_results
 
 
 def main():

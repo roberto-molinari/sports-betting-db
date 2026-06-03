@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Iterable, Optional
 
-from sports_db import (
+from core.sports_db import (
     add_nhl_match,
     ensure_nhl_team,
     init_database,

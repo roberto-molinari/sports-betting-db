@@ -7,9 +7,9 @@ how to run the collector to build a 2-year NHL historical dataset.
 
 ## High-level Components
 
-- `sports_db.py` — SQLite schema and helper functions for CRUD operations.
+- `core/sports_db.py` — SQLite schema and helper functions for CRUD operations.
   - Core tables: `teams`, `matches`, `betting_odds`, `match_outcomes`, `betting_analysis`.
-- `data_collector.py` — Ingests sports data and betting lines.
+- `core/data_collector.py` — Ingests sports data and betting lines.
   - Integrates with `nhlpy` (installed as `nhl-api-py`) for NHL web endpoints.
   - Falls back to direct `requests` calls against `statsapi.web.nhl.com` when `nhlpy` isn't available.
   - Includes `collect_nhl_data()` and `collect_nhl_historical_data()` helpers.
@@ -30,7 +30,7 @@ how to run the collector to build a 2-year NHL historical dataset.
 - `match_outcomes`, `betting_analysis`:
   - Summaries and precomputed analysis artifacts
 
-Refer to `sports_db.py` for full DDL.
+Refer to `core/sports_db.py` for full DDL.
 
 ## Data Flow
 

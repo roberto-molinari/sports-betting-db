@@ -6,7 +6,7 @@ Explores which teams beat the odds, favorite value, and upset patterns
 
 import sqlite3
 from collections import defaultdict
-from sports_db import DATABASE_PATH
+from core.sports_db import DATABASE_PATH
 import statistics
 
 
