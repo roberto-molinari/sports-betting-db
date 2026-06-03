@@ -49,7 +49,7 @@ nhl_teams
 ### 1. Initial Setup
 
 ```python
-from sports_db import init_database
+from core.sports_db import init_database
 
 # Initialize the database
 init_database()
@@ -207,7 +207,7 @@ To build a database of past NHL games with scores (e.g., for analysis and backte
 use the dedicated historical data collection method:
 
 ```python
-from data_collector import SportDataCollector
+from core.data_collector import SportDataCollector
 
 collector = SportDataCollector()
 
@@ -231,7 +231,7 @@ collector.collect_nhl_historical_data(seasons=['20232024', '20242025', '20212022
 ### Adding Data
 
 ```python
-from sports_db import (
+from core.sports_db import (
     ensure_soccer_team,
     add_soccer_match,
     add_soccer_betting_odds,
@@ -279,7 +279,7 @@ update_soccer_match_result(
 ### Querying Data
 
 ```python
-from sports_db import get_soccer_matches, get_nhl_matches
+from core.sports_db import get_soccer_matches, get_nhl_matches
 
 # Get completed Serie A matches for a season
 serie_a_matches = get_soccer_matches(league='Serie A', season=2025, status='completed')
@@ -303,9 +303,9 @@ source .venv/bin/activate
   - Full multi-section Serie A analysis across available seasons.
 - `python analyze_serie_a.py --season 2025`
   - Single-season Serie A analysis.
-- `python analyze_betting.py`
+- `python analyze_nhl_betting.py`
   - NHL betting/coverage analysis report (moneyline, spread, totals, team-level summaries).
-- `python advanced_analysis.py`
+- `python analyze_serie_a_advanced.py`
   - Additional deeper-dive analysis queries.
 
 ### Strategy Evaluation Scripts
@@ -314,10 +314,12 @@ source .venv/bin/activate
   - Backtesting framework for strategy performance.
 - `python param_sweep.py`
   - Parameter sweep for strategy tuning.
-- `python calculate_favorite_roi.py`
-  - ROI view for favorite-oriented approaches.
-- `python calculate_underdog_roi.py`
-  - ROI view for underdog-oriented approaches.
+- `python calculate_nhl_moneyline_roi.py --side favorite`
+  - ROI view for NHL favorite-oriented approaches.
+- `python calculate_nhl_moneyline_roi.py --side underdog`
+  - ROI view for NHL underdog-oriented approaches.
+- `python calculate_nhl_moneyline_roi.py --side both`
+  - Combined ROI view for both favorite and underdog strategies.
 - `python inspect_away_bets.py`
   - Investigation helper for away-bet behavior.
 

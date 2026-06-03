@@ -13,7 +13,7 @@ how to run the collector to build a 2-year NHL historical dataset.
   - Integrates with `nhlpy` (installed as `nhl-api-py`) for NHL web endpoints.
   - Falls back to direct `requests` calls against `statsapi.web.nhl.com` when `nhlpy` isn't available.
   - Includes `collect_nhl_data()` and `collect_nhl_historical_data()` helpers.
-- `betting_analyzer.py` / `advanced_analysis.py` — Analysis modules to find
+- `betting_analyzer.py` / `analyze_serie_a_advanced.py` — Analysis modules to find
   moneyline/spread inefficiencies and generate reports.
 - Utility scripts: `quickstart.py`, `interactive_example.py`, `view_database.py`,
   CSV import helpers (manual import paths), and small test scripts.
@@ -48,7 +48,7 @@ Refer to `core/sports_db.py` for full DDL.
    - **Note:** Kaggle dataset contains moneylines and spread values, but NOT spread odds or over/under odds.
    - **Alternative sources:** The Odds API (paid), web scraping (Covers.com, Sports-Reference.com)
 5. Analyze:
-   - Use `betting_analyzer.py` and `advanced_analysis.py` to query tables and compute insights.
+  - Use `betting_analyzer.py` and `analyze_serie_a_advanced.py` to query tables and compute insights.
 
 ## NHL Integration Details
 
@@ -70,20 +70,20 @@ Refer to `core/sports_db.py` for full DDL.
 - Initialize DB:
 
 ```bash
-/your/venv/path/bin/python -c "from sports_db import init_database; init_database()"
+/your/venv/path/bin/python -c "from core.sports_db import init_database; init_database()"
 ```
 
 - Add sample data (quick check):
 
 ```bash
-/your/venv/path/bin/python -c "from data_collector import SportDataCollector; SportDataCollector().add_sample_data()"
+/your/venv/path/bin/python -c "from core.data_collector import SportDataCollector; SportDataCollector().add_sample_data()"
 ```
 
 - Build 2-year NHL historical results (example):
 
 ```bash
 /your/venv/path/bin/python - <<'PY'
-from data_collector import SportDataCollector
+from core.data_collector import SportDataCollector
 c = SportDataCollector()
 c.collect_nhl_historical_data()  # defaults to last 2 seasons
 PY

@@ -66,7 +66,7 @@ Pick: Sassuolo ML (better form, better value at implied odds)
 - Check for data gaps or missing historical records
 
 ## Implementation
-See `betting_analyzer.py` and `advanced_analysis.py` for existing analysis functions that can be adapted for this workflow.
+See `betting_analyzer.py` and `analyze_serie_a_advanced.py` for existing analysis functions that can be adapted for this workflow.
 
 ## Project Roadmap (Agreed Plan)
 

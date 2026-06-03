@@ -59,7 +59,7 @@ When the away team's moneyline is between +200 and +400, the home team has posit
 - Dataset: Serie A, seasons 2022–2025 (four complete seasons, ~380 matches each)
 - No train/test split — full season used (market-data-only test, no model)
 - Odds source: Bet365 B365H/B365A from football-data.co.uk CSVs
-- Script: `test_h002_home_vs_medium_dog.py`
+- Script: historical one-off (`test_h002_home_vs_medium_dog.py`, removed during cleanup)
 
 ### Results
 
@@ -105,7 +105,7 @@ When the away team's moneyline is between +251 and +300, the home team has posit
 
 ### Test Methodology
 - Dataset: Serie A, seasons 2022–2025
-- Script: `test_h002_home_vs_medium_dog.py --away-min 251 --away-max 300`
+- Script: historical one-off (`test_h002_home_vs_medium_dog.py --away-min 251 --away-max 300`, removed during cleanup)
 
 ### Results
 
@@ -143,7 +143,7 @@ When an elite Serie A home team (top-6 finisher the prior season) is priced betw
 
 ### Test Methodology
 - Dataset: Serie A, seasons 2023–2025 (prior-season top-6 used to tag elite teams)
-- Script: `test_h004_elite_home_moderate_fav.py`
+- Script: historical one-off (`test_h004_elite_home_moderate_fav.py`, removed during cleanup)
 
 ### Results
 
@@ -191,7 +191,7 @@ In H004, the dominant clubs (Inter, Napoli) produced catastrophic ROI (-33.8% an
 
 ### Test Methodology
 - Dataset: Serie A, seasons 2023–2025
-- Script: `test_h004_elite_home_moderate_fav.py --gap-threshold 5`
+- Script: historical one-off (`test_h004_elite_home_moderate_fav.py --gap-threshold 5`, removed during cleanup)
 - Prior season standings computed from DB match results
 
 ### Results
@@ -251,7 +251,7 @@ The H005 odds-band breakdown showed the -161 to -180 band was responsible for es
 
 ### Test Methodology
 - Dataset: Serie A, seasons 2023–2025
-- Script: `test_h004_elite_home_moderate_fav.py --gap-threshold 5 --home-min -180 --home-max -161`
+- Script: historical one-off (`test_h004_elite_home_moderate_fav.py --gap-threshold 5 --home-min -180 --home-max -161`, removed during cleanup)
 - Prior season standings computed from DB match results
 
 ### How the gap split played out (threshold=5)
