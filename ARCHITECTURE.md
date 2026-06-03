@@ -43,7 +43,7 @@ Refer to `sports_db.py` for full DDL.
      (via `nhlpy.client.schedule.team_season_schedule`) and inserts completed games into `matches`.
 4. Ingest betting odds:
    - **Current source:** Kaggle NHL Historical Game Data (https://www.kaggle.com/datasets/jonathanncoletti/nhl-historical-game-data)
-     - File: `nhl_data_extensive_last_two_years.csv` (ESPN betting data)
+    - File: `data/csv/nhl_data_extensive_last_two_years.csv` (ESPN betting data)
      - Import via: `import_betting_odds.py`
    - **Note:** Kaggle dataset contains moneylines and spread values, but NOT spread odds or over/under odds.
    - **Alternative sources:** The Odds API (paid), web scraping (Covers.com, Sports-Reference.com)

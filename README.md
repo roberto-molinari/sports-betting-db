@@ -2,6 +2,18 @@
 
 A comprehensive system for tracking and analyzing Serie A (soccer) and NHL (hockey) match results with historical betting odds to identify market inefficiencies and betting opportunities.
 
+## Current Data Status (June 2026)
+
+This snapshot reflects the latest verification queries run against `sports_betting.db`.
+
+### Full Database Coverage (All Seasons Present)
+
+- Serie A match data: seasons **2022-2023 to 2025-2026** (`soccer_matches`, league='Serie A'), **1521** total matches
+- Serie A odds data: seasons **2022-2023 to 2025-2026** (`soccer_betting_odds` joined to Serie A matches), **1520** odds rows covering **1520** distinct matches
+- NHL game data: seasons **2023-2024 to 2025-2026** (`nhl_matches`), **4424** total games
+- NHL odds data: seasons **2023-2024 to 2025-2026** (`nhl_betting_odds` joined to `nhl_matches`), **2547** odds rows covering **2547** distinct games
+
+
 ## System Overview
 
 This system consists of three main components:
@@ -14,20 +26,23 @@ This system consists of three main components:
 
 ### Tables
 
-- **teams**: All teams with metadata (sport, league, country)
-- **matches**: Match/game records with results
-- **betting_odds**: Historical opening lines from sportsbooks
-- **match_outcomes**: Summarized match results for analysis
-- **betting_analysis**: Patterns and inefficiencies
+- **soccer_teams**: Serie A team metadata (`team_id`, `name`, `league`, `country`)
+- **soccer_matches**: Serie A fixtures/results (`season`, teams, scores, halftime scores, `match_status`)
+- **soccer_betting_odds**: Soccer odds history (1X2, spread, totals, sportsbook/time metadata)
+- **nhl_teams**: NHL team metadata (`team_id`, `name`, `country`)
+- **nhl_matches**: NHL games/results (`season`, teams, scores, `match_status`)
+- **nhl_betting_odds**: NHL odds history (moneyline, spread, totals, sportsbook/time metadata)
 
 ### Key Relationships
 
 ```
-teams
-  ├── matches (home_team_id, away_team_id)
-  │   ├── betting_odds
-  │   └── match_outcomes
-  └── betting_analysis
+soccer_teams
+  └── soccer_matches (home_team_id, away_team_id)
+      └── soccer_betting_odds (match_id)
+
+nhl_teams
+  └── nhl_matches (home_team_id, away_team_id)
+      └── nhl_betting_odds (match_id)
 ```
 
 ## Getting Started
@@ -43,20 +58,14 @@ init_database()
 
 This creates a SQLite database file: `sports_betting.db`
 
-### 2. Add Sample Data
+### 2. Ingest Data
 
-```python
-from data_collector import SportDataCollector
+Use the update/import scripts in Section 3 to populate the database with
+current Serie A and NHL results/odds data.
 
-collector = SportDataCollector()
-collector.add_sample_data()
-```
+### 3. Updating Serie A and NHL Data
 
-This adds sample Serie A and NHL teams and matches for testing.
-
-### 3. Import Historical Data
-
-#### Option A: Use the Unified Serie A Updater
+#### For Serie A Data Updates - Use the Unified Serie A Updater
 
 The script `update_serie_a_results.py` is the primary way to keep your Serie A match data current. It can use two different data sources, specified with the `--source` flag.
 
@@ -77,11 +86,17 @@ This is the recommended method for automated, recurring updates. It fetches data
   # Activate the virtual environment first
   source .venv/bin/activate
 
-  # Update the current season's results
+  # Option A: pass key explicitly
   python update_serie_a_results.py YOUR_API_KEY
 
+  # Option B: read key from env var
+  export FOOTBALL_DATA_API_KEY=YOUR_API_KEY
+
+  # Update the current season's results
+  python update_serie_a_results.py
+
   # Update a specific season (e.g., 2024-25)
-  python update_serie_a_results.py YOUR_API_KEY --season 2024
+  python update_serie_a_results.py --season 2024
   ```
 - **Automation**: You can schedule this to run automatically (e.g., via cron) to keep your database fresh.
 
@@ -125,7 +140,48 @@ SQL
 
 If that query returns `0`, there are no completed Serie A matches missing score fields.
 
-#### Option B: NHL API (Free, No Auth Required)
+#### For NHL Data Updates - Use NHL API (Free, No Auth Required)
+
+For routine NHL results refreshes, use the unified updater script:
+
+```bash
+source .venv/bin/activate
+
+# Sync current NHL season
+python update_nhl_results.py
+
+# Sync a specific season (e.g. 2025-26)
+python update_nhl_results.py --season 2025
+
+# Historical/backfill mode: write completed games only
+python update_nhl_results.py --season 2024 --completed-only
+```
+
+This updates `nhl_matches` with the latest schedule state and final scores.
+NHL betting odds are still imported separately via `import_nhl_odds.py`.
+
+### NHL Maintenance Scripts (Recommended Workflow)
+
+Use these scripts together when refreshing NHL data:
+
+```bash
+source .venv/bin/activate
+
+# 1) Sync NHL schedule + results
+python update_nhl_results.py --season 2025
+
+# 2) Import NHL odds from a source file or API
+python import_nhl_odds.py --season 2025 <odds_file.csv>
+
+# 3) Validate odds coverage progress
+python validate_nhl_odds_coverage.py --season 2025
+```
+
+Script roles:
+- `update_nhl_results.py`: user-facing unified updater for NHL fixtures and final scores.
+- `import_nhl_odds.py`: imports NHL odds from The Odds API (`--future-only`) or local CSV input.
+- `validate_nhl_odds_coverage.py`: tracks progress to full odds coverage by market type.
+- `nhl_results_sync.py`: shared internal sync logic used by the updater and collector modules.
 
 The repository now supports the `nhl-api-py` package (imported as `nhlpy`),
 which wraps the official NHL web endpoints and handles rate‑limits and
@@ -170,138 +226,110 @@ collector.collect_nhl_historical_data(seasons=['20232024', '20242025', '20212022
 - Only completed games with final scores are inserted into the `matches` table
 - Existing games are skipped gracefully, so you can safely re-run the method
 
-#### Option C: Manual Data Import
-
-You can also manually import historical data using CSV:
-
-```python
-from sports_db import add_team, add_match, add_betting_odds, update_match_result
-import csv
-
-# Read from CSV and populate database
-with open('historical_matches.csv') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        # Parse and add to database
-        pass
-```
 
 ## Database Operations
 
 ### Adding Data
 
 ```python
-from sports_db import add_team, add_match, add_betting_odds, update_match_result
+from sports_db import (
+    ensure_soccer_team,
+    add_soccer_match,
+    add_soccer_betting_odds,
+    update_soccer_match_result,
+)
 
 # Add teams
-home_team_id = add_team('AC Milan', 'Soccer', 'Serie A', 'Italy')
-away_team_id = add_team('Inter Milan', 'Soccer', 'Serie A', 'Italy')
+home_team_id = ensure_soccer_team('AC Milan', 'Serie A', 'Italy')
+away_team_id = ensure_soccer_team('Inter', 'Serie A', 'Italy')
 
 # Add match
-match_id = add_match(
-    sport='Soccer',
+match_id = add_soccer_match(
     league='Serie A',
     season=2024,
     home_team_id=home_team_id,
     away_team_id=away_team_id,
     match_date='2024-02-01T20:00:00',
-    status='scheduled'
+    status='scheduled',
 )
 
 # Add betting odds
-add_betting_odds(
+add_soccer_betting_odds(
     match_id=match_id,
     sportsbook='DraftKings',
     odds_date='2024-01-31T12:00:00',
     home_moneyline=-120,
+    draw_moneyline=240,
     away_moneyline=100,
     spread_home=-1.5,
+    spread_away=1.5,
     over_under=2.5,
     notes='Opening lines'
 )
 
 # Update with final result
-update_match_result(match_id, home_score=2, away_score=1)
+update_soccer_match_result(
+    match_id,
+    home_score=2,
+    away_score=1,
+    halftime_home=1,
+    halftime_away=0,
+)
 ```
 
 ### Querying Data
 
 ```python
-from sports_db import get_matches_by_league_and_date, get_betting_odds_for_match, get_all_teams
+from sports_db import get_soccer_matches, get_nhl_matches
 
-# Get all Serie A teams
-teams = get_all_teams(league='Serie A')
+# Get completed Serie A matches for a season
+serie_a_matches = get_soccer_matches(league='Serie A', season=2025, status='completed')
 
-# Get matches within date range
-matches = get_matches_by_league_and_date(
-    league='Serie A',
-    start_date='2024-01-01T00:00:00',
-    end_date='2024-12-31T23:59:59'
-)
-
-# Get betting odds for specific match
-odds = get_betting_odds_for_match(match_id=123)
+# Get completed NHL games for a season
+nhl_games = get_nhl_matches(season=2025, status='completed')
 ```
 
 ## Betting Analysis
 
-### Moneyline Accuracy
+This repository is primarily script-driven for analysis workflows. Prefer running
+the scripts below directly instead of using inline Python snippets.
 
-Analyze how often favorites won vs underdogs pulled upsets:
-
-```python
-from betting_analyzer import BettingAnalyzer
-
-analyzer = BettingAnalyzer()
-results = analyzer.analyze_moneyline_accuracy(
-    league='Serie A',
-    sport='Soccer',
-    days=365  # Last 365 days
-)
-
-# Results include:
-# - total_games: Number of matches analyzed
-# - favorite_wins: Times favorite won
-# - favorite_win_rate: Percentage
-# - upset_count: Underdog wins
+```bash
+source .venv/bin/activate
 ```
 
-### Spread Covering Analysis
+### Core Analysis Scripts
 
-Identify if favorites consistently beat or miss their spreads:
+- `python analyze_serie_a.py`
+  - Full multi-section Serie A analysis across available seasons.
+- `python analyze_serie_a.py --season 2025`
+  - Single-season Serie A analysis.
+- `python analyze_betting.py`
+  - NHL betting/coverage analysis report (moneyline, spread, totals, team-level summaries).
+- `python advanced_analysis.py`
+  - Additional deeper-dive analysis queries.
 
-```python
-results = analyzer.analyze_spread_covering(
-    league='NHL',
-    sport='Hockey',
-    days=365
-)
+### Strategy Evaluation Scripts
 
-# Results include:
-# - home_covers: Times home team covered
-# - away_covers: Times away team covered
-# - pushes: Exact spread results
-```
+- `python backtest.py`
+  - Backtesting framework for strategy performance.
+- `python param_sweep.py`
+  - Parameter sweep for strategy tuning.
+- `python calculate_favorite_roi.py`
+  - ROI view for favorite-oriented approaches.
+- `python calculate_underdog_roi.py`
+  - ROI view for underdog-oriented approaches.
+- `python inspect_away_bets.py`
+  - Investigation helper for away-bet behavior.
 
-### Line Movement Opportunities
+### Data Quality Validation for Analysis Inputs
 
-Find games where opening lines moved significantly:
+- `python validate_serie_a_matches.py`
+- `python validate_nhl_matches.py`
+- `python validate_nhl_odds_coverage.py --season 2025`
 
-```python
-results = analyzer.identify_line_movement_opportunities(
-    league='Serie A',
-    days=30  # Last 30 days
-)
-
-# Identifies moves of 0.20+ (significant sharp money movement)
-```
-
-### Generate Summary Report
-
-```python
-analyzer.generate_summary_report('Serie A', 'Soccer')
-analyzer.generate_summary_report('NHL', 'Hockey')
-```
+These validation scripts are useful pre-analysis checks to confirm coverage and
+avoid misleading outputs from partial datasets.
 
 ## Data Sources for Historical Betting Odds
 
@@ -309,9 +337,9 @@ analyzer.generate_summary_report('NHL', 'Hockey')
 
 **Kaggle: NHL Historical Game Data**
 - Source: https://www.kaggle.com/datasets/jonathanncoletti/nhl-historical-game-data
-- File: `nhl_data_extensive_last_two_years.csv`
+- File: `data/csv/nhl_data_extensive_last_two_years.csv`
 - Contains: 2+ seasons of NHL games with ESPN betting odds (moneylines, spreads, over/under)
-- Imported via: `import_betting_odds.py`
+- Imported via: `import_nhl_odds.py` (local CSV mode)
 - Note: Includes spread values and favorite moneyline, but NOT spread odds or over/under odds (these would need to be sourced separately)
 
 ### Additional Data Sources for Reference
@@ -349,77 +377,6 @@ When importing betting data, use this format:
     "over_under": 2.5,
     "notes": "Opening lines"
 }
-```
-
-## Analysis Examples
-
-### Find Teams That Outperform Spreads
-
-```python
-from betting_analyzer import BettingAnalyzer
-
-analyzer = BettingAnalyzer()
-
-# Check which teams consistently cover (beat their spreads)
-spreads = analyzer.analyze_spread_covering('Serie A', 'Soccer', days=365)
-
-# A team that covers >55% of the time is a potential edge
-```
-
-### Identify Upset Trends
-
-```python
-# Moneyline analysis shows upset frequency
-ml_results = analyzer.analyze_moneyline_accuracy('NHL', 'Hockey', days=365)
-
-# If underdogs win >45% of the time, there's value in underdog betting
-```
-
-### Track Line Movement
-
-```python
-# Lines that move >0.20 (20 cents) typically indicate sharp action
-movements = analyzer.identify_line_movement_opportunities('Serie A', days=30)
-
-# Moves away from public betting patterns may indicate value
-```
-
-## Database Maintenance
-
-### Backup Database
-
-```bash
-# In PowerShell
-Copy-Item sports_betting.db sports_betting_backup.db
-```
-
-### Export Data to CSV
-
-```python
-import sqlite3
-import csv
-
-conn = sqlite3.connect('sports_betting.db')
-cursor = conn.cursor()
-
-cursor.execute('SELECT * FROM matches WHERE league = ?', ('Serie A',))
-matches = cursor.fetchall()
-
-with open('serie_a_matches.csv', 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerows(matches)
-
-conn.close()
-```
-
-### Clean Database (Reset for Testing)
-
-```python
-import os
-from sports_db import DATABASE_PATH
-
-os.remove(DATABASE_PATH)
-# Then re-run init_database()
 ```
 
 ## Tips for Building a Successful Analysis
@@ -473,85 +430,7 @@ If certain fields are NULL:
 
 ---
 
-**Last Updated**: February 2025
+**Last Updated**: June 2026
 **Database Version**: 1.0
 
-### 4. Import Serie A Odds (All-in-One)
-
-The script `import_serie_a_odds.py` lets you import Serie A betting odds using the appropriate backend for the job:
-- historical/completed-fixture odds are pulled from football-data.co.uk
-- future/upcoming odds are pulled from The Odds API
-- local CSV import is still available when you explicitly provide a file
-
-**Recommended: Auto-download and import odds for a season**
-
-```bash
-# Activate the virtual environment first
-source .venv/bin/activate
-
-# Download and import odds for the 2024-25 season (season code: 2024)
-python import_serie_a_odds.py --download --season 2024
-
-# Download and import odds for multiple seasons
-python import_serie_a_odds.py --download --season 2023 2024
-```
-
-**If you want future odds (for example, next matchday):**
-
-```bash
-# Import upcoming odds from The Odds API
-python import_serie_a_odds.py --season 2025 --future-only
-```
-
-- `--future-only` automatically uses The Odds API and reads `THE_ODDS_API_KEY` from your environment.
-- If you explicitly pass a CSV file with `--future-only`, the script will import from that file instead.
-- If you do not specify `--sportsbook`, future imports default to `Pinnacle` because `Bet365` is not present in the current Odds API feed.
-
-- `--season` uses the season start year (for example, `2025` means 2025-26).
-- Historical odds can be fetched from football-data.co.uk and imported directly into your database.
-
-**Import from a local CSV file (advanced/manual):**
-
-```bash
-python import_serie_a_odds.py --season 2024 I1.csv
-```
-
-- You must specify the season for each file.
-- The script will match and import odds for all Serie A matches in the database.
-
-**Options:**
-- `--insert-missing`: Insert missing matches from CSV rows that include a result.
-- `--sportsbook`: Set the preferred sportsbook name. Historical imports default to `Bet365`; future Odds API imports default to `Pinnacle` unless you specify another available bookmaker.
-- `--future-only`: Import odds only for matches on/after today.
-
----
-
-### 5. Import NHL Odds
-
-**Future odds via The Odds API (recommended):**
-
-```bash
-python import_nhl_odds.py --future-only
-```
-
-- Automatically fetches upcoming NHL game odds from The Odds API.
-- Requires `THE_ODDS_API_KEY` set in your environment.
-- Default sportsbook is `DraftKings` (US region). Pass `--sportsbook` to select another.
-- There is no free recurring source for NHL historical odds, so `--download` is not supported.
-
-**Import from a local CSV file (e.g. a Kaggle export):**
-
-```bash
-python import_nhl_odds.py --season 2023 nhl_games_with_odds.csv
-```
-
-- `--season` is required and uses the season start year (e.g. `2023` for 2023-24).
-- The CSV is expected to have columns matching the Kaggle NHL odds export format:
-  `home_team`, `away_team`, `match_date`, `sportsbook`, `odds_date`,
-  `home_moneyline`, `away_moneyline`, `spread_home`, `spread_away`,
-  `spread_home_odds`, `spread_away_odds`, `over_under`, `over_odds`, `under_odds`, `notes`.
-
-**Options:**
-- `--sportsbook`: Override the preferred sportsbook for the import.
-- `--future-only`: When combined with a CSV file, skips any past matches in the file.
 

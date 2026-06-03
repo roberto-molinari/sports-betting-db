@@ -1,5 +1,6 @@
 import sqlite3
 import csv
+from pathlib import Path
 from sports_db import DATABASE_PATH
 
 conn = sqlite3.connect(DATABASE_PATH)
@@ -44,7 +45,9 @@ if not rows:
     exit(1)
 
 columns = rows[0].keys()
-output_file = 'nhl_games_with_odds.csv'
+output_dir = Path('data/csv')
+output_dir.mkdir(parents=True, exist_ok=True)
+output_file = output_dir / 'nhl_games_with_odds.csv'
 with open(output_file, 'w', newline='') as f:
     writer = csv.DictWriter(f, fieldnames=columns)
     writer.writeheader()

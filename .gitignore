@@ -5,3 +5,6 @@ __pycache__/
 *.backup*
 .DS_Store
 notes.txt
+*.csv
+nhl_odds_derived_*.csv
+matchday*_picks.csv

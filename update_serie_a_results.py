@@ -32,6 +32,7 @@ import requests
 import time
 import argparse
 import csv
+import os
 from datetime import datetime
 
 DB_PATH = 'sports_betting.db'
@@ -173,12 +174,10 @@ def load_existing_matches(conn, season):
 # ---------------------------------------------------------------------------
 
 def fetch_season_data(api_key, season):
-# ...existing code...
     headers = {'X-Auth-Token': api_key}
     params = {'season': season}
 
     print(f"  Fetching teams for season {season}...", end=' ', flush=True)
-# ...existing code...
     r = requests.get(f"{API_BASE}/competitions/{SERIE_A_CODE}/teams",
                      headers=headers, params=params, timeout=15)
     if r.status_code == 400:
@@ -186,12 +185,11 @@ def fetch_season_data(api_key, season):
         r = requests.get(f"{API_BASE}/competitions/{SERIE_A_CODE}/teams",
                          headers=headers, timeout=15)
     r.raise_for_status()
-# ...existing code...
+    teams = r.json().get('teams', [])
     print(f"{len(teams)} teams")
     time.sleep(RATE_LIMIT_DELAY)
 
     print(f"  Fetching matches for season {season}...", end=' ', flush=True)
-# ...existing code...
     r = requests.get(f"{API_BASE}/competitions/{SERIE_A_CODE}/matches",
                      headers=headers, params=params, timeout=15)
     r.raise_for_status()
@@ -414,18 +412,20 @@ def main():
     )
     parser.add_argument(
         'api_key', nargs='?', default=None,
-        help='Your football-data.org API key (required for --source api).'
+        help='Your football-data.org API key. If omitted, reads FOOTBALL_DATA_API_KEY.'
     )
     args = parser.parse_args()
 
-    if args.source == 'api' and not args.api_key:
-        parser.error("--source 'api' requires an api_key.")
+    api_key = args.api_key or os.getenv('FOOTBALL_DATA_API_KEY')
+
+    if args.source == 'api' and not api_key:
+        parser.error("--source 'api' requires an api_key or FOOTBALL_DATA_API_KEY.")
 
     season = args.season or current_season_year()
     print(f"=== Serie A Sync  {datetime.now().strftime('%Y-%m-%d %H:%M')}  season={season}  source={args.source} ===\n")
 
     if args.source == 'api':
-        sync_from_api(args.api_key, season)
+        sync_from_api(api_key, season)
     elif args.source == 'csv':
         sync_from_csv(season)
 

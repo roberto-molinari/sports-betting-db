@@ -9,15 +9,9 @@ import time
 from datetime import datetime, timedelta
 from sports_db import (
     ensure_soccer_team, add_soccer_match, update_soccer_match_result,
-    ensure_nhl_team, get_nhl_team_id, add_nhl_match, update_nhl_match_result,
     init_database
 )
-
-# optional NHL helper library for newer API endpoints
-try:
-    from nhlpy import NHLClient
-except ImportError:  # package not installed, we'll fall back to raw HTTP
-    NHLClient = None
+from nhl_results_sync import sync_many_nhl_seasons, sync_nhl_results
 
 
 class SportDataCollector:
@@ -134,119 +128,24 @@ class SportDataCollector:
     
     def collect_nhl_data(self, season=2024):
         """
-        Collect NHL hockey data using the `nhlpy` helper package if available.
-        The wrapper hides the details of the underlying NHL endpoints and
-        provides higher‑level helpers for teams, schedules, stats, etc.
-
-        If `nhlpy` isn't installed we fall back to the original direct HTTP
-        requests against `statsapi.web.nhl.com` (which may be subject to DNS
-        issues as you've experienced).
+        Collect NHL hockey data for a season.
+        Uses shared sync logic also used by update_nhl_results.py.
         """
         print(f"Collecting NHL data for season {season}...")
-
-        # Make sure the database exists
-        init_database()
-
-        nhl_teams = {}
         try:
-            if NHLClient is not None:
-                # use nhlpy for all calls
-                client = NHLClient()
-
-                print("Fetching NHL teams via nhlpy...")
-                teams_list = client.teams.teams()
-
-                # teams_list is a simple list of team dicts
-                for t in teams_list:
-                    # name, abbreviation, maybe country
-                    country = t.get("country", "USA/Canada")
-                    team_id = ensure_nhl_team(
-                        name=t.get("name", ""),
-                        country=country,
-                    )
-                    # store by abbreviation so we can look teams up later
-                    nhl_teams[t.get("abbr")] = team_id
-                    print(f"  Added: {t.get('name')} ({t.get('abbr')})")
-
-                print(f"\n✓ Added {len(nhl_teams)} NHL teams to database")
-
-                # optionally pull schedule/games for the season; nhlpy exposes
-                # several helper methods, e.g. calendar_schedule() for a given
-                # date or team_season_schedule(team_abbr, season_str).
-                # We'll fetch the full season schedule for each team and insert
-                # matches/results where available, similar to the old code.
-
-                season_str = f"{season}{season+1:04d}"
-                print(f"Fetching season schedules ({season_str})...")
-
-                games_added = 0
-                for abbr, team_db_id in nhl_teams.items():
-                    sched = client.schedule.team_season_schedule(
-                        team_abbr=abbr, season=season_str
-                    )
-
-                    # sched is a dict containing a 'games' list
-                    for game in sched.get("games", []):
-                        home = game.get("homeTeam")
-                        away = game.get("awayTeam")
-                        # map abbreviation to our database id
-                        home_id = nhl_teams.get(home.get("abbrev") or home.get("abbr"))
-                        away_id = nhl_teams.get(away.get("abbrev") or away.get("abbr"))
-                        if not home_id or not away_id:
-                            continue
-
-                        status = "completed" if game.get("gameState") in [
-                            "FINAL", "LIVE"
-                        ] else "scheduled"
-
-                        match_date = game.get("startTimeUTC")
-                        match_id = add_nhl_match(
-                            season=season,
-                            home_team_id=home_id,
-                            away_team_id=away_id,
-                            match_date=match_date,
-                            status=status,
-                        )
-
-                        # update result if finished
-                        if status == "completed":
-                            home_score = home.get("score", 0)
-                            away_score = away.get("score", 0)
-                            update_nhl_match_result(
-                                match_id, home_score=home_score, away_score=away_score
-                            )
-
-                        games_added += 1
-
-                print(f"✓ Added {games_added} NHL games from schedules")
-                print(
-                    "\n⚠️  Note: nhlpy (and the NHL API) still do not provide "
-                    "betting odds.  You'll need a separate source for lines."
-                )
-
-                return True
-
-            else:
-                # fallback to raw HTTP call if nhlpy not installed
-                print("nhlpy not available; falling back to direct NHL API")
-                base_url = "https://statsapi.web.nhl.com/api/v1"
-
-                teams_url = f"{base_url}/teams"
-                response = requests.get(teams_url)
-                response.raise_for_status()
-                teams_data = response.json()
-
-                for team in teams_data["teams"]:
-                    if team.get("active"):
-                        team_id = ensure_nhl_team(
-                            name=team.get("name"),
-                            country="USA/Canada",
-                        )
-                        nhl_teams[team["id"]] = team_id
-
-                print(f"Added {len(nhl_teams)} NHL teams to database")
-                print("⚠️  Note: NHL API provides game results but limited betting odds.")
-                return True
+            stats = sync_nhl_results(
+                season,
+                completed_only=False,
+                initialize_db=True,
+                verbose=True,
+            )
+            print(f"✓ Synced {stats['games_written']} unique NHL games")
+            print(f"✓ Updated {stats['results_updated']} completed game results")
+            print(
+                "\n⚠️  Note: NHL API provides results/schedule data only; "
+                "run import_nhl_odds.py separately for odds."
+            )
+            return True
 
         except Exception as e:
             print(f"Error collecting NHL data: {e}")
@@ -272,111 +171,18 @@ class SportDataCollector:
             seasons = ['20232024', '20242025']
         
         print(f"\nCollecting historical NHL data for seasons: {seasons}")
-        init_database()
-        
+
         try:
-            if NHLClient is None:
-                print("⚠️  nhlpy not available; cannot collect historical data")
-                return False
-            
-            client = NHLClient()
-            
-            # Fetch all teams once (reuse across seasons)
-            print("Fetching NHL teams...")
-            teams_list = client.teams.teams()
-            nhl_teams_by_abbr = {}
-            
-            for t in teams_list:
-                abbr = t.get('abbr')
-                name = t.get('name', '')
-                country = t.get('country', 'USA/Canada')
-                
-                # Try to get existing team or add new one
-                team_id = get_nhl_team_id(name)
-                if team_id is None:
-                    team_id = ensure_nhl_team(
-                        name=name,
-                        country=country
-                    )
-                    print(f"  Added: {name}")
-                else:
-                    print(f"  Found existing: {name}")
-                
-                nhl_teams_by_abbr[abbr] = team_id
-            
-            print(f"✓ Total {len(nhl_teams_by_abbr)} NHL teams in database\n")
-            
-            # For each season, fetch all team schedules
-            total_games_added = 0
-            for season_str in seasons:
-                print(f"Fetching schedules for season {season_str}...")
-                season_int = int(season_str[:4])
-                games_this_season = 0
-                
-                # Fetch schedule for each team
-                for abbr, team_id in nhl_teams_by_abbr.items():
-                    try:
-                        sched = client.schedule.team_season_schedule(
-                            team_abbr=abbr, season=season_str
-                        )
-                        
-                        for game in sched.get('games', []):
-                            # Only insert completed games with results
-                            game_state = game.get('gameState', '')
-                            if game_state not in ['FINAL', 'OFF']:
-                                # Skip unfinished games
-                                continue
-                            
-                            home_team = game.get('homeTeam', {})
-                            away_team = game.get('awayTeam', {})
-                            
-                            home_abbr = home_team.get('abbrev')
-                            away_abbr = away_team.get('abbrev')
-                            
-                            home_id = nhl_teams_by_abbr.get(home_abbr)
-                            away_id = nhl_teams_by_abbr.get(away_abbr)
-                            
-                            if not home_id or not away_id:
-                                continue
-                            
-                            match_date = game.get('startTimeUTC')
-                            home_score = home_team.get('score')
-                            away_score = away_team.get('score')
-                            
-                            # Skip if scores are missing
-                            if home_score is None or away_score is None:
-                                continue
-                            
-                            try:
-                                match_id = add_nhl_match(
-                                    season=season_int,
-                                    home_team_id=home_id,
-                                    away_team_id=away_id,
-                                    match_date=match_date,
-                                    status='completed'
-                                )
-                                
-                                update_nhl_match_result(
-                                    match_id,
-                                    home_score=home_score,
-                                    away_score=away_score
-                                )
-                                
-                                games_this_season += 1
-                            except Exception as e:
-                                # Handle duplicate matches gracefully
-                                if 'UNIQUE constraint failed' in str(e):
-                                    pass  # Already in database
-                                else:
-                                    print(f"  Error adding match: {e}")
-                    
-                    except Exception as e:
-                        print(f"  Error fetching schedule for {abbr}: {e}")
-                
-                print(f"  ✓ Added {games_this_season} games for season {season_str}")
-                total_games_added += games_this_season
-            
-            print(f"\n✓ Total games added: {total_games_added}")
+            season_years = [int(s[:4]) for s in seasons]
+            stats = sync_many_nhl_seasons(
+                season_years,
+                completed_only=True,
+                initialize_db=True,
+                verbose=True,
+            )
+            print(f"\n✓ Seasons synced: {stats['seasons']}")
+            print(f"✓ Completed games written: {stats['completed_written']}")
+            print(f"✓ Results updated: {stats['results_updated']}")
             return True
         
         except Exception as e:

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from sports_db import DATABASE_PATH
+from sports_db import DATABASE_PATH, canonical_nhl_team_name
 
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds"
 ODDS_API_DEFAULT_BOOK = "DraftKings"
@@ -66,7 +66,12 @@ def parse_args():
 def load_team_map(conn):
     cur = conn.cursor()
     cur.execute("SELECT name, team_id FROM nhl_teams")
-    return dict(cur.fetchall())
+    mapping = dict(cur.fetchall())
+    # Add canonicalized aliases for importer-side lookups.
+    for name, team_id in list(mapping.items()):
+        canonical = canonical_nhl_team_name(name)
+        mapping.setdefault(canonical, team_id)
+    return mapping
 
 
 def load_match_index(conn, season=None):
@@ -212,8 +217,8 @@ def import_odds_api(conn, preferred_sportsbook, season=None):
             skipped += 1
             continue
 
-        home_name = event.get("home_team", "").strip()
-        away_name = event.get("away_team", "").strip()
+        home_name = canonical_nhl_team_name(event.get("home_team", "").strip())
+        away_name = canonical_nhl_team_name(event.get("away_team", "").strip())
         home_id = team_map.get(home_name)
         away_id = team_map.get(away_name)
 
@@ -331,8 +336,8 @@ def import_csv(conn, csv_path, season, sportsbook, future_only=False):
                 skipped_past += 1
                 continue
 
-            home_name = (row.get("home_team") or "").strip()
-            away_name = (row.get("away_team") or "").strip()
+            home_name = canonical_nhl_team_name((row.get("home_team") or "").strip())
+            away_name = canonical_nhl_team_name((row.get("away_team") or "").strip())
             home_id = team_map.get(home_name)
             away_id = team_map.get(away_name)
 
