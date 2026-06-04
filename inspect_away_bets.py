@@ -162,7 +162,7 @@ def breakdown(records: list[dict], group_key: str, label: str):
         groups[g]["profit"] += r["profit"]
 
     if not groups:
-        print(f"\n  (no bets)\n")
+        print("\n  (no bets)\n")
         return
 
     print(f"\n--- By {label} ---")
@@ -228,7 +228,7 @@ def cross_season_breakdown(records_by_season: dict, group_key: str, label: str, 
 
     print(f"\n=== Cross-season: {label} (min {min_bets} bets per season, in all seasons) ===")
     if not stable:
-        print(f"  (no group meets criteria)")
+        print("  (no group meets criteria)")
         # fall back: show all with >= min_bets in at least one season
         seen_any = {g for g in all_groups
                     if any(agg.get((s, g), {}).get("bets", 0) >= min_bets for s in seasons)}

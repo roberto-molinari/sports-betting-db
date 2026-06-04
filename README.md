@@ -408,6 +408,64 @@ When importing betting data, use this format:
 4. **Refine models**: Use analysis results to improve predictions
 5. **Backtest strategies**: Test strategies on historical data before live betting
 
+## Tests
+
+Automated tests live in `tests/` and use [pytest](https://docs.pytest.org/).
+
+**Setup** (one-time, with the virtualenv active):
+```bash
+pip install -r requirements-dev.txt   # installs pytest (and ruff)
+```
+
+**Running them** (from the project root):
+```bash
+pytest                     # the fast unit tests (default)
+pytest -v                  # same, but list every test name
+pytest -m data_integrity   # ONLY the live-DB data-quality checks (opt-in)
+pytest -m ""               # everything: unit + data-integrity together
+```
+
+There are two kinds of test, and they fail for different reasons:
+
+| Suite | Checks | Uses real DB? |
+|-------|--------|---------------|
+| `test_poisson_model.py`, `test_db_smoke.py` | The **code** (odds/Poisson math, schema + CRUD logic), run against a throwaway temp DB with seeded sample rows | No |
+| `test_data_integrity.py` | The **actual data** in `sports_betting.db` (no duplicate fixtures, completed games have scores, referential integrity, …) | Yes — opens it read-only, skips if absent |
+
+Plain `pytest` deliberately **skips** the data-integrity checks (configured via
+`addopts` in `pyproject.toml`), so the everyday run is fast and doesn't depend
+on the data file. A failing data-integrity test means the *data* needs fixing,
+not the code. Test config lives in `pyproject.toml` under
+`[tool.pytest.ini_options]`.
+
+## Linting (ruff)
+
+[ruff](https://docs.astral.sh/ruff/) is the project linter. It catches real
+bugs (undefined names, unused imports, f-strings with no placeholders) and can
+auto-fix many of them.
+
+**Setup** (one-time, with the virtualenv active):
+```bash
+pip install -r requirements-dev.txt   # installs ruff (and pytest)
+```
+
+**Running it** (from the project root):
+```bash
+ruff check .          # report problems
+ruff check . --fix    # auto-fix the safe ones (e.g. unused imports)
+ruff format .         # reformat code style (optional, separate from check)
+```
+
+**Configuration** lives in `pyproject.toml` under `[tool.ruff]`:
+- `extend-exclude = ["legacy", ".venv"]` — the deprecated `legacy/` scripts are
+  not linted.
+- `[tool.ruff.lint] select = ["E4", "E7", "E9", "F"]` — a conservative rule set:
+  pyflakes (`F`) bug-catching plus a few pycodestyle (`E`) error classes.
+  Style-only rules are intentionally left off; widen `select` later if useful.
+
+Ruff is **run manually** — nothing triggers it automatically (no commit hook or
+CI). Run it whenever you like; it takes well under a second on this codebase.
+
 ## Support & Troubleshooting
 
 ### Database Locks

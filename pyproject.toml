@@ -1,0 +1,22 @@
+[tool.pytest.ini_options]
+# Make the repo root importable so `from core.sports_db import ...` works
+# when tests are run from anywhere.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "data_integrity: checks run against the live sports_betting.db (data quality, not unit logic)",
+]
+# Unit tests run by default; the slower live-DB data-integrity checks are opt-in.
+addopts = "-m 'not data_integrity'"
+
+[tool.ruff]
+# Start small: lint the maintained code, not the deprecated scripts.
+extend-exclude = ["legacy", ".venv"]
+target-version = "py314"
+
+[tool.ruff.lint]
+# Conservative default rule set: pyflakes (F) catches real bugs — undefined
+# names, unused imports/variables, f-strings with no placeholders — and a few
+# pycodestyle error classes (E). Style-only noise is left off for now; widen
+# later if it proves useful.
+select = ["E4", "E7", "E9", "F"]

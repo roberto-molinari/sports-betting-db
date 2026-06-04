@@ -1,0 +1,4 @@
+# Development / testing dependencies (not needed to run the analysis scripts).
+# Install with:  pip install -r requirements-dev.txt
+pytest>=8.0
+ruff>=0.6        # linter/formatter; config in pyproject.toml [tool.ruff]

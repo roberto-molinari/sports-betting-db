@@ -251,7 +251,7 @@ def run_backtest(ev_threshold: float = 0.0, season: int = 2025,
     print(f"  Total profit/loss   : ${total_profit:+.2f}")
     print(f"  ROI                 : {roi:+.1%}")
 
-    print(f"\n--- By Bet Type ---")
+    print("\n--- By Bet Type ---")
     print(f"  {'Side':>6}  {'Bets':>5}  {'Wins':>5}  {'Win rate':>9}  {'Profit':>9}  {'ROI':>8}")
     print("  " + "-" * 52)
     for side in ("home", "draw", "away"):

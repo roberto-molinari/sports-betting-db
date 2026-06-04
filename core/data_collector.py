@@ -4,9 +4,7 @@ Fetches historical match data and odds from free/public APIs
 """
 
 import requests
-import json
 import time
-from datetime import datetime, timedelta
 from core.sports_db import (
     ensure_soccer_team, add_soccer_match, update_soccer_match_result,
     init_database

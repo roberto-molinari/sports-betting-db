@@ -86,7 +86,7 @@ def run(season_filter=None):
     print(f"  Away wins : {aw:>5}  ({pct(aw, tot)})")
 
     if not season_filter:
-        print(f"\n  By season:")
+        print("\n  By season:")
         rows = q(f"""
             SELECT season,
                 SUM(CASE WHEN home_score > away_score THEN 1 ELSE 0 END),
@@ -129,7 +129,7 @@ def run(season_filter=None):
     print(f"  Over 2.5 goals          : {pct(over25, tot)}")
     print(f"  Over 3.5 goals          : {pct(over35, tot)}")
 
-    print(f"\n  Score frequency (top 10):")
+    print("\n  Score frequency (top 10):")
     rows = q(f"""
         SELECT home_score || '-' || away_score as scoreline, COUNT(*) as n
         FROM soccer_matches m

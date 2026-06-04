@@ -396,21 +396,6 @@ def import_csv(conn, csv_path: Path, season: int, sportsbook: str = "Bet365",
     }
 
 
-def resolve_default_files(base_dir):
-    resolved = []
-    for file_name, season in DEFAULT_IMPORTS:
-        path = base_dir / file_name
-        if path.exists():
-            resolved.append((path, season))
-    for file_name, season in FALLBACK_IMPORTS:
-        if any(existing_season == season for _, existing_season in resolved):
-            continue
-        path = base_dir / file_name
-        if path.exists():
-            resolved.append((path, season))
-    return resolved
-
-
 
 def download_serie_a_csv(season_code):
     url = f"https://www.football-data.co.uk/mmz4281/{season_code}/I1.csv"
