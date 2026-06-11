@@ -48,6 +48,23 @@ RECENCY_DECAY = 1.0
 # Set to 0 to disable shrinkage.
 SHRINKAGE_K = 0
 
+# ── World Cup constants ──────────────────────────────────────────────────────
+# Baseline goals per team per international match.  Team strength lambdas are
+# normalized around this, and it scales the attack/defense combination in
+# analyse_match_wc (parallel to the league average used for Serie A).
+WC_BASELINE = 1.35
+
+# Larger scoreline grid for the World Cup model.  WC totals lines run higher
+# than Serie A's (3.5 / 4.5 in lopsided games), so MAX_GOALS=6 would truncate
+# the over tail; 10 keeps it.
+WC_MAX_GOALS = 10
+
+# EV-gap thresholds mapping a pick's EV to a 1-3 star confidence rating.
+# ev >= 0.15 -> 3 stars, ev >= 0.075 -> 2 stars, otherwise 1 star.
+# 1 star is the catch-all floor (incl. sub-threshold and negative EV): the
+# requirements forbid abstention, so every match still gets a rated pick.
+STAR_THRESHOLDS = (0.075, 0.15)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -295,6 +312,54 @@ def compute_ev(p_model: float, american_odds: float) -> float:
     return p_model * d - 1
 
 
+def totals_probs(grid: list[list[float]], line: float) -> dict:
+    """
+    Split the scoreline grid's total-goals distribution around an arbitrary
+    over/under line (1.5, 2.0, 2.5, 3.5, ...).
+
+    For half-goal lines p_push is always 0.  For integer lines (2.0, 3.0) the
+    mass landing exactly on the line is a push.
+    """
+    p_over = p_under = p_push = 0.0
+    for i, row in enumerate(grid):
+        for j, prob in enumerate(row):
+            total = i + j
+            if total > line:
+                p_over += prob
+            elif total < line:
+                p_under += prob
+            else:
+                p_push += prob
+    return {"p_over": p_over, "p_under": p_under, "p_push": p_push}
+
+
+def compute_ev_totals(p_win: float, p_lose: float, american_odds: float) -> float:
+    """
+    Push-aware EV per $1 bet on a totals (over/under) market.
+
+    EV = p_win * (decimal - 1) - p_lose * 1   (a push returns the stake -> 0).
+    For half-goal lines p_lose == 1 - p_win and this reduces to compute_ev.
+    """
+    d = american_to_decimal(american_odds)
+    return p_win * (d - 1) - p_lose
+
+
+def ev_to_stars(ev: float, thresholds: tuple = STAR_THRESHOLDS) -> int:
+    """
+    Map a pick's EV to a 1-3 star confidence rating.
+
+    ev >= thresholds[1] -> 3, ev >= thresholds[0] -> 2, otherwise 1.
+    1 star is the floor (no abstention): even a low- or negative-EV best pick
+    is still rated and posted.
+    """
+    low, high = thresholds
+    if ev >= high:
+        return 3
+    if ev >= low:
+        return 2
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # High-level entry point
 # ---------------------------------------------------------------------------
@@ -365,6 +430,92 @@ def analyse_match(home_team_id: int, away_team_id: int,
     finally:
         if own_conn:
             conn.close()
+
+
+def analyse_match_wc(lambda_home_attack: float, lambda_away_attack: float,
+                     lambda_home_defense: float, lambda_away_defense: float,
+                     home_moneyline: float = None,
+                     draw_moneyline: float = None,
+                     away_moneyline: float = None,
+                     ou_line: float = None,
+                     over_odds: float = None,
+                     under_odds: float = None,
+                     baseline: float = WC_BASELINE,
+                     home_advantage: float = 1.0,
+                     away_advantage: float = 1.0) -> dict:
+    """
+    World Cup entry point — parallel to analyse_match() but accepts pre-computed
+    team strength lambdas directly instead of deriving them from match history.
+
+    The match-level expected goals are formed exactly like estimate_lambdas():
+    a team's attack is modulated by the opponent's defense, scaled by the
+    international baseline.
+
+        lambda_H = home_attack * (away_defense / baseline) * home_advantage
+        lambda_A = away_attack * (home_defense / baseline) * away_advantage
+
+    Parameters
+    ----------
+    lambda_home_attack, lambda_away_attack   : per-team attack strength (goals)
+    lambda_home_defense, lambda_away_defense : per-team defense strength
+                                               (goals conceded; lower = stronger)
+    home_moneyline, draw_moneyline, away_moneyline : American 1X2 odds (optional)
+    ou_line, over_odds, under_odds : posted totals line and its odds (optional).
+                                     The model evaluates over/under at THIS line.
+    baseline       : international goals-per-team baseline (default WC_BASELINE)
+    home_advantage : multiplier on lambda_H; 1.0 = neutral venue (default)
+    away_advantage : multiplier on lambda_A; 1.0 = neutral (default). Set >1.0
+                     when the nominal away team has the real venue edge — e.g. a
+                     host nation listed away but still playing in its own country.
+
+    Returns the same shape as analyse_match (lambdas, 1X2 probs, optional EVs)
+    plus, when ou_line is given, totals fields for the posted line.
+    """
+    lambda_H = lambda_home_attack * (lambda_away_defense / baseline) * home_advantage
+    lambda_A = lambda_away_attack * (lambda_home_defense / baseline) * away_advantage
+    lambda_H = max(lambda_H, 0.1)
+    lambda_A = max(lambda_A, 0.1)
+
+    grid  = scoreline_grid(lambda_H, lambda_A, max_goals=WC_MAX_GOALS)
+    probs = outcome_probs(grid)
+
+    result = {
+        "lambda_H":  lambda_H,
+        "lambda_A":  lambda_A,
+        "p_home":    probs["p_home"],
+        "p_draw":    probs["p_draw"],
+        "p_away":    probs["p_away"],
+    }
+
+    if home_moneyline is not None:
+        result["ev_home"]      = compute_ev(probs["p_home"], home_moneyline)
+        result["implied_home"] = american_to_implied_prob(home_moneyline)
+        result["decimal_home"] = american_to_decimal(home_moneyline)
+
+    if draw_moneyline is not None:
+        result["ev_draw"]      = compute_ev(probs["p_draw"], draw_moneyline)
+        result["implied_draw"] = american_to_implied_prob(draw_moneyline)
+        result["decimal_draw"] = american_to_decimal(draw_moneyline)
+
+    if away_moneyline is not None:
+        result["ev_away"]      = compute_ev(probs["p_away"], away_moneyline)
+        result["implied_away"] = american_to_implied_prob(away_moneyline)
+        result["decimal_away"] = american_to_decimal(away_moneyline)
+
+    if ou_line is not None:
+        totals = totals_probs(grid, ou_line)
+        result["ou_line"] = ou_line
+        result["p_over"]  = totals["p_over"]
+        result["p_under"] = totals["p_under"]
+        result["p_push"]  = totals["p_push"]
+        if over_odds is not None:
+            result["ev_over"] = compute_ev_totals(
+                totals["p_over"], totals["p_under"], over_odds)
+        if under_odds is not None:
+            result["ev_under"] = compute_ev_totals(
+                totals["p_under"], totals["p_over"], under_odds)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

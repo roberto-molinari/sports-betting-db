@@ -31,6 +31,13 @@ This system now has two layers:
 - **nhl_teams**: NHL team metadata (`team_id`, `name`, `country`)
 - **nhl_matches**: NHL games/results (`season`, teams, scores, `match_status`)
 - **nhl_betting_odds**: NHL odds history (moneyline, spread, totals, sportsbook/time metadata)
+- **soccer_wc_teams / soccer_wc_players / soccer_wc_player_stats**: World Cup 2026 national
+  teams, squad members, and each player's current-season club stats (xG and the club-team
+  defensive rate `club_xga_per90` used for defensive strength)
+- **soccer_wc_matches / soccer_wc_odds**: World Cup fixtures (with `stage`/`grp`) and per-book odds
+- **soccer_wc_team_strength**: computed `lambda_attack` / `lambda_defense` per team; multiple
+  versions per team are kept (e.g. updated after the group stage)
+- **soccer_wc_picks**: generated picks (side, odds, model prob, EV, stars, result) for scoring
 
 ### Key Relationships
 
@@ -42,6 +49,13 @@ soccer_teams
 nhl_teams
   └── nhl_matches (home_team_id, away_team_id)
       └── nhl_betting_odds (match_id)
+
+soccer_wc_teams
+  ├── soccer_wc_players → soccer_wc_player_stats
+  ├── soccer_wc_team_strength (lambda_attack, lambda_defense)
+  └── soccer_wc_matches (home_team_id, away_team_id)
+      ├── soccer_wc_odds (match_id)
+      └── soccer_wc_picks (match_id)
 ```
 
 ## Getting Started
@@ -399,6 +413,45 @@ When importing betting data, use this format:
 2. **Betting percentages**: When public heavily favors one side, opposite may have value
 3. **Home/Away patterns**: Some teams perform very differently at home vs away
 4. **Spread covering**: Teams that consistently over/under-perform their spread
+
+## World Cup 2026 Picks
+
+The World Cup extension reuses the same framework as Serie A — own probability →
+market-implied probability → EV gap → pick — but derives team strength from the
+**club** stats of each squad's players rather than from sparse national-team
+history. See `WC2026_REQUIREMENTS.md` and `WC2026_DESIGN.md` for the full rationale.
+
+**One-time setup (before the tournament):**
+
+```bash
+# 1) Pull the 48 squads and each player's current-season club stats
+#    (TheStatsAPI — includes club xG and the club-team defensive rate)
+python import_wc_squads.py
+python import_wc_player_stats.py        # prints a data-coverage report
+
+# 2) Aggregate player stats into per-team attack/defense lambdas
+python compute_wc_team_strength.py --print      # inspect first
+python compute_wc_team_strength.py --persist     # write a strength version
+```
+
+**Each matchday:**
+
+```bash
+# 3) Import that day's odds (transcribe a sportsbook screenshot to CSV:
+#    date,home,away,home_ml,draw_ml,away_ml,total,over_odds,under_odds)
+python import_wc_odds.py odds.csv --sportsbook DraftKings
+
+# 4) Generate the card (one best pick per match, 1-3 stars, stored for scoring).
+#    Over/under is evaluated at whatever line the book posted, not a fixed 2.5.
+python generate_wc_card.py --date 2026-06-11
+
+# 5) After results come in, record scores and grade the stored picks
+python update_wc_results.py results.csv          # or --home/--away/--*-score
+```
+
+Team strength can be recomputed and re-persisted during the tournament (e.g. after
+the group stage) — `soccer_wc_team_strength` keeps every version, and the card
+always uses the latest.
 
 ## Next Steps
 

@@ -10,6 +10,8 @@ import scripts rely on.
 
 import sqlite3
 
+import pytest
+
 from core import sports_db
 
 
@@ -122,3 +124,106 @@ def test_canonical_nhl_team_name_normalises_alias(db_path):
     b = sports_db.ensure_nhl_team("Montréal Canadiens")   # canonical
     assert a == b
     assert sports_db.get_nhl_team_id("Montreal Canadiens") == a
+
+
+# ── World Cup tables ─────────────────────────────────────────────────────────
+
+WC_TABLES = {
+    "soccer_wc_teams", "soccer_wc_players", "soccer_wc_player_stats",
+    "soccer_wc_matches", "soccer_wc_odds", "soccer_wc_team_strength",
+    "soccer_wc_picks",
+}
+
+
+def test_init_database_creates_wc_tables(db_path, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {row[0] for row in cur.fetchall()}
+    assert WC_TABLES <= tables
+
+
+def test_ensure_wc_team_is_idempotent(db_path):
+    first = sports_db.ensure_wc_team("Brazil", "CONMEBOL", 5)
+    second = sports_db.ensure_wc_team("Brazil", "CONMEBOL", 5)
+    assert first == second
+    assert sports_db.get_wc_team_id("Brazil") == first
+    assert sports_db.get_wc_team_id("Nowhere") is None
+
+
+def test_wc_player_and_stats_round_trip(db_path, conn):
+    team = sports_db.ensure_wc_team("Brazil", "CONMEBOL", 5)
+    p1 = sports_db.add_wc_player(team, "Vinicius Jr", position="FWD",
+                                 club="Real Madrid", club_league="La Liga")
+    # Re-adding the same player for the team reuses the row.
+    assert sports_db.add_wc_player(team, "Vinicius Jr") == p1
+
+    first = sports_db.upsert_wc_player_stats(p1, season=2025, minutes_played=2700,
+                                             xg=15.0, xg_per90=0.5, goals=18, assists=9,
+                                             club_xga_per90=1.0, source="stub")
+    # Upsert on the same (player, season) updates rather than duplicates.
+    again = sports_db.upsert_wc_player_stats(p1, season=2025, minutes_played=2800,
+                                             xg=16.0, xg_per90=0.51, source="stub")
+    assert first == again
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_wc_player_stats WHERE player_id = ?", (p1,))
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT minutes_played, club_xga_per90 FROM soccer_wc_player_stats WHERE stat_id = ?",
+                (first,))
+    row = cur.fetchone()
+    assert row[0] == 2800            # updated minutes
+    assert row[1] == pytest.approx(1.0)  # club xGA preserved across update path
+
+
+def test_ensure_wc_match_dedupes_on_fixture(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Serbia")
+    first = sports_db.ensure_wc_match("2026-06-11T19:00:00", home, away,
+                                      stage="group", grp="G")
+    second = sports_db.ensure_wc_match("2026-06-11T19:00:00", home, away,
+                                       stage="group", grp="G")
+    assert first == second
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_wc_matches")
+    assert cur.fetchone()[0] == 1
+
+
+def test_wc_odds_upsert_updates_in_place(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Serbia")
+    match_id = sports_db.ensure_wc_match("2026-06-11T19:00:00", home, away)
+    sports_db.upsert_wc_odds(match_id, "DraftKings", "2026-06-10",
+                             home_moneyline=-200, draw_moneyline=320, away_moneyline=600,
+                             over_under=3.5, over_odds=-110, under_odds=-110)
+    sports_db.upsert_wc_odds(match_id, "DraftKings", "2026-06-11",
+                             home_moneyline=-180, draw_moneyline=300, away_moneyline=550,
+                             over_under=3.0, over_odds=-105, under_odds=-115)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_wc_odds WHERE match_id = ?", (match_id,))
+    assert cur.fetchone()[0] == 1   # updated, not duplicated
+    cur.execute("SELECT home_moneyline, over_under FROM soccer_wc_odds WHERE match_id = ?",
+                (match_id,))
+    assert cur.fetchone() == (-180, 3.0)
+
+
+def test_wc_team_strength_keeps_versions_and_returns_latest(db_path, conn):
+    team = sports_db.ensure_wc_team("Brazil")
+    sports_db.set_wc_team_strength(team, 2.1, 0.8, notes="initial")
+    sports_db.set_wc_team_strength(team, 2.3, 0.7, notes="post group stage")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_wc_team_strength WHERE team_id = ?", (team,))
+    assert cur.fetchone()[0] == 2   # both versions retained
+    assert sports_db.get_latest_wc_strength(team) == (2.3, 0.7)
+    assert sports_db.get_latest_wc_strength(999) is None
+
+
+def test_wc_pick_add_and_grade(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Serbia")
+    match_id = sports_db.ensure_wc_match("2026-06-11T19:00:00", home, away)
+    pick_id = sports_db.add_wc_pick(match_id, "2026-06-10T12:00:00", "UNDER 3.5",
+                                    odds=-110, model_prob=0.63, ev=0.21, stars=3)
+    sports_db.set_wc_pick_result(pick_id, "win")
+    cur = conn.cursor()
+    cur.execute("SELECT side, stars, result FROM soccer_wc_picks WHERE pick_id = ?",
+                (pick_id,))
+    assert cur.fetchone() == ("UNDER 3.5", 3, "win")

@@ -29,6 +29,10 @@ how to run the collector to build a 2-year NHL historical dataset.
   - Stores betting lines per `match_id`, `sportsbook`, `odds_date`, moneyline/spread/OU fields
 - `match_outcomes`, `betting_analysis`:
   - Summaries and precomputed analysis artifacts
+- World Cup 2026 (`soccer_wc_*`): `teams`, `players`, `player_stats`, `matches`, `odds`,
+  `team_strength` (per-team attack/defense lambdas, versioned), `picks`. Team strength is
+  built from squad players' club stats, then `analyse_match_wc()` (in `core/poisson_model.py`)
+  runs the same Poisson math against the posted odds. See `WC2026_DESIGN.md`.
 
 Refer to `core/sports_db.py` for full DDL.
 

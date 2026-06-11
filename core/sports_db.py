@@ -5,6 +5,8 @@ Supports Serie A (Soccer) and NHL (Hockey) with sport-specific tables.
 Tables:
   soccer_teams, soccer_matches, soccer_betting_odds
   nhl_teams,    nhl_matches,    nhl_betting_odds
+  soccer_wc_teams, soccer_wc_players, soccer_wc_player_stats,
+  soccer_wc_matches, soccer_wc_odds, soccer_wc_team_strength, soccer_wc_picks
 """
 
 import sqlite3
@@ -106,6 +108,103 @@ def init_database():
             FOREIGN KEY (match_id) REFERENCES nhl_matches(match_id)
         );
 
+        -- ── World Cup 2026 tables ─────────────────────────────────────────
+        CREATE TABLE IF NOT EXISTS soccer_wc_teams (
+            team_id       INTEGER PRIMARY KEY,
+            name          TEXT NOT NULL UNIQUE,
+            confederation TEXT,
+            fifa_ranking  INTEGER,
+            api_team_id   TEXT,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_wc_players (
+            player_id     INTEGER PRIMARY KEY,
+            team_id       INTEGER NOT NULL,
+            name          TEXT NOT NULL,
+            position      TEXT,
+            club          TEXT,
+            club_league   TEXT,
+            api_player_id TEXT,
+            api_club_id   TEXT,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (team_id) REFERENCES soccer_wc_teams(team_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_wc_player_stats (
+            stat_id        INTEGER PRIMARY KEY,
+            player_id      INTEGER NOT NULL,
+            season         INTEGER,
+            minutes_played INTEGER,
+            xg             REAL,
+            xg_per90       REAL,
+            goals          INTEGER,
+            assists        INTEGER,
+            club_xga_per90 REAL,
+            club_ga_per90  REAL,
+            source         TEXT,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (player_id) REFERENCES soccer_wc_players(player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_wc_matches (
+            match_id     INTEGER PRIMARY KEY,
+            match_date   TIMESTAMP NOT NULL,
+            stage        TEXT,
+            grp          TEXT,
+            home_team_id INTEGER NOT NULL,
+            away_team_id INTEGER NOT NULL,
+            home_score   INTEGER,
+            away_score   INTEGER,
+            match_status TEXT,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (home_team_id) REFERENCES soccer_wc_teams(team_id),
+            FOREIGN KEY (away_team_id) REFERENCES soccer_wc_teams(team_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_wc_odds (
+            odds_id        INTEGER PRIMARY KEY,
+            match_id       INTEGER NOT NULL,
+            sportsbook     TEXT NOT NULL,
+            odds_date      TIMESTAMP NOT NULL,
+            home_moneyline REAL,
+            draw_moneyline REAL,
+            away_moneyline REAL,
+            over_under     REAL,
+            over_odds      REAL,
+            under_odds     REAL,
+            notes          TEXT,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
+        );
+
+        -- No UNIQUE on team_id: multiple lambda versions per team are allowed
+        -- over time (e.g. updated after the group stage).
+        CREATE TABLE IF NOT EXISTS soccer_wc_team_strength (
+            strength_id    INTEGER PRIMARY KEY,
+            team_id        INTEGER NOT NULL,
+            lambda_attack  REAL,
+            lambda_defense REAL,
+            method         TEXT,
+            computed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes          TEXT,
+            FOREIGN KEY (team_id) REFERENCES soccer_wc_teams(team_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_wc_picks (
+            pick_id      INTEGER PRIMARY KEY,
+            match_id     INTEGER NOT NULL,
+            generated_at TIMESTAMP NOT NULL,
+            side         TEXT,
+            odds         REAL,
+            model_prob   REAL,
+            ev           REAL,
+            stars        INTEGER,
+            result       TEXT,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_soccer_match_date    ON soccer_matches(match_date);
         CREATE INDEX IF NOT EXISTS idx_soccer_league        ON soccer_matches(league);
         CREATE INDEX IF NOT EXISTS idx_soccer_season        ON soccer_matches(season);
@@ -117,13 +216,39 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_nhl_odds_match       ON nhl_betting_odds(match_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_nhl_match_unique
             ON nhl_matches(season, home_team_id, away_team_id, match_date);
+
+        CREATE INDEX IF NOT EXISTS idx_wc_match_date      ON soccer_wc_matches(match_date);
+        CREATE INDEX IF NOT EXISTS idx_wc_team_name       ON soccer_wc_teams(name);
+        CREATE INDEX IF NOT EXISTS idx_wc_players_team    ON soccer_wc_players(team_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_stats_player    ON soccer_wc_player_stats(player_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_odds_match      ON soccer_wc_odds(match_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_strength_team   ON soccer_wc_team_strength(team_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_picks_match     ON soccer_wc_picks(match_id);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
+    ensure_wc_team_strength_schema(conn)
 
     conn.commit()
     conn.close()
     print(f"Database initialized at {DATABASE_PATH}")
+
+
+def ensure_wc_team_strength_schema(conn=None):
+    """Add the `method` column to soccer_wc_team_strength on older databases."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(soccer_wc_team_strength)")
+        existing = {row[1] for row in cur.fetchall()}
+        if "method" not in existing:
+            cur.execute("ALTER TABLE soccer_wc_team_strength ADD COLUMN method TEXT")
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 def ensure_soccer_betting_odds_schema(conn=None):
@@ -275,6 +400,299 @@ def get_soccer_matches(league=None, season=None, status=None):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+# ── World Cup 2026 helpers ──────────────────────────────────────────────────────
+
+def ensure_wc_team(name, confederation=None, fifa_ranking=None, api_team_id=None):
+    """Insert a World Cup national team if it doesn't exist; return its team_id.
+
+    If the team already exists, fill in api_team_id when it was previously unset.
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO soccer_wc_teams (name, confederation, fifa_ranking, api_team_id)
+               VALUES (?, ?, ?, ?)""",
+            (name, confederation, fifa_ranking, api_team_id)
+        )
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError:
+        cur.execute("SELECT team_id FROM soccer_wc_teams WHERE name = ?", (name,))
+        team_id = cur.fetchone()[0]
+        # Backfill api id / ranking / confederation if they were previously unset.
+        cur.execute(
+            """UPDATE soccer_wc_teams
+               SET api_team_id = COALESCE(api_team_id, ?),
+                   fifa_ranking = COALESCE(fifa_ranking, ?),
+                   confederation = COALESCE(confederation, ?)
+               WHERE team_id = ?""",
+            (api_team_id, fifa_ranking, confederation, team_id)
+        )
+        conn.commit()
+        return team_id
+    finally:
+        conn.close()
+
+
+def get_wc_team_id(name):
+    """Return team_id for a World Cup team, or None if not found."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT team_id FROM soccer_wc_teams WHERE name = ?", (name,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def add_wc_player(team_id, name, position=None, club=None, club_league=None,
+                  api_player_id=None, api_club_id=None):
+    """Insert a squad player if not already present for this team; return player_id.
+
+    If the player already exists, refresh club/position/api fields (a squad
+    re-import may carry newer club info).
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT player_id FROM soccer_wc_players WHERE team_id = ? AND name = ?",
+            (team_id, name)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_wc_players
+                   SET position = COALESCE(?, position),
+                       club = COALESCE(?, club),
+                       club_league = COALESCE(?, club_league),
+                       api_player_id = COALESCE(?, api_player_id),
+                       api_club_id = COALESCE(?, api_club_id)
+                   WHERE player_id = ?""",
+                (position, club, club_league, api_player_id, api_club_id, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_wc_players
+               (team_id, name, position, club, club_league, api_player_id, api_club_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (team_id, name, position, club, club_league, api_player_id, api_club_id)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def upsert_wc_player_stats(player_id, season=None, minutes_played=None,
+                           xg=None, xg_per90=None, goals=None, assists=None,
+                           club_xga_per90=None, club_ga_per90=None, source=None):
+    """Insert or replace a player's club stat line for a season; return stat_id."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT stat_id FROM soccer_wc_player_stats WHERE player_id = ? AND season IS ?",
+            (player_id, season)
+        )
+        existing = cur.fetchone()
+        if existing:
+            # COALESCE: only overwrite a column when a new (non-None) value is
+            # given, so a partial update doesn't wipe previously stored fields.
+            cur.execute(
+                """UPDATE soccer_wc_player_stats
+                   SET minutes_played = COALESCE(?, minutes_played),
+                       xg             = COALESCE(?, xg),
+                       xg_per90       = COALESCE(?, xg_per90),
+                       goals          = COALESCE(?, goals),
+                       assists        = COALESCE(?, assists),
+                       club_xga_per90 = COALESCE(?, club_xga_per90),
+                       club_ga_per90  = COALESCE(?, club_ga_per90),
+                       source         = COALESCE(?, source)
+                   WHERE stat_id = ?""",
+                (minutes_played, xg, xg_per90, goals, assists,
+                 club_xga_per90, club_ga_per90, source, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_wc_player_stats
+               (player_id, season, minutes_played, xg, xg_per90, goals, assists,
+                club_xga_per90, club_ga_per90, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (player_id, season, minutes_played, xg, xg_per90, goals, assists,
+             club_xga_per90, club_ga_per90, source)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def ensure_wc_match(match_date, home_team_id, away_team_id,
+                    stage=None, grp=None, status="scheduled"):
+    """Insert or reuse a World Cup match; return its match_id.
+
+    Matches are keyed on (home_team_id, away_team_id, match_date) so re-imports
+    do not create duplicates.
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT match_id FROM soccer_wc_matches
+               WHERE home_team_id = ? AND away_team_id = ? AND match_date = ?""",
+            (home_team_id, away_team_id, match_date)
+        )
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_wc_matches
+               (match_date, stage, grp, home_team_id, away_team_id, match_status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (match_date, stage, grp, home_team_id, away_team_id, status)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_wc_match_result(match_id, home_score, away_score):
+    """Update final score for a World Cup match."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """UPDATE soccer_wc_matches
+               SET home_score = ?, away_score = ?, match_status = 'completed'
+               WHERE match_id = ?""",
+            (home_score, away_score, match_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_wc_odds(match_id, sportsbook, odds_date,
+                   home_moneyline=None, draw_moneyline=None, away_moneyline=None,
+                   over_under=None, over_odds=None, under_odds=None, notes=None):
+    """Insert or update odds for a World Cup match + sportsbook; return odds_id."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT odds_id FROM soccer_wc_odds WHERE match_id = ? AND sportsbook = ?",
+            (match_id, sportsbook)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_wc_odds
+                   SET odds_date = ?, home_moneyline = ?, draw_moneyline = ?,
+                       away_moneyline = ?, over_under = ?, over_odds = ?,
+                       under_odds = ?, notes = ?
+                   WHERE odds_id = ?""",
+                (odds_date, home_moneyline, draw_moneyline, away_moneyline,
+                 over_under, over_odds, under_odds, notes, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_wc_odds
+               (match_id, sportsbook, odds_date, home_moneyline, draw_moneyline,
+                away_moneyline, over_under, over_odds, under_odds, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, sportsbook, odds_date, home_moneyline, draw_moneyline,
+             away_moneyline, over_under, over_odds, under_odds, notes)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def set_wc_team_strength(team_id, lambda_attack, lambda_defense,
+                         method=None, notes=None):
+    """Persist a new lambda version for a team; return strength_id.
+
+    `method` records how the lambdas were derived ('player_aggregation' or
+    'fifa_ranking') so we can track, per team, which approach is in use and flip
+    data-quality-poor teams to the FIFA fallback over time.
+
+    Always inserts a new row (no UNIQUE on team_id) so prior versions are kept.
+    """
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO soccer_wc_team_strength
+               (team_id, lambda_attack, lambda_defense, method, notes)
+               VALUES (?, ?, ?, ?, ?)""",
+            (team_id, lambda_attack, lambda_defense, method, notes)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_latest_wc_strength(team_id, conn=None):
+    """Return the most recent (lambda_attack, lambda_defense) for a team, or None."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT lambda_attack, lambda_defense
+               FROM soccer_wc_team_strength
+               WHERE team_id = ?
+               ORDER BY computed_at DESC, strength_id DESC
+               LIMIT 1""",
+            (team_id,)
+        )
+        row = cur.fetchone()
+        return (row[0], row[1]) if row else None
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def add_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
+                result=None):
+    """Store a generated pick for later scoring; return pick_id."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO soccer_wc_picks
+               (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def set_wc_pick_result(pick_id, result):
+    """Grade a stored pick: result is 'win', 'loss', or 'push'."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE soccer_wc_picks SET result = ? WHERE pick_id = ?",
+            (result, pick_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── NHL helpers ────────────────────────────────────────────────────────────────
