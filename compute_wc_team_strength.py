@@ -27,7 +27,7 @@ Usage:
 
 import argparse
 import sqlite3
-from statistics import mean
+from statistics import mean, pstdev
 
 from core.sports_db import DATABASE_PATH, set_wc_team_strength
 from core.poisson_model import WC_BASELINE
@@ -49,6 +49,26 @@ DEFENSE_POS_WEIGHTS = {"GK": 1.0, "DEF": 0.8, "MID": 0.3, "FWD": 0.1}
 # prior are weighted 50/50. ~900 min ≈ 10 matches (about half a season). This is
 # set from how football works, not by fitting the betting market.
 K_SHRINK_MINUTES = 900.0
+
+# Attack uses the league factor raised to this power (BUG-002). A weak-league
+# goal is cheap for two compounding reasons — the league is less competitive AND
+# the defenders are weaker — but a single league_factor only captures one. The
+# exponent applies the discount more than once: top leagues are unaffected
+# (1.0^x = 1.0, so genuine elite scorers are untouched) while weak-league scoring
+# is progressively discounted. 1.5 (not 2.0) keeps mid-tier leagues like Liga MX
+# from being over-penalized; the exact value isn't theory-derivable, so it's the
+# conservative choice that fixes the over-rated teams with least collateral.
+# (Defense keeps the plain factor — this is an attack-scoring issue only.)
+ATTACK_LEAGUE_EXPONENT = 1.5
+
+# Target spread (standard deviation) of the normalized attack lambdas. We
+# normalize attack to a fixed mean (WC_BASELINE) AND this spread, rather than the
+# mean alone. Pinning only the mean lets the spread float with the raw
+# distribution, so any change (like the exponent above) can blow the spread out
+# and re-inflate the top teams. Fixing both keeps Brazil ~2.3 and the field at a
+# realistic ~3x range regardless. Set to the post-shrinkage attack spread so the
+# exponent change is a pure redistribution, not a spread shift.
+ATTACK_LAMBDA_SD = 0.41
 
 # League quality multiplier (1.0 = top tier). A goal in a weaker league predicts
 # less international scoring, so its rate is discounted. Keys are the exact
@@ -233,10 +253,13 @@ def raw_team_strength(players):
             continue
         lf = league_factor(pl["league"])
         # Attack: player's own scoring rate (xG/90 or goals/90), league-discounted.
+        # The league factor is raised to ATTACK_LEAGUE_EXPONENT so weak-league
+        # scoring is discounted harder than its competitive-strength factor alone
+        # (BUG-002); top leagues (factor 1.0) are unaffected.
         if pl["attack_rate"] is not None:
             w = pl["minutes"] * ATTACK_POS_WEIGHTS.get(pos, 0.0)
             if w > 0:
-                a_num += w * pl["attack_rate"] * lf
+                a_num += w * pl["attack_rate"] * (lf ** ATTACK_LEAGUE_EXPONENT)
                 a_w += w
         # Defense: club-team concession rate, inflated for weaker leagues
         # (low xGA vs weak opposition overstates real solidity).
@@ -273,8 +296,9 @@ def fifa_fallback(fifa_rank, field_ranks):
 def compute_strengths(teams):
     """Return {team_id: {name, lambda_attack, lambda_defense, basis}}.
 
-    Stat-based raw values are normalized so the mean across stat-covered teams
-    equals WC_BASELINE; thin-coverage teams use the FIFA fallback.
+    Stat-based raw values are normalized to WC_BASELINE: defense to the baseline
+    mean, attack to the baseline mean AND a fixed spread (ATTACK_LAMBDA_SD).
+    Thin-coverage teams and manual overrides use the FIFA fallback.
     """
     raw = {}
     for tid, info in teams.items():
@@ -285,8 +309,19 @@ def compute_strengths(teams):
                    if r["ra"] is not None and r["aw"] >= MIN_ATTACK_WEIGHT]
     defense_vals = [r["rd"] for tid, r in raw.items()
                     if r["rd"] is not None and r["dw"] >= MIN_DEFENSE_WEIGHT]
-    attack_scale = (WC_BASELINE / mean(attack_vals)) if attack_vals else None
+    attack_mean = mean(attack_vals) if attack_vals else None
+    attack_sd = pstdev(attack_vals) if len(attack_vals) > 1 else 0.0
+    attack_scale = (WC_BASELINE / attack_mean) if attack_mean else None
     defense_scale = (WC_BASELINE / mean(defense_vals)) if defense_vals else None
+
+    def normalize_attack(ra):
+        """Mean-AND-spread normalization: re-center to WC_BASELINE and rescale to
+        ATTACK_LAMBDA_SD, so the field's attack spread stays realistic regardless
+        of the raw distribution. Falls back to mean-only when the field is too
+        small to estimate a spread (e.g. tiny test fixtures)."""
+        if attack_sd > 1e-9:
+            return WC_BASELINE + (ra - attack_mean) * (ATTACK_LAMBDA_SD / attack_sd)
+        return ra * attack_scale
 
     # FIFA ranks of the whole field, so the fallback can rank teams against each
     # other (field-relative) rather than against the global FIFA pool.
@@ -311,7 +346,7 @@ def compute_strengths(teams):
         if has_attack and has_defense:
             out[tid] = {
                 "name": info["name"],
-                "lambda_attack": r["ra"] * attack_scale,
+                "lambda_attack": normalize_attack(r["ra"]),
                 "lambda_defense": r["rd"] * defense_scale,
                 "basis": "stats",
             }

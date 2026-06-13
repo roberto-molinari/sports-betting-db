@@ -4,6 +4,8 @@ Unit tests for the pure logic in the World Cup scripts:
   - compute_wc_team_strength.normalize_position / fifa_fallback
 """
 
+from statistics import mean, pstdev
+
 import pytest
 
 import update_wc_results as uwr
@@ -107,6 +109,39 @@ def test_raw_team_strength_skips_unknown_position_and_missing_data():
     raw_attack, attack_w, _, _ = cws.raw_team_strength(players)
     assert attack_w == 0
     assert raw_attack is None
+
+
+# ── attack league exponent (BUG-002) ─────────────────────────────────────────
+
+def test_attack_applies_league_exponent_discount():
+    """A weak-league scorer is discounted by league_factor**exponent, i.e. harder
+    than the plain linear factor (top leagues at factor 1.0 are unaffected)."""
+    lf = cws.league_factor("MLS")                      # < 1.0
+    ra, _, _, _ = cws.raw_team_strength([_player("FWD", 1.0, 1.0, league="MLS")])
+    assert ra == pytest.approx(lf ** cws.ATTACK_LEAGUE_EXPONENT)
+    assert ra < lf                                     # harder than linear
+
+
+def test_attack_exponent_leaves_top_league_untouched():
+    ra, _, _, _ = cws.raw_team_strength(
+        [_player("FWD", 0.8, 1.0, league="Premier League")])
+    assert ra == pytest.approx(0.8)                    # 1.0**1.5 == 1.0
+
+
+def test_compute_strengths_normalizes_attack_to_target_spread():
+    """Attack is normalized to baseline mean AND the fixed ATTACK_LAMBDA_SD spread,
+    regardless of the raw distribution's spread."""
+    teams = {
+        i: {"name": f"T{i}", "fifa": 30, "players": [
+            _player("FWD", r, 1.0), _player("MID", 0.5, 1.0),
+            _player("DEF", 0.1, 0.9), _player("GK", 0.0, 0.9)]}
+        for i, r in enumerate([0.2, 0.4, 0.6, 0.8, 1.0, 1.2])
+    }
+    out = cws.compute_strengths(teams)
+    atts = [out[t]["lambda_attack"] for t in out]
+    assert all(out[t]["basis"] == "stats" for t in out)
+    assert mean(atts) == pytest.approx(WC_BASELINE)
+    assert pstdev(atts) == pytest.approx(cws.ATTACK_LAMBDA_SD)
 
 
 # ── compute_strengths: manual FIFA overrides are sticky ──────────────────────

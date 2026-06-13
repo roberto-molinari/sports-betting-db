@@ -23,31 +23,42 @@ Severity: **high** (materially wrong picks across many teams) ·
   *absolute* edge (model_p − implied_p ≥ ~0.04), not just EV%. Demote to the
   next-best qualifying side (no abstention). Does not touch the lambdas.
 
+## BUG-004 — Over-skew: model expects more total goals than the market (LEVEL bias)
+
+- **Severity:** medium · **Status:** OPEN — and possibly *not* a bug (2026-06-13)
+- **Symptom.** Across all 72 games, OVER has avg EV **+6.8%** (+EV in 48/72) vs
+  UNDER **−14.4%** (+EV in only 17/72). The model's expected total goals sits
+  above the market's on essentially every game — a *level* bias, distinct from
+  any team being mis-rated. (Draws are well-calibrated: model avg p 0.226 vs
+  market 0.230; they just rarely win the one-best-pick race.)
+- **Important:** this is a LEVEL issue (the whole slate's goal expectation), NOT
+  the BUG-002 distribution issue — the two were originally conflated. The BUG-002
+  fix (attack exponent + spread normalization) is a pure redistribution and left
+  the over-skew unchanged (+6.8% → +7.0%), confirming they are separate.
+- **It may be a real edge, not an error.** Model ~2.7 goals/game vs market ~2.5
+  could mean the model correctly sees WC group games as higher-scoring. Matchday-1
+  Overs went 1-1 — far too few to tell.
+- **Do NOT fix yet.** Let results accumulate; only adjust the baseline / totals
+  level once results show the higher goal expectation is wrong, not right.
+  Candidate lever if so: lower WC_BASELINE or a totals-specific level shift.
+
 ## BUG-002 — Weak-league forwards inflate attack lambda
 
-- **Severity:** medium-high · **Status:** OPEN (2026-06-13)
-- **Symptom.** Teams whose forwards play in weak leagues get an over-rated attack
+- **Severity:** medium-high · **Status:** FIXED 2026-06-13 (v5)
+- **Symptom.** Teams whose forwards play in weak leagues got an over-rated attack
   even after the league-factor discount (goals/90 in a soft league overstates
-  international scoring more than the factor captures). Drives over-optimistic
-  underdog ML picks and a systematic Over skew.
-- **Evidence.**
-  - Per-team: Czechia, Bosnia, Haiti rated too high (model ranks well above
-    FIFA-field). Bosnia attack 1.44 / Haiti 1.23 built on Romanian/Austrian/
-    Czech/Hungarian-league forwards.
-  - **Aggregate over-skew (all 72 games):** OVER avg EV **+6.8%** (+EV in 48/72)
-    vs UNDER avg EV **−14.4%** (+EV in only 17/72). The model expects more goals
-    than the market across the board. (Draws, by contrast, are well-calibrated:
-    model avg p 0.226 vs market 0.230 — they just rarely win the one-best-pick
-    race, crowded out by inflated Overs and longshots.)
-  - **Matchday 1 results (1-3 record):** all three losses were on known issues —
-    Czechia ML (lost, Korea won 2-1) and Bosnia ML (1-1 draw) were both
-    weak-league-attack-inflated underdogs; Mexico Over 2.5 lost (2-0). The lone
-    win was USA Over 2 (4-1), the Over with a *legit* (top-league) attack. Tiny
-    sample, but directionally consistent with the diagnosis.
-- **Proposed fix (model-level, NEEDS validation — do in a calm session, not
-  reactively on a few games).** Options to evaluate: steeper attack-specific
-  discount for non-top leagues; cap/shrink individual weak-league goals/90 harder
-  toward the positional prior. Re-validate the full 48-team table after any change.
+  international scoring more than the single factor captures) — over-optimistic
+  underdog ML picks (Czechia, Bosnia, Haiti rated well above their FIFA-field).
+- **Evidence.** Matchday 1: Czechia ML (lost, Korea won 2-1) and Bosnia ML (1-1
+  draw) were both weak-league-attack-inflated underdogs that failed to win.
+- **Fix shipped (v5).** Attack uses `league_factor ** ATTACK_LEAGUE_EXPONENT`
+  (1.5) so weak-league scoring is discounted harder while top leagues (factor
+  1.0) are untouched; paired with **mean-AND-spread** attack normalization
+  (`ATTACK_LAMBDA_SD`) so the discount can't blow out the spread / re-inflate the
+  elites. Full 48-team table re-validated: Czechia/Bosnia/Haiti down, elites held,
+  Brazil ~2.3. Exponent 1.5 (not 2.0) chosen to spare mid-tier leagues (Liga MX).
+- **Note:** this fix is a *redistribution*; it does NOT address the Over-skew
+  (that's the separate BUG-004, a level bias).
 
 ---
 

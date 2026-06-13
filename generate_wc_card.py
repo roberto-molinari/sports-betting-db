@@ -41,11 +41,12 @@ EASTERN_SQL_OFFSET = "-4 hours"   # applied to match_date to get the Eastern day
 HOST_NATIONS = {"USA", "Mexico", "Canada"}
 HOST_HOME_ADVANTAGE = 1.20
 
-# Longshot guardrail (BUG-003): we won't surface a team-to-win pick when the
-# model's own win probability is below this floor. At long odds the model's
-# small-probability estimates are too noisy to trust, so the EV is noise, not
-# edge. Applies to HOME/AWAY only; draws and totals are exempt.
-MIN_ML_PROBABILITY = 0.25
+# Longshot guardrail (BUG-003): we won't surface ANY pick — win, draw, or total —
+# when the model's own probability for it is below this floor. At long odds the
+# model's small-probability estimates are too noisy to trust, so the EV is noise,
+# not edge (a 12% win and an 18% longshot draw are the same problem). Demotes to
+# the next-best qualifying side; no abstention.
+MIN_PICK_PROBABILITY = 0.25
 
 
 def parse_args():
@@ -144,13 +145,12 @@ def best_pick_for_match(match, conn):
     if not priced:
         return None
 
-    # Longshot guardrail: drop a win pick (HOME/AWAY) when our own win probability
-    # is below MIN_ML_PROBABILITY. At long odds the model can't estimate small
-    # probabilities reliably, so a tiny overestimate becomes a large, fake EV%.
-    # Draws and totals are exempt (calibrated / near-even odds). No abstention:
-    # if the floor would leave nothing, fall back to the full priced set.
-    eligible = [c for c in priced
-                if not (c["side"] in ("HOME", "AWAY") and c["prob"] < MIN_ML_PROBABILITY)]
+    # Longshot guardrail: drop any pick whose model probability is below
+    # MIN_PICK_PROBABILITY. At long odds the model can't estimate small
+    # probabilities reliably, so a tiny overestimate becomes a large, fake EV% —
+    # true for a longshot win, draw, or total alike. No abstention: if the floor
+    # would leave nothing, fall back to the full priced set.
+    eligible = [c for c in priced if c["prob"] >= MIN_PICK_PROBABILITY]
     best = max(eligible or priced, key=lambda c: c["ev"])
     best.update({
         "match_id": match["match_id"],
