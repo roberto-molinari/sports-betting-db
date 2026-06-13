@@ -1,0 +1,61 @@
+"""Tests for generate_wc_card pick selection (the longshot guardrail)."""
+
+import sqlite3
+
+import core.sports_db as sdb
+import generate_wc_card as gwc
+
+
+def _seed_longshot_game(db_path):
+    """A clear favorite (home) vs a longshot underdog (away) priced at +2000, so
+    the underdog has the highest EV purely from odds despite a tiny win prob."""
+    fav = sdb.ensure_wc_team("Favoritia")
+    dog = sdb.ensure_wc_team("Underdogia")
+    match_id = sdb.ensure_wc_match("2026-06-20 18:00:00", fav, dog, stage="Group")
+    sdb.upsert_wc_odds(
+        match_id=match_id, sportsbook="Test", odds_date="2026-06-13",
+        home_moneyline=-400, draw_moneyline=500, away_moneyline=2000,
+        over_under=2.5, over_odds=-110, under_odds=-110,
+    )
+    sdb.set_wc_team_strength(fav, 2.0, 0.9)   # strong attack, mean defense
+    sdb.set_wc_team_strength(dog, 0.7, 1.6)   # weak attack, leaky defense
+    return match_id
+
+
+def _fetch_match(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    matches = gwc.fetch_matches(conn, "2026-06-20", "2026-06-20")
+    return conn, matches
+
+
+def test_guardrail_demotes_sub_floor_longshot(db_path, monkeypatch):
+    _seed_longshot_game(db_path)
+    conn, matches = _fetch_match(db_path)
+    assert len(matches) == 1
+    match = matches[0]
+
+    # With the floor disabled, the +2000 longshot wins on EV despite a tiny prob.
+    monkeypatch.setattr(gwc, "MIN_ML_PROBABILITY", 0.0)
+    raw = gwc.best_pick_for_match(match, conn)
+    assert raw["side"] == "AWAY"
+    assert raw["prob"] < 0.25            # confirms it is a sub-floor longshot
+
+    # With the 0.25 floor it must not surface a sub-floor win pick.
+    monkeypatch.setattr(gwc, "MIN_ML_PROBABILITY", 0.25)
+    guarded = gwc.best_pick_for_match(match, conn)
+    assert guarded["side"] != "AWAY"
+    assert not (guarded["side"] in ("HOME", "AWAY") and guarded["prob"] < 0.25)
+    conn.close()
+
+
+def test_guardrail_leaves_solid_win_picks_alone(db_path, monkeypatch):
+    """A win pick above the floor is untouched (draws/totals always exempt)."""
+    _seed_longshot_game(db_path)
+    conn, matches = _fetch_match(db_path)
+    match = matches[0]
+    # A very low floor keeps everything; the longshot still wins on EV.
+    monkeypatch.setattr(gwc, "MIN_ML_PROBABILITY", 0.01)
+    pick = gwc.best_pick_for_match(match, conn)
+    assert pick["side"] == "AWAY"
+    conn.close()
