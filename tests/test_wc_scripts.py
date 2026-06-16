@@ -128,6 +128,25 @@ def test_attack_exponent_leaves_top_league_untouched():
     assert ra == pytest.approx(0.8)                    # 1.0**1.5 == 1.0
 
 
+# ── defense league exponent (BUG-001) ────────────────────────────────────────
+
+def test_defense_applies_softened_league_exponent():
+    """A weak-league defender's concede rate is marked up by league_factor**exponent
+    with exponent < 1 — softer than the full ÷ league_factor division, but still a
+    markup vs the raw rate."""
+    lf = cws.league_factor("MLS")                      # < 1.0
+    _, _, rd, _ = cws.raw_team_strength([_player("GK", 0.0, 1.5, league="MLS")])
+    assert rd == pytest.approx(1.5 / (lf ** cws.DEFENSE_LEAGUE_EXPONENT))
+    assert rd < 1.5 / lf                               # softer than full division
+    assert rd > 1.5                                    # still marked up vs raw rate
+
+
+def test_defense_exponent_leaves_top_league_untouched():
+    _, _, rd, _ = cws.raw_team_strength(
+        [_player("GK", 0.0, 1.2, league="Premier League")])
+    assert rd == pytest.approx(1.2)                    # 1.0**0.5 == 1.0
+
+
 def test_compute_strengths_normalizes_attack_to_target_spread():
     """Attack is normalized to baseline mean AND the fixed ATTACK_LAMBDA_SD spread,
     regardless of the raw distribution's spread."""

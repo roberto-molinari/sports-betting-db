@@ -227,3 +227,36 @@ def test_wc_pick_add_and_grade(db_path, conn):
     cur.execute("SELECT side, stars, result FROM soccer_wc_picks WHERE pick_id = ?",
                 (pick_id,))
     assert cur.fetchone() == ("UNDER 3.5", 3, "win")
+
+
+def test_replace_wc_pick_supersedes_ungraded(db_path, conn):
+    home = sports_db.ensure_wc_team("France")
+    away = sports_db.ensure_wc_team("Spain")
+    match_id = sports_db.ensure_wc_match("2026-06-12T19:00:00", home, away)
+    # first run: model picks DRAW
+    sports_db.replace_wc_pick(match_id, "2026-06-11T10:00:00", "DRAW",
+                              odds=240, model_prob=0.28, ev=0.05, stars=1)
+    # re-run after a model improvement now picks OVER 2.5 -> should replace, not stack
+    sports_db.replace_wc_pick(match_id, "2026-06-11T11:00:00", "OVER 2.5",
+                              odds=-110, model_prob=0.55, ev=0.05, stars=1)
+    cur = conn.cursor()
+    cur.execute("SELECT side FROM soccer_wc_picks WHERE match_id = ?", (match_id,))
+    assert cur.fetchall() == [("OVER 2.5",)]   # one row, latest pick wins
+
+
+def test_replace_wc_pick_preserves_graded(db_path, conn):
+    home = sports_db.ensure_wc_team("Italy")
+    away = sports_db.ensure_wc_team("Croatia")
+    match_id = sports_db.ensure_wc_match("2026-06-12T19:00:00", home, away)
+    pick_id = sports_db.replace_wc_pick(match_id, "2026-06-11T10:00:00", "HOME",
+                                        odds=-130, model_prob=0.6, ev=0.1, stars=2)
+    sports_db.set_wc_pick_result(pick_id, "win")
+    # a later re-run must not wipe an already-graded pick (locked history)
+    sports_db.replace_wc_pick(match_id, "2026-06-11T11:00:00", "AWAY",
+                              odds=300, model_prob=0.3, ev=0.05, stars=1)
+    cur = conn.cursor()
+    cur.execute("SELECT side, result FROM soccer_wc_picks WHERE match_id = ? ORDER BY pick_id",
+                (match_id,))
+    rows = cur.fetchall()
+    assert ("HOME", "win") in rows   # graded pick retained
+    assert len(rows) == 2            # graded kept, new ungraded added alongside

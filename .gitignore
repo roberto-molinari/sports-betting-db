@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 .venv/
 *.backup*
+*.bak*
 .DS_Store
 notes.txt
 *.csv

@@ -681,6 +681,35 @@ def add_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
         conn.close()
 
 
+def replace_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
+                    result=None):
+    """Store a pick for a match, replacing any prior *ungraded* pick for that
+    match so re-running the card supersedes (rather than stacks) picks. Already
+    graded picks (result IS NOT NULL) are left intact — once a pick is settled
+    it's locked history. Returns the new pick_id.
+
+    The DB is the record of what the model picked, one current pick per match;
+    re-running after a model improvement should overwrite the prior pick, not
+    create a duplicate."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM soccer_wc_picks WHERE match_id = ? AND result IS NULL",
+            (match_id,)
+        )
+        cur.execute(
+            """INSERT INTO soccer_wc_picks
+               (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
 def set_wc_pick_result(pick_id, result):
     """Grade a stored pick: result is 'win', 'loss', or 'push'."""
     conn = sqlite3.connect(DATABASE_PATH)

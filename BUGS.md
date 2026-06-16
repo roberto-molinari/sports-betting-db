@@ -9,6 +9,94 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## DESIGN-001 — Model runs on goals, not xG/xGA (deliberate v1 choice)
+
+- **Status:** BY DESIGN for v1 (recorded 2026-06-14). **TODO:** add real xG (attack)
+  and xGA (defense) when feasible. Not a bug — a known simplification.
+
+**What.** No player row currently carries `xg_per90` or `club_xga_per90`
+(0 of ~1,124). The strength model therefore runs entirely on the cruder proxies:
+- **attack = club goals/90** (the per-player fallback in `compute_wc_team_strength.py`),
+- **defense = club goals-against/90** (`club_ga_per90`).
+
+**Why it's a choice, not a failure.** Both gaps are documented at the source:
+- *xGA (defense):* TheStatsAPI exposes team **goals against** but **not xGA at team
+  level**, so `club_xga_per90` is intentionally left null and the model falls back to
+  `club_ga_per90` — see `import_wc_player_stats.py` (`club_defense`, module docstring).
+- *xG (attack):* the season endpoint **doesn't expose expected goals** (xG exists only
+  per-match), so `xg/xg_per90` are left null pending an **optional per-match xG pass**
+  that has not been run; attack derives from goals/90 until then — see
+  `import_wc_player_stats.py` (`fetch_player_line`).
+
+**Why it matters (the cost of the proxy).** goals/90 rewards finishers and goals-
+against/90 is blind to defensive *identity*, so finisher-heavy squads get inflated
+attack and defense-first sides (e.g. Ecuador) get under-rated defense. This is the
+same mechanism as **BUG-001** (club-concede ≠ national defense) and contributes to
+big market disagreements on individual picks (e.g. CIV +255 read as a coin-flip).
+
+**TODO (future).** (1) Run a per-match xG aggregation pass to populate `xg_per90`
+for attack. (2) Source team-level xGA (different feed/scrape) to replace the
+goals-against proxy for defense. Until then, treat large model-vs-market gaps that
+hinge on attack/defense *level* with skepticism.
+
+---
+
+## BUG-005 — Club goals/90 over-credits the attack of talent-rich, mid-ranked teams
+
+- **Severity:** medium · **Status:** OPEN (2026-06-14)
+- **Discovered:** 2026-06-14, reviewing the Jun 14 card (Côte d'Ivoire vs Ecuador;
+  model gave CIV win +78% EV — a +255 market dog read as a ~50% favorite).
+
+**Symptom.** Teams whose squads are full of genuine club *scorers* but who are only
+mid-tier *internationally* get an inflated `lambda_attack`. CIV is the standout:
+the stats model ranks their attack ~2nd in the field (1.67, ≈Germany tier) while
+they sit at **FIFA #34**. That produces λ_H 1.68 vs Ecuador (#23) 1.13 → model
+P(CIV) ≈ 50% vs market-implied ~28%, a 22-point disagreement on a well-bet match.
+
+**What it is NOT (levers already ruled out):**
+- *Not weak-league inflation.* CIV's goals are overwhelmingly legit top-5: Bundesliga
+  17 (Diomande 12), Ligue 1 10 (Wahi 7), LaLiga 8, Serie A 5, PL 4. Those carry
+  league factor ≥0.85; the Pro League/Saudi chunks are already discounted hard by
+  `ATTACK_LEAGUE_EXPONENT` (1.5). So **raising the BUG-002 league discount won't fix
+  this** — the scoring is real top-flight output.
+- *Not small-sample noise.* Empirical-Bayes shrinkage (`apply_shrinkage`, K=900 min)
+  already pulls hot low-minute rates toward the positional prior (e.g. Fofana's
+  3-in-295 is regressed).
+- *Not a pipeline bug.* The aggregation is doing exactly what it's designed to.
+
+**Root cause (structural).** The model treats club **goals/90 as if it transfers 1:1
+to international scoring.** It doesn't: a national side's output against organized
+international defenses is systematically lower than the minutes/position-weighted
+average of its players' club rates (scoring is not additive across a squad, roles
+change, opposition is tougher). Nothing calibrates a high club rate toward the team's
+actual international standing. Two sub-causes feed it:
+1. **goals, not xG** — hot finishing seasons aren't regressed to chances created
+   (ties to **DESIGN-001**; the per-match xG pass is the metric-level fix).
+2. **no club→international calibration** — the stats rating and the team's
+   international results (FIFA/Elo) are never blended; the model trusts club output
+   outright.
+
+**Candidate fixes (discuss before building — see also the menu reasoning in chat):**
+| Fix | Targets | Effort | Moves CIV? | Risk |
+|---|---|---|---|---|
+| **Measure first** — log model-xG vs ESPN-xG over several games | is it *really* high? | tiny | informs | none; delays |
+| **xG pass** (DESIGN-001) — real xG/90 replaces/blends goals/90 | finishing variance | high | partially | won't fix transfer |
+| **Blend attack toward FIFA/field-rank**: `λ = w·stats + (1−w)·rank_implied` | club→intl transfer | medium | **strongly, targeted** | over-blend → just re-predicts the ranking, kills value edges |
+| **Compress spread** (lower `ATTACK_LAMBDA_SD`) | extreme ratings | one line | yes, but nerfs Germany/NL too | blunt, untargeted |
+| **Targeted override** (CIV + similar AFCON sides), like `FIFA_OVERRIDES` | one match now | tiny | yes | band-aid, subjective |
+
+**Recommendation.** The principled pair is the **FIFA/field-rank blend** (highest-
+leverage, targets the actual cause) plus the **xG pass** (fixes the metric). But the
+blend carries the system's central tension — blend too hard and the model just
+re-predicts FIFA rank, destroying the value-vs-market edge that is the entire point.
+So `w` must be tuned against **results**, not guessed, and **"measure first" gates any
+engine change** — one match against a market we already distrust on totals is not
+enough signal. **Interim handling:** for affected matches prefer totals (robust to the
+attack/defense misallocation — see the CIV Over 1.5 sensitivity check) or skip the
+moneyline; flag the team rather than trusting the raw edge.
+
+---
+
 ## BUG-003 — EV on big-longshot moneylines is unreliable (noise amplification)
 
 - **Severity:** medium · **Status:** OPEN (2026-06-13)
@@ -41,6 +129,18 @@ Severity: **high** (materially wrong picks across many teams) ·
 - **Do NOT fix yet.** Let results accumulate; only adjust the baseline / totals
   level once results show the higher goal expectation is wrong, not right.
   Candidate lever if so: lower WC_BASELINE or a totals-specific level shift.
+- **Update 2026-06-15 — dispersion checked and ruled out as the lever.** Tested
+  whether the totals miss is a *spread* problem (model under-dispersing →
+  under-calling blowouts) fixable via `ATTACK_LAMBDA_SD`. It is not: SD of the
+  model's per-game totals = **0.40** vs SD of the market's O/U lines = **0.41**
+  (72 games) — the model is *not* under-dispersed, so widening the dial would
+  over-disperse. `ATTACK_LAMBDA_SD` confirmed a pure *dispersion* knob (slate-avg
+  total moves only +0.01 going 0.41→0.55), orthogonal to the *level*
+  (`WC_BASELINE`). The model-minus-market gap is a LEVEL effect concentrated on
+  low-total games (+0.64 at line 2.0, +0.33 at 2.5, ~0 at 3.0+), and Spain/Cape
+  Verde — the elite-attack-vs-leaky-defense corner we'd have widened *for* — went
+  0-0. **Decision: leave `ATTACK_LAMBDA_SD` at 0.41.** Any future totals fix
+  targets the LEVEL, pending results to confirm the over-skew is error vs edge.
 
 ## BUG-002 — Weak-league forwards inflate attack lambda
 
@@ -65,7 +165,8 @@ Severity: **high** (materially wrong picks across many teams) ·
 ## BUG-001 — Goalkeeper club-concede rate is a poor proxy for team defense
 
 - **Severity:** medium
-- **Status:** OPEN (deferred 2026-06-11; documented for a calm session)
+- **Status:** PARTIALLY FIXED 2026-06-15 (league markup softened — see update
+  below); the core proxy issue remains OPEN
 - **Discovered:** 2026-06-11, reviewing the Jun 12 card (Canada vs Bosnia &
   Herzegovina; model gave Bosnia ML +86% EV, an obvious stretch).
 
@@ -101,6 +202,19 @@ of the existing team-level `FIFA_OVERRIDES`. ~48 manual judgments; reliable.
 Smaller alternative to evaluate first: a gentler league adjustment for **defense**
 (the ÷ league_factor over-amplifies high concede rates in weak leagues — affects
 keepers *and* defenders, one formula change, but needs whole-table re-validation).
+
+**Update 2026-06-15 — shipped the gentle league adjustment (partial fix).** Added
+`DEFENSE_LEAGUE_EXPONENT = 0.5`: club concede rates are now marked up by
+`÷ league_factor**0.5` instead of the full `÷ league_factor`, applying only part
+of the markup. Diagnosed first (the division most distorts teams with weak
+defensive leagues, factor 0.50–0.68), then persisted as **v6**. Effect — pulls in
+the over-rated-leaky tail while leaving strong-league defenses and all attacks
+untouched (field mean stays at baseline; pure redistribution): Qatar 2.19→1.82,
+New Zealand 1.82→1.65, Jordan 1.80→1.55, Iraq 1.74→1.51, Canada 1.76→1.65. This
+reproduces, across the whole field, the ~1.65 endpoint the manual Canada data-fix
+reached. **Still OPEN:** the deeper issues — club-concede ≠ national defense, and
+wrong-keeper-by-minutes — are untouched, so the **keeper-quality override (option
+A)** remains the follow-up for the residual distortion.
 
 **Related / also worth a look:**
 - The `matches_played` denominator is unreliable from TheStatsAPI for some clubs

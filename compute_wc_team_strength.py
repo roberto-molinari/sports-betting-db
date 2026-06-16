@@ -58,8 +58,17 @@ K_SHRINK_MINUTES = 900.0
 # is progressively discounted. 1.5 (not 2.0) keeps mid-tier leagues like Liga MX
 # from being over-penalized; the exact value isn't theory-derivable, so it's the
 # conservative choice that fixes the over-rated teams with least collateral.
-# (Defense keeps the plain factor — this is an attack-scoring issue only.)
 ATTACK_LEAGUE_EXPONENT = 1.5
+
+# Defense uses the mirror idea but in the SOFTENING direction. A club concede rate
+# from a weak league is marked up (divided by the league factor) because it was
+# earned against weak attacks — but the full division over-amplifies: 2.1 ÷ 0.62
+# (MLS) = 3.4 treats the entire league gap as extra goals conceded, when defensive
+# organization and individual quality carry across leagues. An exponent BELOW 1.0
+# applies only PART of that markup (÷ lf**0.5), keeping the right direction without
+# inflating weak-league sides (Qatar, Gulf/African teams, Canada) into fake
+# leakiness. See BUG-001. (Attack hardens its discount; defense softens its markup.)
+DEFENSE_LEAGUE_EXPONENT = 0.5
 
 # Target spread (standard deviation) of the normalized attack lambdas. We
 # normalize attack to a fixed mean (WC_BASELINE) AND this spread, rather than the
@@ -261,12 +270,14 @@ def raw_team_strength(players):
             if w > 0:
                 a_num += w * pl["attack_rate"] * (lf ** ATTACK_LEAGUE_EXPONENT)
                 a_w += w
-        # Defense: club-team concession rate, inflated for weaker leagues
-        # (low xGA vs weak opposition overstates real solidity).
+        # Defense: club-team concession rate, marked up for weaker leagues (a low
+        # xGA vs weak opposition overstates real solidity). DEFENSE_LEAGUE_EXPONENT
+        # < 1 applies only part of that markup, so the full ÷ league_factor doesn't
+        # over-amplify weak-league concede rates into fake leakiness (BUG-001).
         if pl["club_xga_per90"] is not None:
             w = pl["minutes"] * DEFENSE_POS_WEIGHTS.get(pos, 0.0)
             if w > 0:
-                d_num += w * (pl["club_xga_per90"] / lf)
+                d_num += w * (pl["club_xga_per90"] / (lf ** DEFENSE_LEAGUE_EXPONENT))
                 d_w += w
     raw_attack = (a_num / a_w) if a_w > 0 else None
     raw_defense = (d_num / d_w) if d_w > 0 else None

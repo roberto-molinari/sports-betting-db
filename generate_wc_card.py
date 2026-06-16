@@ -23,7 +23,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
-from core.sports_db import DATABASE_PATH, get_latest_wc_strength, add_wc_pick
+from core.sports_db import DATABASE_PATH, get_latest_wc_strength, replace_wc_pick
 from core.poisson_model import analyse_match_wc, ev_to_stars, american_to_implied_prob
 
 # match_date is stored in UTC, but the tournament is hosted in North America and
@@ -184,7 +184,7 @@ def main():
     generated_at = datetime.now(timezone.utc).isoformat()
     if not args.dry_run:
         for p in picks:
-            add_wc_pick(
+            replace_wc_pick(
                 match_id=p["match_id"], generated_at=generated_at,
                 side=p["side"], odds=p["odds"], model_prob=p["prob"],
                 ev=p["ev"], stars=p["stars"],
