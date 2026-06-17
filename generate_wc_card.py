@@ -30,9 +30,13 @@ from core.poisson_model import analyse_match_wc, ev_to_stars, american_to_implie
 # matchdays are reckoned in Eastern time (the US broadcast/posting frame), so a
 # late-evening kickoff stays on its Eastern calendar day. We bucket by Eastern at
 # query time. The whole tournament (Jun 11 - Jul 19) is EDT = UTC-4, with no DST
-# transition inside the window, so a fixed -4h shift is exact throughout.
+# transition inside the window, so a fixed shift is exact throughout.
 TOURNAMENT_TZ = ZoneInfo("America/New_York")
-EASTERN_SQL_OFFSET = "-4 hours"   # applied to match_date to get the Eastern day
+# Matchday boundary is 4am ET (a "broadcast day"), not midnight. Games kick off
+# only at 00:00 and 12:00-23:00 ET, leaving a 1am-11am ET dead zone, so a midnight
+# (00:00 ET) game groups with the PRIOR day's slate instead of spilling onto the
+# next calendar date. -8h total = -4h (UTC->ET) - 4h (midnight->4am boundary).
+EASTERN_SQL_OFFSET = "-8 hours"   # match_date -> matchday (4am-ET broadcast day)
 
 # The three host nations play their group games in their own countries, so they
 # carry a real home-field edge regardless of which side FIFA lists as "home"
@@ -41,12 +45,21 @@ EASTERN_SQL_OFFSET = "-4 hours"   # applied to match_date to get the Eastern day
 HOST_NATIONS = {"USA", "Mexico", "Canada"}
 HOST_HOME_ADVANTAGE = 1.20
 
-# Longshot guardrail (BUG-003): we won't surface ANY pick — win, draw, or total —
-# when the model's own probability for it is below this floor. At long odds the
-# model's small-probability estimates are too noisy to trust, so the EV is noise,
-# not edge (a 12% win and an 18% longshot draw are the same problem). Demotes to
-# the next-best qualifying side; no abstention.
+# Selection guardrails (BUG-003 — noise amplification on longshots). Both are
+# evaluated INDEPENDENTLY on every candidate so we can log which one excluded a
+# pick; a candidate must clear BOTH to be eligible.
+#
+# floor — we won't surface ANY pick (win, draw, or total) whose model probability
+# is below this. At long odds a tiny probability overestimate becomes a large,
+# fake EV%, so a sub-floor pick's EV is noise, not edge. Applies to all markets.
 MIN_PICK_PROBABILITY = 0.25
+# cap — we won't surface a pick whose model probability is >= this multiple of the
+# market's implied probability. Only an underdog can trip it (a favorite can't be
+# 2x its own high implied prob), so it targets the case the floor misses: the model
+# *confidently over-rating a dog* (e.g. Jordan +725, model 0.353 vs market 0.121 =
+# 2.9x — cleared the floor at 0.353, but the disagreement is the model under-rating
+# the favorite, not edge). Set on principle ("twice the market's price"), not fit.
+MAX_UNDERDOG_MARKET_DISAGREEMENT = 2.0
 
 
 def parse_args():
@@ -63,7 +76,10 @@ def match_window(target_date):
     """Return (start, end) ISO Eastern-day dates for the query window."""
     if target_date:
         return target_date, target_date
-    today = datetime.now(timezone.utc).astimezone(TOURNAMENT_TZ).date()
+    # Same 4am-ET broadcast-day boundary as EASTERN_SQL_OFFSET, so running in the
+    # small hours (after a midnight game) still resolves to the prior day's slate.
+    today = (datetime.now(timezone.utc).astimezone(TOURNAMENT_TZ)
+             - timedelta(hours=4)).date()
     return today.isoformat(), (today + timedelta(days=1)).isoformat()
 
 
@@ -95,6 +111,48 @@ def display_pick(side, home, away):
     if side == "DRAW":
         return "Draw"
     return side.replace("OVER", "Over").replace("UNDER", "Under")
+
+
+def select_pick(priced):
+    """Choose the pick from a list of priced candidates, applying the two BUG-003
+    guardrails. Pure (no DB) so it's directly testable.
+
+    Each candidate dict needs ``side``, ``odds``, ``prob`` (model probability),
+    ``implied`` (market-implied probability), and ``ev``. The two guardrails are
+    evaluated INDEPENDENTLY on every candidate (no short-circuit) so each exclusion
+    records which check(s) fired:
+      - floor: model prob below ``MIN_PICK_PROBABILITY`` (any market).
+      - cap:   model prob >= ``MAX_UNDERDOG_MARKET_DISAGREEMENT`` x implied prob
+               (only underdogs can trip it; catches the model over-rating a dog).
+    A candidate must clear BOTH to be eligible. The chosen dict is returned with
+    ``excluded_by`` set on every candidate, ``demoted`` = the higher-EV candidates
+    that were excluded, and ``fallback`` = True if no candidate cleared both gates.
+    """
+    for c in priced:
+        reasons = []
+        if c["prob"] < MIN_PICK_PROBABILITY:
+            reasons.append(
+                f"floor (model {c['prob']:.3f} < {MIN_PICK_PROBABILITY:g})")
+        if c["implied"] and c["prob"] >= MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"]:
+            reasons.append(
+                f"cap (model {c['prob']:.3f} >= {MAX_UNDERDOG_MARKET_DISAGREEMENT:g}x "
+                f"market {c['implied']:.3f})")
+        c["excluded_by"] = reasons
+
+    eligible = [c for c in priced if not c["excluded_by"]]
+    if eligible:
+        best = max(eligible, key=lambda c: c["ev"])
+    else:
+        # No abstention: nothing cleared both gates, so back the MOST LIKELY
+        # outcome (highest model prob), not the highest EV — picking by EV would
+        # hand it straight back to the longshot we just excluded.
+        best = max(priced, key=lambda c: c["prob"])
+        best["fallback"] = True
+    # For the log: higher-EV candidates that were excluded (what we would have
+    # picked without the guardrails, and why we didn't).
+    best["demoted"] = [c for c in priced
+                       if c["excluded_by"] and c["ev"] > best["ev"]]
+    return best
 
 
 def best_pick_for_match(match, conn):
@@ -138,20 +196,15 @@ def best_pick_for_match(match, conn):
         (f"UNDER {line_label}", match["under_odds"], r.get("p_under"), r.get("ev_under")),
     ]
     priced = [
-        {"side": side, "odds": odds, "prob": prob, "ev": ev}
+        {"side": side, "odds": odds, "prob": prob, "ev": ev,
+         "implied": american_to_implied_prob(odds)}
         for side, odds, prob, ev in candidates
         if ev is not None and odds is not None and prob is not None
     ]
     if not priced:
         return None
 
-    # Longshot guardrail: drop any pick whose model probability is below
-    # MIN_PICK_PROBABILITY. At long odds the model can't estimate small
-    # probabilities reliably, so a tiny overestimate becomes a large, fake EV% —
-    # true for a longshot win, draw, or total alike. No abstention: if the floor
-    # would leave nothing, fall back to the full priced set.
-    eligible = [c for c in priced if c["prob"] >= MIN_PICK_PROBABILITY]
-    best = max(eligible or priced, key=lambda c: c["ev"])
+    best = select_pick(priced)
     best.update({
         "match_id": match["match_id"],
         "match_date": match["match_date"],
@@ -206,6 +259,19 @@ def main():
               f"| odds {p['odds']:+.0f} | imp p {imp:.3f} | model p {p['prob']:.3f} "
               f"| EV {p['ev']:+.1%} | {'⭐' * p['stars']}")
     print("")
+
+    demoted_any = [p for p in picks if p.get("demoted") or p.get("fallback")]
+    if demoted_any:
+        print("=== GUARDRAIL LOG (BUG-003) ===")
+        for p in demoted_any:
+            for d in p["demoted"]:
+                print(f"  {p['home']} vs {p['away']}: {d['side']} "
+                      f"(EV {d['ev']:+.1%}) EXCLUDED by {' & '.join(d['excluded_by'])} "
+                      f"-> selected {p['side']}")
+            if p.get("fallback"):
+                print(f"  {p['home']} vs {p['away']}: no candidate cleared both gates "
+                      f"-> fell back to most-likely side {p['side']} (model {p['prob']:.3f})")
+        print("")
 
     print("=== SOCIAL POST ===")
     for p in picks:

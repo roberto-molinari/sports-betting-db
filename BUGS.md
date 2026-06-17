@@ -99,7 +99,8 @@ moneyline; flag the team rather than trusting the raw edge.
 
 ## BUG-003 — EV on big-longshot moneylines is unreliable (noise amplification)
 
-- **Severity:** medium · **Status:** OPEN (2026-06-13)
+- **Severity:** medium · **Status:** MITIGATED 2026-06-17 (floor + cap shipped);
+  the underlying dog over-rating is still open (BUG-005 / DESIGN-001 territory)
 - **Symptom.** A small absolute probability error on a big underdog produces a
   large EV%, so longshot moneylines keep topping the card on fake edges.
 - **Evidence.** Qatar +1100: model p 0.119 vs market 0.083 — a **3.6-point**
@@ -110,6 +111,38 @@ moneyline; flag the team rather than trusting the raw edge.
   moneyline pick below a model-probability floor (~0.15), or require a minimum
   *absolute* edge (model_p − implied_p ≥ ~0.04), not just EV%. Demote to the
   next-best qualifying side (no abstention). Does not touch the lambdas.
+
+**Update 2026-06-17 — noise amplification has been the book's single biggest leak
+(~1 week in).** Through 19 graded picks (Jun 11–16), big-underdog moneylines (+150
+or longer) are **1W-5L for −2.45u** — CIV +255 the lone winner; Korea +180, Bosnia
++360, Netherlands/Japan +255, Haiti +475 and Jordan +725 all lost. Strip them out
+and the rest of the model is **+3.16u** (vs +0.71u overall): the longshots alone
+turn a clearly-profitable model into a coin flip. The shipped guardrail (uniform
+`MIN_PICK_PROBABILITY = 0.25`) does NOT catch them — it only demotes picks the model
+itself rates sub-floor, whereas these are dogs the model *confidently over-rates*
+(Jordan: model p 0.353 vs market 0.121, ~3×, +191% "EV", cleared the 0.25 floor,
+Austria won 3-1). The error is directional (model under-rates the favorite → over-
+rates the dog), so the fix is a **market-disagreement check on top of** the floor,
+not a replacement for it.
+
+**Update 2026-06-17 (cont.) — cap shipped.** Added `MAX_UNDERDOG_MARKET_DISAGREEMENT
+= 2.0`: a candidate is demoted when its model prob is >= 2x the market's implied prob
+(only an underdog can trip it — a favorite can't be 2x its own high implied). A
+K-sweep over the 20 graded picks showed the *ratio* does **not** cleanly separate
+winners from losers (losers span 1.13x-2.91x, and the lone ML winner CIV +255 sits
+at 1.78x, mid-pack), so K is set on **principle** ("twice the market's price"), not
+fit — and the cap is justified as a **soundness filter** (don't *post* a pick whose
+EV rests on a probability the model can't support), **not** by sample P&L (it adds
+~0 on the sample, since the demoted matches were largely unwinnable by +EV logic
+anyway). At K=2.0 it fires only on the egregious case (Jordan 2.91x) with **zero
+false positives**; Bosnia (1.86x), Haiti (1.58x), CIV (1.78x) and ordinary
+near-market dogs (Korea 1.19x, NL/Japan 1.13x) are all left alone. Implemented as a
+pure `select_pick()` in `generate_wc_card.py`: floor and cap are evaluated
+**independently** on every candidate (each exclusion logs which check(s) fired, with
+the math), a pick must clear **both**, and when nothing clears both the fallback is
+the **highest-model-probability** side (not highest EV — that would hand it back to
+the longshot). A `GUARDRAIL LOG` section prints every demotion. This is *mitigation*;
+the root over-rating of dogs is unchanged (BUG-005 / DESIGN-001).
 
 ## BUG-004 — Over-skew: model expects more total goals than the market (LEVEL bias)
 
