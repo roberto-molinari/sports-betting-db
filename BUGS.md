@@ -43,7 +43,8 @@ hinge on attack/defense *level* with skepticism.
 
 ## BUG-005 — Club goals/90 over-credits the attack of talent-rich, mid-ranked teams
 
-- **Severity:** medium · **Status:** OPEN (2026-06-14)
+- **Severity:** medium · **Status:** PARTIALLY MITIGATED 2026-06-19 (FIFA blend
+  w=0.2 shipped, v7 strengths); root metric issue (goals-not-xG) still open
 - **Discovered:** 2026-06-14, reviewing the Jun 14 card (Côte d'Ivoire vs Ecuador;
   model gave CIV win +78% EV — a +255 market dog read as a ~50% favorite).
 
@@ -94,6 +95,20 @@ engine change** — one match against a market we already distrust on totals is 
 enough signal. **Interim handling:** for affected matches prefer totals (robust to the
 attack/defense misallocation — see the CIV Over 1.5 sensitivity check) or skip the
 moneyline; flag the team rather than trusting the raw edge.
+
+**Mitigation shipped (2026-06-19) — FIFA blend, `FIFA_BLEND_WEIGHT = 0.2`.** Stat-based
+teams now blend `λ = 0.8·stats + 0.2·fifa_fallback(rank)` on BOTH attack and defense
+(overrides/thin-coverage fallbacks already 100% FIFA, untouched). Both inputs are
+WC_BASELINE-centered so the field mean stays at baseline — it only redistributes
+strength. Surfaced on the Jun 19 card: model rated **Scotland (#33) attack 1.48 ABOVE
+Morocco (#11) 1.41** — the inversion this bug predicts. Blend trims Scotland to 1.44 and
+lifts Morocco to 1.47/def 1.21. Weight kept deliberately LOW: the opposite failure
+exists too (club stats correctly capture Haaland-type talent FIFA rank lags — Norway #39
+att 1.87, only trimmed to 1.72), and over-blending re-predicts the ranking and kills the
+value edge. Persisted as v7 (`notes LIKE 'v7:%'`); v6 rows retained, revert = delete v7.
+**Still open:** w=0.2 is a calibration nudge, not a cure — it trims EV on over-rated dogs
+but does not remove them (Scotland still posted at +36% / 3★). Tune `w` against results
+over the tournament; the goals→xG metric fix (DESIGN-001) is the orthogonal other half.
 
 ---
 

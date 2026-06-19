@@ -147,9 +147,11 @@ def test_defense_exponent_leaves_top_league_untouched():
     assert rd == pytest.approx(1.2)                    # 1.0**0.5 == 1.0
 
 
-def test_compute_strengths_normalizes_attack_to_target_spread():
+def test_compute_strengths_normalizes_attack_to_target_spread(monkeypatch):
     """Attack is normalized to baseline mean AND the fixed ATTACK_LAMBDA_SD spread,
-    regardless of the raw distribution's spread."""
+    regardless of the raw distribution's spread. Tested with the FIFA blend off so
+    it isolates the stat-normalization step (the blend has its own test)."""
+    monkeypatch.setattr(cws, "FIFA_BLEND_WEIGHT", 0.0)
     teams = {
         i: {"name": f"T{i}", "fifa": 30, "players": [
             _player("FWD", r, 1.0), _player("MID", 0.5, 1.0),
@@ -161,6 +163,21 @@ def test_compute_strengths_normalizes_attack_to_target_spread():
     assert all(out[t]["basis"] == "stats" for t in out)
     assert mean(atts) == pytest.approx(WC_BASELINE)
     assert pstdev(atts) == pytest.approx(cws.ATTACK_LAMBDA_SD)
+
+
+def test_compute_strengths_blends_stats_toward_fifa(monkeypatch):
+    """With the blend on, two squads with IDENTICAL stats but different FIFA ranks
+    diverge: the better-ranked team is pulled to a stronger attack and stingier
+    defense, recovering pedigree the club aggregate alone would miss."""
+    monkeypatch.setattr(cws, "FIFA_BLEND_WEIGHT", 0.3)
+    teams = {
+        1: {"name": "TopRank", "fifa": 2, "players": _covered_squad()},
+        2: {"name": "LowRank", "fifa": 47, "players": _covered_squad()},
+    }
+    out = cws.compute_strengths(teams)
+    assert out[1]["basis"].startswith("stats+fifa")
+    assert out[1]["lambda_attack"] > out[2]["lambda_attack"]   # better rank -> more attack
+    assert out[1]["lambda_defense"] < out[2]["lambda_defense"]  # better rank -> less conceded
 
 
 # ── compute_strengths: manual FIFA overrides are sticky ──────────────────────
@@ -184,7 +201,7 @@ def test_compute_strengths_override_pins_to_fifa(monkeypatch):
     out = cws.compute_strengths(teams)
     assert out[1]["basis"].startswith("fifa-override")
     assert (out[1]["lambda_attack"], out[1]["lambda_defense"]) == cws.fifa_fallback(8, field)
-    assert out[2]["basis"] == "stats"   # same squad, not overridden -> stat-based
+    assert out[2]["basis"].startswith("stats")  # same squad, not overridden -> stat-based
 
 
 # ── apply_shrinkage: sample-size blend toward positional prior ────────────────

@@ -16,8 +16,10 @@ are tunable constants):
                    normalized to WC_BASELINE. This is why club_xga_per90 is
                    fetched per player — without it defense has no real signal.
 
-Teams whose squads lack usable stat coverage fall back to a FIFA-ranking-derived
-estimate (labeled as such in the notes).
+Stat-based teams are then lightly blended toward their FIFA-rank estimate
+(FIFA_BLEND_WEIGHT) to recover national-team pedigree the club aggregate misses.
+Teams whose squads lack usable stat coverage fall back entirely to the
+FIFA-ranking-derived estimate (labeled as such in the notes).
 
 Usage:
     python compute_wc_team_strength.py --print            # show, don't store
@@ -138,6 +140,20 @@ MIN_DEFENSE_WEIGHT = 1000.0
 # so the mid-field team sits at baseline and only genuine extremes get the full
 # spread. best-in-field -> attack +FIFA_SPREAD / defense -FIFA_SPREAD.
 FIFA_SPREAD = 0.6
+
+# How far a stats-based team's lambdas are pulled toward its FIFA-rank estimate
+# (0 = pure club-stat aggregation, 1 = pure FIFA rank). Club-stat aggregation
+# can't see national-team pedigree that doesn't show up in club numbers: it
+# underrates cohesive sides whose players don't pile up club goals (Morocco, #11,
+# rated below Scotland) and overrates teams whose players post flattering club
+# stats (Scotland, #33). A light blend corrects that systematic bias. It is kept
+# SMALL on purpose because the opposite failure also exists: where club stats
+# correctly capture individual talent that FIFA rank lags (Haaland's Norway, #39),
+# the blend wrongly drags them down. 0.2 keeps most of the club-stat signal (our
+# edge) while nudging the field toward national-team reality. Overrides and
+# thin-coverage fallbacks are already 100% FIFA, so the blend only touches the
+# stats-based teams.
+FIFA_BLEND_WEIGHT = 0.2
 
 # Teams MANUALLY pinned to the FIFA-ranking fallback. These are known
 # data-failures where club-stat aggregation is wrong for a reason we understand
@@ -355,11 +371,24 @@ def compute_strengths(teams):
         has_attack = r["ra"] is not None and r["aw"] >= MIN_ATTACK_WEIGHT and attack_scale
         has_defense = r["rd"] is not None and r["dw"] >= MIN_DEFENSE_WEIGHT and defense_scale
         if has_attack and has_defense:
+            # Normalized club-stat lambdas, then lightly blended toward the team's
+            # FIFA-rank estimate to recover national-team pedigree the club
+            # aggregate misses (both are WC_BASELINE-centered, so the blend keeps
+            # the field mean at baseline — it only redistributes strength).
+            la_stats = normalize_attack(r["ra"])
+            ld_stats = r["rd"] * defense_scale
+            w = FIFA_BLEND_WEIGHT
+            if w > 0:
+                fa, fd = fifa_fallback(info["fifa"], field_ranks)
+                la, ld = (1 - w) * la_stats + w * fa, (1 - w) * ld_stats + w * fd
+                basis = f"stats+fifa{w:g}"
+            else:
+                la, ld, basis = la_stats, ld_stats, "stats"
             out[tid] = {
                 "name": info["name"],
-                "lambda_attack": normalize_attack(r["ra"]),
-                "lambda_defense": r["rd"] * defense_scale,
-                "basis": "stats",
+                "lambda_attack": la,
+                "lambda_defense": ld,
+                "basis": basis,
             }
         else:
             la, ld = fifa_fallback(info["fifa"], field_ranks)
