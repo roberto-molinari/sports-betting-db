@@ -110,6 +110,20 @@ value edge. Persisted as v7 (`notes LIKE 'v7:%'`); v6 rows retained, revert = de
 but does not remove them (Scotland still posted at +36% / 3★). Tune `w` against results
 over the tournament; the goals→xG metric fix (DESIGN-001) is the orthogonal other half.
 
+**Blend impact tracker — is w=0.2 earning its keep?** `python blend_impact.py` re-derives
+the pick the v6 (pre-blend) strengths WOULD have made and compares to the v7 pick on every
+graded match from 2026-06-19 on, attributing the unit delta only where the blend *changed*
+the pick (the only place it can help/hurt). Judge `w` on this cumulative delta, not one card.
+
+| Slate | Game (only blend-changed) | v6 pick → result | v7 pick → result | Δ units |
+|---|---|---|---|---|
+| Jun 19 | USA v Australia (2-0) | HOME ✓ (+0.74) | OVER 2.5 ✗ (−1.00) | **−1.74** |
+| | **cumulative** | | | **−1.74u (1 graded)** |
+
+Early and noisy (1 game): the blend's first swing backfired — it flipped a winning USA
+moneyline to a losing Over 2.5. This is exactly the Haaland-side cost flagged at design time
+(blend cools a strong favorite toward market). Do NOT move `w` off one slate; let the table grow.
+
 ---
 
 ## BUG-003 — EV on big-longshot moneylines is unreliable (noise amplification)
