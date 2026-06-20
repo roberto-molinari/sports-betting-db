@@ -9,6 +9,40 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-001 — Player-availability "what-if" (squad λ impact of an absence)
+
+- **Type:** enhancement (not a bug) · **Status:** PROPOSED (2026-06-20) · not built
+- **Prompted by:** the Jun 19 USA game — USA put up only ~1.08 xG (1.43 combined) with
+  **Pulisic injured**, so the Over 2.5 loss and the low total partly reflect a missing
+  creator the model never accounted for.
+
+**The gap.** Team λ are computed from the **full squad pool** (`compute_wc_team_strength.py`),
+assuming everyone is available. There is no concept of who is actually fit/selected for a
+given match, so an injury or suspension to a key player is invisible to the card.
+
+**Two builds (start small):**
+
+| Option | What | Effort | New data? |
+|---|---|---|---|
+| **A — what-if diagnostic** (recommended first) | `whatif_player_out.py --team USA --out "Pulisic"`: exclude the player from `raw_team_strength`, re-derive *that one team's* raw attack/defense, re-apply the **same field normalization + FIFA blend** the rest of the field used, print the λ delta and (optionally) re-price the team's next match. | ~1hr | none — only a player name; per-player stats already stored |
+| **B — availability baked into the card** | mark players out before card-gen so λ reflect the available XI. Makes λ **per-match** instead of per-tournament-version → touches the strength-storage model. | larger | needs an availability source (manual "out" flags easiest; API feed harder) |
+
+**Caveat the tool must address — and the fix.** λ weight each player by *club minutes ×
+position*, so any one player is only ~5–8% of a 23-man squad's weight. A naïve exclusion
+therefore **understates** a marquee absence — the model has no notion that one creator is
+disproportionately important to the *national* side. Mitigation (user's call, and sound
+because exclusion is already a deliberate "this is a real loss" judgment): an **importance
+multiplier** `M` (tunable, default > 1) that amplifies the excluded player's effect beyond
+his raw squad-share — applied either to his contribution weight before removal or to the
+resulting λ delta. You'd only ever exclude a player you consider a meaningful loss, so
+over-counting their absence is acceptable and likely *more* realistic than the flat share.
+
+**Recommendation.** Build **A with the multiplier** when wanted — cheap, no new pipeline,
+immediately useful for pre-match "key player ruled out → fade/adjust?" calls. Defer **B**
+until A shows absences move the needle enough to justify per-match λ.
+
+---
+
 ## DESIGN-001 — Model runs on goals, not xG/xGA (deliberate v1 choice)
 
 - **Status:** BY DESIGN for v1 (recorded 2026-06-14). **TODO:** add real xG (attack)
