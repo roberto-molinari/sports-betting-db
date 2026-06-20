@@ -9,6 +9,37 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## KNOCKOUT-PRICING — confirm 90-minute markets at the knockout transition
+
+- **Type:** watch / reminder · **Status:** PENDING (fires ~2026-06-28, Round of 32)
+- **Trigger:** group stage ends ~2026-06-27; the first knockout card is the check.
+
+**What.** `analyse_match_wc` prices **90-minute** 1X2 + totals. Knockout games can't end
+in a draw (extra time + penalties), so books post BOTH a **90-minute** line (with Draw)
+and a separate **"to advance"** market. DRAW picks and O/U totals still settle correctly
+**only if we keep ingesting the 90-minute lines.** On the first knockout card, confirm
+`import_wc_odds` is loading 90-min markets — do **not** feed a to-advance price into the
+card as if it were 90-min (it would mis-price the draw and the moneylines).
+
+---
+
+## w-VALIDATION — calibration snapshot at group-stage end (BUG-005)
+
+- **Type:** analysis task · **Status:** PENDING (run when group stage completes ~2026-06-27)
+
+**Why now-or-never.** The FIFA blend only does anything on strong-vs-weak FIFA-gap games,
+which concentrate in the **group stage** and dry up in the knockouts (the field clusters,
+gaps narrow, the blend goes quiet). So the `w`-tuning sample is effectively closed once the
+group stage ends — we will **not** get an empirical `w` from this tournament; it stays a
+principled prior. **Do the one measurement that's meaningful and time-boxed:** a
+**calibration** check (not a unit backtest — too noisy on ~37 longshot games). Of the
+group-stage games where the model rated a dog well above market (CIV-type), did they lose at
+roughly the blended probability's implied rate? That validates the blend's *probabilities*,
+which is variance-robust where P&L is not. `blend_impact.py` tracks pick-change deltas until
+then.
+
+---
+
 ## FEATURE-001 — Player-availability "what-if" (squad λ impact of an absence)
 
 - **Type:** enhancement (not a bug) · **Status:** PROPOSED (2026-06-20) · not built
