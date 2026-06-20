@@ -19,7 +19,35 @@ in a draw (extra time + penalties), so books post BOTH a **90-minute** line (wit
 and a separate **"to advance"** market. DRAW picks and O/U totals still settle correctly
 **only if we keep ingesting the 90-minute lines.** On the first knockout card, confirm
 `import_wc_odds` is loading 90-min markets — do **not** feed a to-advance price into the
-card as if it were 90-min (it would mis-price the draw and the moneylines).
+card as if it were 90-min (it would mis-price the draw and the moneylines). This is the
+*defensive* check only; betting the to-advance market itself is a separate build — see
+**FEATURE-002**.
+
+---
+
+## FEATURE-002 — "To advance" market for knockout ties
+
+- **Type:** feature · **Status:** PROPOSED — needed before knockouts (~2026-06-28) **if we
+  want to bet to-advance**; not blocking otherwise.
+
+**Why.** Knockout ties resolve via extra time + penalties, so "which team advances" is its
+own 2-way market (the marquee knockout line) that the 90-min model can't price today.
+Distinct from KNOCKOUT-PRICING (that's the defensive "keep ingesting 90-min lines" check;
+this *adds* a new bettable market). **Not blocking:** the card still works in the knockouts
+on 90-min 1X2 + totals — to-advance is additive value, not a prerequisite.
+
+**What it touches:**
+- `core/poisson_model.py` — `advance_probs(λ_H, λ_A)` = `P(win 90) + P(draw 90)·[P(win ET) +
+  P(draw ET)·0.5]`; ET reuses `scoreline_grid` at λ scaled to 30 min; penalties ~50/50 (v1).
+- **schema** — store 2-way to-advance odds (e.g. `home_advance_ml`/`away_advance_ml` on
+  `soccer_wc_odds`) and an **"advanced"** result field on `soccer_wc_matches` (the 90-min
+  score doesn't capture a penalty-shootout winner).
+- `import_wc_odds.py` — parse the to-advance odds.
+- `generate_wc_card.py` — add ADVANCE candidates (floor/cap guardrails apply).
+- `update_wc_results.py` — grade ADVANCE picks against who advanced.
+
+**Effort:** moderate, multi-file, ~a few hours. Buildable before Jun 28 if started this week.
+**Decision needed:** build it (bet to-advance) vs. stick to 90-min markets only in knockouts.
 
 ---
 
