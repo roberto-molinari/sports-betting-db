@@ -1,11 +1,12 @@
 """
-Track the real-world impact of the FIFA-rank blend (BUG-005, v7 strengths).
+Track the real-world impact of the FIFA-rank corrections (BUG-005): the w=0.2
+blend plus the per-team FIFA overrides (Egypt, CIV, ...).
 
-For every v7-era match (from FIRST_BLEND_DATE on), re-derive the pick the model
-WOULD have made on the pre-blend v6 strengths and compare it to the v7 pick the
-blend actually produces. The interesting rows are the ones where the blend
-*changed* the pick: only there can the blend help or hurt. For graded matches it
-settles both the v6 and v7 sides and reports the unit delta the blend caused.
+For every match from FIRST_BLEND_DATE on, re-derive the pick the model WOULD have
+made on the pre-correction v6 baseline strengths and compare it to the current
+pick (blend + overrides). The interesting rows are the ones where the correction
+*changed* the pick: only there can it help or hurt. For graded matches it settles
+both the baseline and current sides and reports the unit delta.
 
 This is the data that tells us whether FIFA_BLEND_WEIGHT=0.2 is earning its keep:
 trim it, leave it, or raise it — judged on results, not one card.
@@ -31,14 +32,15 @@ MARKET_BOOK = "Bovada"   # the book the card prices against (Consensus rows are 
 
 
 def strength(conn, team_id, blended):
-    """Latest lambdas for a team. blended=True -> v7 (newest row); False -> the
-    newest NON-v7 row (the v6 the blend replaced)."""
+    """Lambdas for a team. blended=True -> the current production strengths (newest
+    row: blend + any FIFA overrides); False -> the pre-correction v6 baseline (pinned
+    to the 'v6:' rows, stable as later versions v7/v8/... accrue)."""
     if blended:
         sql = ("SELECT lambda_attack, lambda_defense FROM soccer_wc_team_strength "
                "WHERE team_id = ? ORDER BY strength_id DESC LIMIT 1")
     else:
         sql = ("SELECT lambda_attack, lambda_defense FROM soccer_wc_team_strength "
-               "WHERE team_id = ? AND (notes IS NULL OR notes NOT LIKE 'v7:%') "
+               "WHERE team_id = ? AND notes LIKE 'v6:%' "
                "ORDER BY strength_id DESC LIMIT 1")
     row = conn.execute(sql, (team_id,)).fetchone()
     return (row[0], row[1]) if row else None

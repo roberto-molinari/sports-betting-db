@@ -136,8 +136,9 @@ hinge on attack/defense *level* with skepticism.
 
 ## BUG-005 — Club goals/90 over-credits the attack of talent-rich, mid-ranked teams
 
-- **Severity:** medium · **Status:** PARTIALLY MITIGATED 2026-06-19 (FIFA blend
-  w=0.2 shipped, v7 strengths); root metric issue (goals-not-xG) still open
+- **Severity:** medium · **Status:** PARTIALLY MITIGATED — FIFA blend w=0.2 (v7,
+  2026-06-19) + targeted FIFA overrides for the worst cases (Egypt, CIV; v8,
+  2026-06-21). Root metric issue (goals-not-xG) still open.
 - **Discovered:** 2026-06-14, reviewing the Jun 14 card (Côte d'Ivoire vs Ecuador;
   model gave CIV win +78% EV — a +255 market dog read as a ~50% favorite).
 
@@ -188,6 +189,20 @@ engine change** — one match against a market we already distrust on totals is 
 enough signal. **Interim handling:** for affected matches prefer totals (robust to the
 attack/defense misallocation — see the CIV Over 1.5 sensitivity check) or skip the
 moneyline; flag the team rather than trusting the raw edge.
+
+**Targeted overrides shipped (2026-06-21) — Egypt + CIV pinned to FIFA rank (v8).**
+The flat w=0.2 blend is too light for the worst mismatches, so the two clearest cases
+were added to `FIFA_OVERRIDES` (100% FIFA, like the existing South Korea/Belgium pins):
+- **CIV** — club scorers inflated attack to ~Germany tier (1.59) for a #34 side; override
+  drops it to 1.24/1.46.
+- **Egypt** — Salah's output diluted across an Egyptian-league squad left attack at 1.01
+  (below baseline) for a #32 favorite; override lifts it to 1.29/1.41.
+Effect verified on the Jun 21 NZ/Egypt card: Egypt 0.447→0.550 (vs market ~0.60), which
+dropped NZ's win prob below the 0.25 floor so the model self-demoted the +57% NZ moneyline
+and selected Under 2.25 — the correction surfaced the sound pick *through the model*, no
+hand-override. Trade-off: an override discards ALL player signal for that team (a blunt rank
+anchor); justified only when the aggregate is too contaminated to trust. `blend_impact.py`
+now measures blend+overrides vs the pinned v6 baseline.
 
 **Mitigation shipped (2026-06-19) — FIFA blend, `FIFA_BLEND_WEIGHT = 0.2`.** Stat-based
 teams now blend `λ = 0.8·stats + 0.2·fifa_fallback(rank)` on BOTH attack and defense
