@@ -112,7 +112,7 @@ def main():
     conn.row_factory = sqlite3.Row
     matches = fetch(conn, args.date)
 
-    print(f"{'MATCH':<26}{'v6 PICK':<13}{'v7 PICK':<13}{'SCORE':<7}{'v6':>6}{'v7':>6}{'Δ':>7}")
+    print(f"{'MATCH':<26}{'v6 PICK':<13}{'cur PICK':<13}{'SCORE':<7}{'v6':>6}{'cur':>6}{'Δ':>7}")
     graded = pending = 0
     v6_tot = v7_tot = 0.0
     for m in matches:
