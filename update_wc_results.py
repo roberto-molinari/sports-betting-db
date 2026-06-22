@@ -24,6 +24,7 @@ from core.sports_db import (
     DATABASE_PATH,
     update_wc_match_result,
     set_wc_pick_result,
+    set_wc_override_result,
 )
 from import_wc_odds import load_team_map, load_match_index, resolve_team, find_match
 
@@ -71,9 +72,23 @@ def grade_match_picks(conn, match_id, home_score, away_score):
     return graded
 
 
+def grade_match_overrides(conn, match_id, home_score, away_score):
+    """Grade every user override for a completed match on its user_side. Returns count."""
+    cur = conn.cursor()
+    cur.execute("SELECT override_id, user_side FROM soccer_wc_pick_overrides WHERE match_id = ?",
+                (match_id,))
+    graded = 0
+    for override_id, side in cur.fetchall():
+        set_wc_override_result(override_id, grade_pick(side, home_score, away_score))
+        graded += 1
+    return graded
+
+
 def record_result(conn, match_id, home_score, away_score):
     update_wc_match_result(match_id, home_score, away_score)
-    return grade_match_picks(conn, match_id, home_score, away_score)
+    n = grade_match_picks(conn, match_id, home_score, away_score)
+    grade_match_overrides(conn, match_id, home_score, away_score)
+    return n
 
 
 def main():
@@ -85,11 +100,12 @@ def main():
         cur.execute("""SELECT match_id, home_score, away_score FROM soccer_wc_matches
                        WHERE match_status = 'completed'
                          AND home_score IS NOT NULL AND away_score IS NOT NULL""")
-        total = 0
+        total = ov = 0
         for match_id, hs, as_ in cur.fetchall():
             total += grade_match_picks(conn, match_id, hs, as_)
+            ov += grade_match_overrides(conn, match_id, hs, as_)
         conn.close()
-        print(f"Re-graded {total} picks across completed matches.")
+        print(f"Re-graded {total} picks and {ov} overrides across completed matches.")
         return
 
     team_map = load_team_map(conn)

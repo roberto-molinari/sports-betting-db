@@ -260,3 +260,35 @@ def test_replace_wc_pick_preserves_graded(db_path, conn):
     rows = cur.fetchall()
     assert ("HOME", "win") in rows   # graded pick retained
     assert len(rows) == 2            # graded kept, new ungraded added alongside
+
+
+def test_wc_pick_override_round_trip_and_grade(db_path, conn):
+    """A user override records the model snapshot + reason, leaves the model pick
+    untouched, and grades independently on its own user_side."""
+    home = sports_db.ensure_wc_team("Norway")
+    away = sports_db.ensure_wc_team("Senegal")
+    match_id = sports_db.ensure_wc_match("2026-06-22T20:00:00", home, away)
+    sports_db.add_wc_pick(match_id, "2026-06-21T12:00:00", "AWAY",
+                          odds=235, model_prob=0.34, ev=0.14, stars=2)
+    oid = sports_db.add_wc_pick_override(
+        match_id, user_side="OVER 2.5", user_odds=-112, reason="Haaland hot; model form-blind",
+        category="form", model_side="AWAY", model_odds=235)
+    sports_db.set_wc_override_result(oid, "win")
+    cur = conn.cursor()
+    cur.execute("""SELECT model_side, user_side, category, reason, result
+                   FROM soccer_wc_pick_overrides WHERE override_id = ?""", (oid,))
+    assert cur.fetchone() == ("AWAY", "OVER 2.5", "form", "Haaland hot; model form-blind", "win")
+    # the model's own pick row is untouched (single source of truth)
+    cur.execute("SELECT COUNT(*) FROM soccer_wc_picks WHERE match_id = ?", (match_id,))
+    assert cur.fetchone()[0] == 1
+
+
+def test_wc_pick_override_supersedes_ungraded(db_path, conn):
+    home = sports_db.ensure_wc_team("Argentina")
+    away = sports_db.ensure_wc_team("Austria")
+    match_id = sports_db.ensure_wc_match("2026-06-22T13:00:00", home, away)
+    sports_db.add_wc_pick_override(match_id, "UNDER 2.5", -115, "feels like a 2-0 game")
+    sports_db.add_wc_pick_override(match_id, "DRAW", 330, "changed my mind")
+    cur = conn.cursor()
+    cur.execute("SELECT user_side FROM soccer_wc_pick_overrides WHERE match_id = ?", (match_id,))
+    assert cur.fetchall() == [("DRAW",)]   # ungraded prior replaced, not stacked

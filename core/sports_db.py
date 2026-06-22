@@ -205,6 +205,24 @@ def init_database():
             FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
         );
 
+        -- A tagged human deviation from the model's pick on a match. The model's
+        -- pick (soccer_wc_picks) is left untouched (single source of truth); this
+        -- records what the user took INSTEAD and WHY, so model-vs-user can be scored
+        -- head-to-head and the reasons mined for a systematic model improvement.
+        CREATE TABLE IF NOT EXISTS soccer_wc_pick_overrides (
+            override_id INTEGER PRIMARY KEY,
+            match_id    INTEGER NOT NULL,
+            model_side  TEXT,                 -- snapshot of the model's pick at deviation time
+            model_odds  REAL,
+            user_side   TEXT NOT NULL,        -- the side the user actually took
+            user_odds   REAL,
+            category    TEXT,                 -- short tag: form/injury/lineup/motivation/market/...
+            reason      TEXT NOT NULL,        -- free-text rationale (the systematize-later signal)
+            result      TEXT,                 -- graded on user_side: win/loss/push
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_soccer_match_date    ON soccer_matches(match_date);
         CREATE INDEX IF NOT EXISTS idx_soccer_league        ON soccer_matches(league);
         CREATE INDEX IF NOT EXISTS idx_soccer_season        ON soccer_matches(season);
@@ -224,6 +242,7 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wc_odds_match      ON soccer_wc_odds(match_id);
         CREATE INDEX IF NOT EXISTS idx_wc_strength_team   ON soccer_wc_team_strength(team_id);
         CREATE INDEX IF NOT EXISTS idx_wc_picks_match     ON soccer_wc_picks(match_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_overrides_match ON soccer_wc_pick_overrides(match_id);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
@@ -718,6 +737,46 @@ def set_wc_pick_result(pick_id, result):
         cur.execute(
             "UPDATE soccer_wc_picks SET result = ? WHERE pick_id = ?",
             (result, pick_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_wc_pick_override(match_id, user_side, user_odds, reason,
+                         category=None, model_side=None, model_odds=None):
+    """Record a tagged human deviation from the model's pick on a match. Leaves
+    soccer_wc_picks untouched (the model's record stays the source of truth); this
+    captures what the user took instead and WHY, so the two can be scored
+    head-to-head and the reasons mined for a systematic model fix. Returns the
+    override_id. Re-recording for a match supersedes any ungraded prior override."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM soccer_wc_pick_overrides WHERE match_id = ? AND result IS NULL",
+            (match_id,)
+        )
+        cur.execute(
+            """INSERT INTO soccer_wc_pick_overrides
+               (match_id, model_side, model_odds, user_side, user_odds, category, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, model_side, model_odds, user_side, user_odds, category, reason)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def set_wc_override_result(override_id, result):
+    """Grade a user override on its user_side: result is 'win', 'loss', or 'push'."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE soccer_wc_pick_overrides SET result = ? WHERE override_id = ?",
+            (result, override_id)
         )
         conn.commit()
     finally:

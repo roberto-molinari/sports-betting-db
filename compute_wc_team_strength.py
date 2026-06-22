@@ -168,6 +168,7 @@ FIFA_OVERRIDES = {
     "South Korea": "goals/90 misses the squad's quality — Son's unrepresentative 0-goal MLS sample plus creators/defenders (Kim Min-jae, Lee Kang-in) who don't rack up club goals; net-rank #34 vs mid-field FIFA",
     "Egypt": "goals/90 buries the squad's quality — Salah's Liverpool output is diluted across an Egyptian-league squad, leaving net attack 1.01 (below baseline) for a #32 side the market makes a clear favorite (e.g. ~60% vs New Zealand); pin to FIFA rank (BUG-005)",
     "Côte d'Ivoire": "BUG-005 poster child — talent-rich club scorers (Bundesliga/Ligue 1) inflate attack to ~Germany tier (1.59) for a #34 international side, so the model read CIV a coin-flip vs Germany (market a +445 dog); pin to FIFA rank",
+    "Jordan": "weak-league inflation over-credits a #62 squad — attack 1.15 (near baseline) reads Jordan a ~30% live dog vs Algeria, whom the market makes a clear ~63% favorite (1.89x over market, just under the cap); pin to FIFA rank (BUG-005, same family as Uzbekistan)",
 }
 
 
