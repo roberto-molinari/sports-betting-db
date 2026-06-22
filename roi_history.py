@@ -1,0 +1,191 @@
+"""
+Day-by-day cumulative ROI for the World Cup 2026 model.
+
+Walks every graded pick in soccer_wc_picks, buckets by matchday (4am-ET broadcast
+day), and reports each day's record + the running cumulative units and ROI%. Prints
+a table and an ASCII chart by default; `--svg PATH` also writes a tweet-ready SVG
+line chart (pure stdlib, no third-party deps).
+
+Usage:
+    python roi_history.py                  # table + ASCII chart
+    python roi_history.py --svg roi.svg    # also write an SVG graphic
+"""
+
+import argparse
+import os
+import shutil
+import sqlite3
+import subprocess
+from collections import OrderedDict
+
+from core.sports_db import DATABASE_PATH
+from core.poisson_model import american_to_decimal
+
+EASTERN_SQL_OFFSET = "-8 hours"   # matchday boundary (see generate_wc_card.py)
+
+# Headless Chrome is the only no-extra-dependency way to rasterize SVG -> PNG at an
+# exact aspect ratio on this setup (no matplotlib/Pillow/rsvg wheels on py3.14).
+CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
+
+
+def units(odds, result):
+    if result == "win":
+        return american_to_decimal(odds) - 1
+    if result == "loss":
+        return -1.0
+    return 0.0   # push: stake returned
+
+
+def load_series(conn):
+    """Return an ordered list of per-day dicts with cumulative units + ROI%."""
+    rows = conn.execute(
+        """SELECT date(m.match_date, ?) d, p.odds, p.result
+           FROM soccer_wc_picks p JOIN soccer_wc_matches m ON p.match_id = m.match_id
+           WHERE p.result IS NOT NULL ORDER BY d""", (EASTERN_SQL_OFFSET,)).fetchall()
+    days = OrderedDict()
+    for d, o, r in rows:
+        days.setdefault(d, []).append((o, r))
+
+    series, cum_u, cum_n = [], 0.0, 0
+    for d, bs in days.items():
+        day_u = sum(units(o, r) for o, r in bs)
+        cum_u += day_u
+        cum_n += len(bs)
+        series.append({
+            "date": d,
+            "w": sum(r == "win" for _, r in bs),
+            "l": sum(r == "loss" for _, r in bs),
+            "p": sum(r == "push" for _, r in bs),
+            "day_u": day_u, "cum_u": cum_u, "bets": cum_n,
+            "roi": cum_u / cum_n * 100,
+        })
+    return series
+
+
+def print_table(series):
+    print(f"{'date':<12}{'W-L-P':>8}{'day u':>8}{'cum u':>8}{'bets':>6}{'cum ROI':>9}")
+    for s in series:
+        wlp = f"{s['w']}-{s['l']}-{s['p']}"
+        print(f"{s['date']:<12}{wlp:>8}"
+              f"{s['day_u']:>+8.2f}{s['cum_u']:>+8.2f}{s['bets']:>6}{s['roi']:>+8.1f}%")
+
+
+def print_ascii(series):
+    print("\nCumulative ROI %  (bars left of | = negative, right = positive; block ~2%)")
+    lo = min(s["roi"] for s in series)
+    pad = int(round(abs(min(lo, 0)) / 2.0))
+    for s in series:
+        n = int(round(s["roi"] / 2.0))
+        line = (" " * pad + "|" + "#" * n) if s["roi"] >= 0 else (" " * (pad + n) + "#" * (-n) + "|")
+        print(f"{s['date'][5:]:<7}{s['roi']:>+6.1f}% {line}")
+
+
+def write_svg(series, path):
+    """Tweet-ready SVG line chart of cumulative ROI%."""
+    W, H, L, R, T, B = 1200, 675, 90, 60, 130, 90
+    pw, ph = W - L - R, H - T - B
+    ys = [s["roi"] for s in series]
+    ymin, ymax = min(min(ys), 0.0), max(max(ys), 0.0)
+    span = (ymax - ymin) or 1.0
+    ymin, ymax = ymin - span * 0.10, ymax + span * 0.12
+    n = max(len(series) - 1, 1)
+
+    def X(i):
+        return L + pw * i / n
+
+    def Y(v):
+        return T + ph * (1 - (v - ymin) / (ymax - ymin))
+
+    last = series[-1]
+    tw = sum(s["w"] for s in series)
+    tl = sum(s["l"] for s in series)
+    tp = sum(s["p"] for s in series)
+    rec = f"{tw}-{tl}-{tp}"
+    accent = "#00ba7c" if last["roi"] >= 0 else "#f4212e"
+    e = []
+    e.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" font-family="Helvetica,Arial,sans-serif">')
+    e.append(f'<rect width="{W}" height="{H}" fill="#15202b"/>')
+    e.append(f'<text x="{L}" y="56" fill="#ffffff" font-size="38" font-weight="bold">'
+             f'World Cup 2026 — Model ROI</text>')
+    e.append(f'<text x="{L}" y="92" fill="#8899a6" font-size="24">'
+             f'{last["date"][:4]} group stage · {last["bets"]} picks · '
+             f'flat 1u · record {rec}</text>')
+
+    # y gridlines at "nice" steps
+    step = 25 if (ymax - ymin) > 60 else 10
+    v = step * (int(ymin // step))
+    while v <= ymax:
+        if ymin <= v <= ymax:
+            y = Y(v)
+            zero = abs(v) < 1e-9
+            e.append(f'<line x1="{L}" y1="{y:.1f}" x2="{L+pw}" y2="{y:.1f}" '
+                     f'stroke="{"#3a4a5a" if zero else "#22303c"}" '
+                     f'stroke-width="{2 if zero else 1}"/>')
+            e.append(f'<text x="{L-12}" y="{y+6:.1f}" fill="#8899a6" font-size="20" '
+                     f'text-anchor="end">{v:+.0f}%</text>')
+        v += step
+
+    # line + dots
+    pts = " ".join(f"{X(i):.1f},{Y(s['roi']):.1f}" for i, s in enumerate(series))
+    e.append(f'<polyline points="{pts}" fill="none" stroke="{accent}" stroke-width="4" '
+             f'stroke-linejoin="round" stroke-linecap="round"/>')
+    for i, s in enumerate(series):
+        e.append(f'<circle cx="{X(i):.1f}" cy="{Y(s["roi"]):.1f}" r="4.5" fill="{accent}"/>')
+        if i % 2 == 0 or i == len(series) - 1:
+            e.append(f'<text x="{X(i):.1f}" y="{H-B+34:.1f}" fill="#8899a6" font-size="18" '
+                     f'text-anchor="middle">{s["date"][5:]}</text>')
+
+    # final value callout
+    fx, fy = X(len(series) - 1), Y(last["roi"])
+    e.append(f'<text x="{fx:.1f}" y="{fy-18:.1f}" fill="{accent}" font-size="30" '
+             f'font-weight="bold" text-anchor="end">{last["roi"]:+.1f}%</text>')
+    e.append('</svg>')
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(e))
+
+
+def render_png(series, png_path, scale=2):
+    """Write the SVG, then rasterize to PNG via headless Chrome (1200x675 * scale)."""
+    svg_path = png_path.rsplit(".", 1)[0] + ".svg"
+    write_svg(series, svg_path)
+    chrome = next((p for p in CHROME_PATHS if os.path.exists(p)), None) \
+        or shutil.which("google-chrome") or shutil.which("chromium")
+    if not chrome:
+        print(f"Wrote {svg_path} — no Chrome found to make a PNG; open the SVG in a "
+              f"browser and screenshot it (or pass --svg and convert however you like).")
+        return
+    subprocess.run([chrome, "--headless", "--disable-gpu", f"--screenshot={png_path}",
+                    "--window-size=1200,675", f"--force-device-scale-factor={scale}",
+                    "--hide-scrollbars", "--default-background-color=15202bff",
+                    f"file://{os.path.abspath(svg_path)}"], capture_output=True)
+    print(f"Wrote {png_path}" if os.path.exists(png_path)
+          else f"Wrote {svg_path} — Chrome render failed; screenshot the SVG instead.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Day-by-day cumulative ROI for the WC model.")
+    ap.add_argument("--svg", metavar="PATH", help="Also write a tweet-ready SVG chart.")
+    ap.add_argument("--png", metavar="PATH", help="Write a tweet-ready PNG (via headless Chrome).")
+    args = ap.parse_args()
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    series = load_series(conn)
+    conn.close()
+    if not series:
+        print("No graded picks yet.")
+        return
+    print_table(series)
+    print_ascii(series)
+    if args.svg:
+        write_svg(series, args.svg)
+        print(f"\nWrote {args.svg}")
+    if args.png:
+        render_png(series, args.png)
+
+
+if __name__ == "__main__":
+    main()

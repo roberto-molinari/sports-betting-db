@@ -9,3 +9,7 @@ notes.txt
 *.csv
 nhl_odds_derived_*.csv
 matchday*_picks.csv
+
+# ROI chart artifacts
+roi.png
+roi.svg
