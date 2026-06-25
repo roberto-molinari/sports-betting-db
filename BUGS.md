@@ -9,6 +9,27 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## REFACTOR-001 — Generalize schema for multi-tournament reuse (drop `wc_`)
+
+- **Type:** refactor / tech-debt · **Status:** BACKLOG — **post-deadline**, deliberate one-shot.
+  Surfaced 2026-06-25 during FEATURE-002 design.
+
+**Why.** The `soccer_wc_*` tables are World-Cup-specific in name, but the schema (matches,
+penalties, ET goals, picks, odds) is tournament-agnostic and reusable (Champions League, Euros…).
+FEATURE-002's two new tables were named generically (`soccer_penalty_kicks`,
+`soccer_extra_time_goals`) as a seed, leaving a temporary generic-vs-`wc_` naming mix.
+
+**What it takes (why deferred).** `ALTER TABLE ... RENAME` on all 8 `soccer_wc_*` tables (data
+preserved) + every reference across `core/sports_db.py`, ~6 scripts, and all tests + renaming
+~30 `*_wc_*` CRUD helpers + **coordinating a breaking change with the external serie-a-bets-tracker
+repo** that reads these tables. Real cross-repo risk; not to be bolted onto a deadline feature.
+
+**Scope when done.** Rename all tables/helpers off `wc_` **and** introduce generic
+match/team/player parent tables (the part that actually unlocks cross-tournament reuse — the new
+event tables currently still FK to `soccer_wc_*` parents in this DB).
+
+---
+
 ## FEATURE-005 — Confidence-weighted staking plan (stake field + stake_for_stars)
 
 - **Type:** feature · **Status:** BACKLOG — **LOWEST priority** (build after FEATURE-003/-002,
