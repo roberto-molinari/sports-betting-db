@@ -9,6 +9,93 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-005 — Confidence-weighted staking plan (stake field + stake_for_stars)
+
+- **Type:** feature · **Status:** BACKLOG — **LOWEST priority** (build after FEATURE-003/-002,
+  and only if -004 doesn't take precedence). Confirmed low-priority with user 2026-06-25.
+
+**Why.** Everything is currently **flat 1u** — both the model record (`soccer_wc_picks`, no
+stake column) and the override tracker. There's no way to stake by confidence or to record a
+partial stake. Prompted 2026-06-25 when the user wanted to play **0.5u** on a low-conviction
+1★ pick (Tunisia/Netherlands Under 2.5) — which the schema can't represent.
+
+**What the data already says (54 graded picks, 2026-06-25):** star tier *does* carry signal,
+but **opposite to the 1★ instinct** — 1★ is mildly **+** (n=14, +4.6% ROI/bet), 2★ is **−**
+(n=7, −14.5%, small-sample noise), 3★ carries the book (n=33, **+19.3%**). So a sound plan
+stakes **UP on 3★**, not down on 1★. A naive "stake = stars" weighting backtests ~14% ROI vs
+flat ~11% (the best, biggest tier gets the most weight). Re-run this backtest before committing
+a plan — samples are still modest. Sizing *down* on low-confidence picks is still defensible as
+**variance management** (Kelly-style: smaller/under-certain edge → smaller stake), independent
+of EV sign — that's the user's Tunisia rationale.
+
+**What it touches:** a `stake` column on `soccer_wc_picks` (+ override table), a
+`stake_for_stars(stars)` plan function (default the backtested shape), card output shows stake,
+and `roi_history` / grading weight units by stake. Small build.
+
+**Noted manual instances (no stake field yet — fold into realized-ROI accounting):**
+- 2026-06-25 Tunisia/Netherlands **Under 2.5 @ -102 staked 0.5u** (model record holds it flat 1u).
+
+---
+
+## FEATURE-004 — Dead-rubber / motivation flag (demote win-picks on clinched teams)
+
+- **Type:** feature candidate · **Status:** WATCH — strong qualitative case, n=1 result.
+  **Test window is NOW (final group matchday, ~Jun 25-27)** when dead rubbers cluster.
+
+**Why.** The model is structurally blind to **stakes/motivation**. It prices a clinched
+(already-advanced) team the same in a meaningless final group game as in a must-win, so it
+will confidently back an **unmotivated** side's win line. First live case (Jun 24): model
+picked **Canada +250** to win at Switzerland — but Canada had already advanced (nothing to
+play for) while **Switzerland still needed the result**. Switzerland won 2-1. The tagged
+`motivation` override (pivot to **Over 2**, same high-scoring model thesis but not dependent
+on the unmotivated team *winning*) cashed +0.85u while the model's Canada ML lost (+1.85u edge).
+
+**The signal (well-defined, generalizable).** In a final group game, if a team has clinched
+(or is eliminated) and its opponent still has something to play for, **demote/avoid that team's
+win line** — and (the override's insight) the goals market is often the better expression: a
+motivated side pressing an indifferent one tends to *raise* the total, not lower it.
+
+**What it would touch:** a per-match "stakes" input (clinched / eliminated / alive — needs a
+standings + scenario source, or a manual flag), and a `select_pick` rule that demotes a
+moneyline pick when the backed team is in a dead rubber vs a live opponent.
+
+**Why WATCH not BUILD.** n=1. BUT the **final group matchday is exactly when dead rubbers
+appear en masse**, so the `motivation` override category should accumulate fast over the next
+few days. If it keeps beating the model, that's the empirical case to build the flag. Until
+then, handle case-by-case via tagged `motivation` overrides (don't hand-fade silently —
+[[let-the-model-ride]] — log it so the pattern is measured).
+
+---
+
+## FEATURE-003 — Price every posted O/U total line, not just the stored one
+
+- **Type:** feature · **Status:** QUEUED — **build first** (ahead of FEATURE-002), target
+  2026-06-24/25. Confirmed with user 2026-06-23.
+
+**Why.** Books post a **ladder** of total lines per game (e.g. Portugal O/U 2.5 / 3.0 / 3.5 /
+4.0, all bettable at different prices). The card prices only the **single stored line**, so
+real EV on a different line is invisible. The model already computes the **full scoreline
+grid** → P(over/under) at *every* line for free (`totals_probs`); only the odds-feeding side
+is missing. Demonstrated 2026-06-23 on the Portugal game: the model's fair-odds ladder showed
+big edges sitting on lines we never priced.
+
+**What it touches:**
+- **schema** — a small `soccer_wc_total_lines` table (`match_id`, `sportsbook`, `line`,
+  `over_odds`, `under_odds`) holding the ladder; keeps 1X2 / primary odds clean and sidesteps
+  the "which odds row owns the moneyline" mess.
+- `import_wc_odds.py` (or a sibling) — load the ladder.
+- `generate_wc_card.py` — `best_pick_for_match` builds candidates from 1X2 **+ over/under at
+  every stored line**, then `select_pick` **once** across all of them. **Also kills the
+  latent duplicate-pick JOIN bug** in `fetch_matches` (multiple odds rows → duplicate picks)
+  by collapsing to one candidate set per match.
+- tests.
+
+**Effort:** moderate, ~a few hours. **Order:** (1) this, then (2) FEATURE-002 (to-advance),
+per user. Interim: ladders priced **manually** on request (give the book's O/U ladder, model
+returns best-EV line) until shipped.
+
+---
+
 ## KNOCKOUT-PRICING — confirm 90-minute markets at the knockout transition
 
 - **Type:** watch / reminder · **Status:** PENDING (fires ~2026-06-28, Round of 32)
@@ -27,8 +114,11 @@ card as if it were 90-min (it would mis-price the draw and the moneylines). This
 
 ## FEATURE-002 — "To advance" market for knockout ties
 
-- **Type:** feature · **Status:** PROPOSED — needed before knockouts (~2026-06-28) **if we
-  want to bet to-advance**; not blocking otherwise.
+- **Type:** feature · **Status:** IN PROGRESS — **promoted to build FIRST** (user wants
+  to-advance live for Round of 32, ~2026-06-28; multi-line O/U FEATURE-003 demoted to nice-to-have,
+  2026-06-25). **Requirements locked** → see [FEATURE-002_TO_ADVANCE.md](FEATURE-002_TO_ADVANCE.md).
+  Decisions: real ET/PK model with a proxy bench nudge, team+player-level ET/PK data capture,
+  manual results entry, reusable market-agnostic grader in `core/` for the social/ROI tracker.
 
 **Why.** Knockout ties resolve via extra time + penalties, so "which team advances" is its
 own 2-way market (the marquee knockout line) that the 90-min model can't price today.
