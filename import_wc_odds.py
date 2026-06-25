@@ -6,12 +6,18 @@ assistant) into one row per match.  Required header columns:
 
     date, home, away, home_ml, draw_ml, away_ml, total, over_odds, under_odds
 
+Optional columns (knockout ties only):
+
+    home_adv, away_adv
+
 - date           : match date (YYYY-MM-DD, optionally with time) — used to
                    disambiguate when a fixture is ambiguous; may be blank.
 - home, away     : national team names (matched to soccer_wc_teams.name).
 - *_ml           : 1X2 American moneylines.
 - total          : the over/under goals line the book posted (e.g. 2.5, 3.5).
 - over/under_odds : American odds for that total.
+- home/away_adv  : 2-way "to advance" American odds (knockout rounds; blank for
+                   group games or books that don't post the market).
 
 Odds are American by default.  Pass --decimal if the CSV holds decimal odds.
 
@@ -167,6 +173,8 @@ def main():
                     over_under=parse_odds(row.get("total"), as_decimal=False),
                     over_odds=parse_odds(row.get("over_odds"), args.decimal),
                     under_odds=parse_odds(row.get("under_odds"), args.decimal),
+                    home_advance_ml=parse_odds(row.get("home_adv"), args.decimal),
+                    away_advance_ml=parse_odds(row.get("away_adv"), args.decimal),
                 )
                 if exists:
                     updated += 1

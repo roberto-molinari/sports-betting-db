@@ -26,6 +26,7 @@ from core.sports_db import (
     set_wc_pick_result,
     set_wc_override_result,
 )
+from core.grading import grade_pick
 from import_wc_odds import load_team_map, load_match_index, resolve_team, find_match
 
 
@@ -42,44 +43,35 @@ def parse_args():
     return parser.parse_args()
 
 
-def grade_pick(side, home_score, away_score):
-    """Return 'win' / 'loss' / 'push' for a pick side given the final score."""
-    total = home_score + away_score
-    if side == "HOME":
-        return "win" if home_score > away_score else "loss"
-    if side == "AWAY":
-        return "win" if away_score > home_score else "loss"
-    if side == "DRAW":
-        return "win" if home_score == away_score else "loss"
-    if side.startswith("OVER ") or side.startswith("UNDER "):
-        label, line_text = side.split(" ", 1)
-        line = float(line_text)
-        if total == line:
-            return "push"
-        over = total > line
-        return "win" if (over == (label == "OVER")) else "loss"
-    raise ValueError(f"Unknown pick side: {side!r}")
+def _outcome(home_score, away_score, advanced=None):
+    """Outcome dict for grading. advanced is None for group games (no tie to advance)."""
+    return {"regulation_home": home_score, "regulation_away": away_score, "advanced": advanced}
 
 
-def grade_match_picks(conn, match_id, home_score, away_score):
-    """Grade every stored pick for a completed match. Returns count graded."""
+def grade_match_picks(conn, match_id, home_score, away_score, advanced=None):
+    """Grade every stored pick for a completed match. Returns count graded.
+
+    advanced ('HOME'/'AWAY'/None) settles knockout ADVANCE picks; group games pass None.
+    """
+    outcome = _outcome(home_score, away_score, advanced)
     cur = conn.cursor()
     cur.execute("SELECT pick_id, side FROM soccer_wc_picks WHERE match_id = ?", (match_id,))
     graded = 0
     for pick_id, side in cur.fetchall():
-        set_wc_pick_result(pick_id, grade_pick(side, home_score, away_score))
+        set_wc_pick_result(pick_id, grade_pick(side, outcome))
         graded += 1
     return graded
 
 
-def grade_match_overrides(conn, match_id, home_score, away_score):
+def grade_match_overrides(conn, match_id, home_score, away_score, advanced=None):
     """Grade every user override for a completed match on its user_side. Returns count."""
+    outcome = _outcome(home_score, away_score, advanced)
     cur = conn.cursor()
     cur.execute("SELECT override_id, user_side FROM soccer_wc_pick_overrides WHERE match_id = ?",
                 (match_id,))
     graded = 0
     for override_id, side in cur.fetchall():
-        set_wc_override_result(override_id, grade_pick(side, home_score, away_score))
+        set_wc_override_result(override_id, grade_pick(side, outcome))
         graded += 1
     return graded
 

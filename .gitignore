@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 *.backup*
 *.bak*
+.coverage
 .DS_Store
 notes.txt
 *.csv

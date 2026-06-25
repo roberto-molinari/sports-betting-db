@@ -195,3 +195,64 @@ def test_cap_demotes_overrated_underdog_end_to_end(db_path):
     assert pick["side"] != "AWAY"
     away = next(d for d in pick["demoted"] if d["side"] == "AWAY")
     assert any("cap" in r for r in away["excluded_by"])
+
+
+# ── to-advance market (FEATURE-002) ──────────────────────────────────────────
+
+def _seed_knockout(db_path, with_advance):
+    home = sdb.ensure_wc_team("Favoritia")
+    away = sdb.ensure_wc_team("Underdogia")
+    match_id = sdb.ensure_wc_match("2026-06-30 18:00:00", home, away, stage="R32")
+    adv = dict(home_advance_ml=-150, away_advance_ml=250) if with_advance else {}
+    sdb.upsert_wc_odds(
+        match_id=match_id, sportsbook="Test", odds_date="2026-06-29",
+        home_moneyline=-250, draw_moneyline=600, away_moneyline=2000,
+        over_under=2.5, over_odds=-110, under_odds=-110, **adv)
+    sdb.set_wc_team_strength(home, 2.0, 0.9)   # heavy favorite
+    sdb.set_wc_team_strength(away, 0.7, 1.6)
+    return match_id
+
+
+def _fetch_knockout(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    matches = gwc.fetch_matches(conn, "2026-06-30", "2026-06-30")
+    return conn, matches
+
+
+def test_advance_market_surfaces_when_odds_present(db_path):
+    """A heavy favorite priced at -150 to advance is the best +EV pick."""
+    _seed_knockout(db_path, with_advance=True)
+    conn, matches = _fetch_knockout(db_path)
+    pick = gwc.best_pick_for_match(matches[0], conn)
+    conn.close()
+    assert pick["side"] == "HOME ADVANCE"
+    assert pick["prob"] > 0.5
+
+
+def test_no_advance_candidate_without_advance_odds(db_path):
+    """Safety invariant: no advance odds -> no ADVANCE candidate considered at all."""
+    _seed_knockout(db_path, with_advance=False)
+    conn, matches = _fetch_knockout(db_path)
+    pick = gwc.best_pick_for_match(matches[0], conn)
+    conn.close()
+    assert "ADVANCE" not in pick["side"]
+    assert all("ADVANCE" not in d["side"] for d in pick.get("demoted", []))
+
+
+def test_display_pick_advance():
+    assert gwc.display_pick("HOME ADVANCE", "Brazil", "Chile") == "Brazil to advance"
+    assert gwc.display_pick("AWAY ADVANCE", "Brazil", "Chile") == "Chile to advance"
+
+
+def test_card_passes_bench_index_into_advance(db_path):
+    """The bench_indices arg flows through to advance_probs: a stronger home bench
+    raises the modeled P(home advances)."""
+    _seed_knockout(db_path, with_advance=True)
+    conn, matches = _fetch_knockout(db_path)
+    home_id = matches[0]["home_team_id"]
+    base = gwc.best_pick_for_match(matches[0], conn)
+    nudged = gwc.best_pick_for_match(matches[0], conn, bench_indices={home_id: 2.0})
+    conn.close()
+    assert base["side"] == "HOME ADVANCE" and nudged["side"] == "HOME ADVANCE"
+    assert nudged["prob"] > base["prob"]

@@ -519,6 +519,59 @@ def analyse_match_wc(lambda_home_attack: float, lambda_away_attack: float,
 
 
 # ---------------------------------------------------------------------------
+# Knockout "to advance" market — regulation -> extra time -> penalty shootout
+# ---------------------------------------------------------------------------
+
+EXTRA_TIME_LAMBDA_FRACTION = 1 / 3   # extra time is 30 of 90 minutes
+EXTRA_TIME_BENCH_WEIGHT = 0.10       # a stronger bench lifts extra-time scoring
+SHOOTOUT_BENCH_WEIGHT = 0.10         # bench depth tilts the shootout win probability
+SHOOTOUT_FAVORITE_WEIGHT = 0.05      # slight favorite edge from the 90' win-prob gap
+SHOOTOUT_PROB_BOUNDS = (0.40, 0.60)  # a shootout stays near coin-flip
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return low if value < low else high if value > high else value
+
+
+def advance_probs(lambda_home: float, lambda_away: float,
+                  bench_index_home: float = 0.0, bench_index_away: float = 0.0,
+                  max_goals: int = WC_MAX_GOALS) -> dict:
+    """
+    Probability each side advances a knockout tie: 90' regulation, else extra time,
+    else a penalty shootout.
+
+        P(home advances) = P(home wins 90')
+                         + P(draw 90') * [ P(home wins ET) + P(draw ET) * P(home wins SO) ]
+
+    lambda_home/lambda_away are the 90' match expected goals (the lambda_H/lambda_A that
+    analyse_match_wc derives). bench_index_* are field-centered bench-strength indices
+    (default 0.0 -> no bench nudge, the Step-3 behaviour); when supplied they raise that
+    team's extra-time scoring rate and tilt the shootout its way. Returns
+    {"p_home_advance", "p_away_advance"} summing to 1.
+    """
+    reg = outcome_probs(scoreline_grid(lambda_home, lambda_away, max_goals=max_goals))
+    p_home_90, p_draw_90, p_away_90 = reg["p_home"], reg["p_draw"], reg["p_away"]
+
+    # Extra time: 1/3 of a match, each team's rate nudged by its bench depth.
+    et_home_mult = 1 + EXTRA_TIME_BENCH_WEIGHT * bench_index_home
+    et_away_mult = 1 + EXTRA_TIME_BENCH_WEIGHT * bench_index_away
+    lambda_et_home = lambda_home * EXTRA_TIME_LAMBDA_FRACTION * et_home_mult
+    lambda_et_away = lambda_away * EXTRA_TIME_LAMBDA_FRACTION * et_away_mult
+    et = outcome_probs(scoreline_grid(lambda_et_home, lambda_et_away, max_goals=max_goals))
+    p_home_et, p_draw_et = et["p_home"], et["p_draw"]
+
+    # Penalty shootout: near coin-flip, tilted by bench depth and a slight favorite edge.
+    delta_bench = bench_index_home - bench_index_away
+    delta_strength = p_home_90 - p_away_90
+    p_home_shootout = _clamp(
+        0.5 + SHOOTOUT_BENCH_WEIGHT * delta_bench + SHOOTOUT_FAVORITE_WEIGHT * delta_strength,
+        *SHOOTOUT_PROB_BOUNDS)
+
+    p_home_advance = p_home_90 + p_draw_90 * (p_home_et + p_draw_et * p_home_shootout)
+    return {"p_home_advance": p_home_advance, "p_away_advance": 1 - p_home_advance}
+
+
+# ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
 

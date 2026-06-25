@@ -303,6 +303,41 @@ def raw_team_strength(players):
     return raw_attack, a_w, raw_defense, d_w
 
 
+BENCH_XI_SIZE = 11   # proxy starting XI: the 11 most-played squad members
+
+
+def bench_attack(players):
+    """Raw attack rate of a squad's bench — its members ranked BELOW the top-11 by club
+    minutes (a proxy XI). Reuses raw_team_strength's attack weighting, so it is on the same
+    scale as the team's attack. Returns None when the bench carries no real attack weight.
+    """
+    ranked = sorted(players, key=lambda p: p["minutes"] or 0, reverse=True)
+    bench = ranked[BENCH_XI_SIZE:]
+    raw_attack, a_w, _, _ = raw_team_strength(bench)
+    return raw_attack if a_w >= 1.0 else None
+
+
+def compute_bench_indices(conn=None):
+    """Return {team_id: bench_index} — each team's bench attack, field-centered, for use as
+    the extra-time / shootout nudge in advance_probs (stronger bench -> positive index, weaker
+    -> negative). Teams with no computable bench get a neutral 0.0. Mirrors the strength
+    pipeline's shrinkage so bench rates are comparable across teams.
+    """
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        teams = load_team_players(conn)
+        apply_shrinkage(teams)
+        raw = {tid: bench_attack(info["players"]) for tid, info in teams.items()}
+        present = [v for v in raw.values() if v is not None]
+        mean_bench = mean(present) if present else 0.0
+        return {tid: (v - mean_bench if v is not None else 0.0) for tid, v in raw.items()}
+    finally:
+        if own:
+            conn.close()
+
+
 def fifa_fallback(fifa_rank, field_ranks):
     """Derive (lambda_attack, lambda_defense) from a team's FIFA rank, scaled by
     its position WITHIN this field rather than the global FIFA pool.

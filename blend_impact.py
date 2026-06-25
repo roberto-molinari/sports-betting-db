@@ -23,7 +23,7 @@ from core.sports_db import DATABASE_PATH
 from core.poisson_model import (analyse_match_wc, american_to_implied_prob,
                                 american_to_decimal)
 from generate_wc_card import select_pick, HOST_NATIONS, HOST_HOME_ADVANTAGE, EASTERN_SQL_OFFSET
-from update_wc_results import grade_pick
+from core.grading import grade_pick
 
 # v7 (FIFA blend) was persisted 2026-06-19; earlier slates ran on v6, so the blend
 # could not have changed them. Counterfactuals before this date are meaningless.
@@ -78,7 +78,7 @@ def settle(side, odds, hs, as_):
     """Units won/lost on a 1u flat stake, or None if the match isn't graded."""
     if hs is None or as_ is None:
         return None
-    res = grade_pick(side, hs, as_)
+    res = grade_pick(side, {"regulation_home": hs, "regulation_away": as_, "advanced": None})
     return american_to_decimal(odds) - 1 if res == "win" else (-1.0 if res == "loss" else 0.0)
 
 

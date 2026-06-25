@@ -1,45 +1,17 @@
 """
 Unit tests for the pure logic in the World Cup scripts:
-  - update_wc_results.grade_pick (settlement of each market)
   - compute_wc_team_strength.normalize_position / fifa_fallback
+
+(Market settlement now lives in core.grading — see tests/test_grading.py.)
 """
 
 from statistics import mean, pstdev
 
 import pytest
 
-import update_wc_results as uwr
 import compute_wc_team_strength as cws
+import core.sports_db as sdb
 from core.poisson_model import WC_BASELINE
-
-
-# ── grade_pick ───────────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("side,home,away,expected", [
-    ("HOME", 2, 0, "win"),
-    ("HOME", 1, 1, "loss"),     # a draw loses the home moneyline
-    ("HOME", 0, 1, "loss"),
-    ("AWAY", 0, 2, "win"),
-    ("AWAY", 1, 1, "loss"),
-    ("DRAW", 1, 1, "win"),
-    ("DRAW", 2, 1, "loss"),
-    ("OVER 2.5", 2, 1, "win"),  # total 3 > 2.5
-    ("OVER 2.5", 1, 1, "loss"), # total 2 < 2.5
-    ("UNDER 3.5", 2, 0, "win"), # total 2 < 3.5
-    ("UNDER 3.5", 3, 1, "loss"),# total 4 > 3.5
-])
-def test_grade_pick(side, home, away, expected):
-    assert uwr.grade_pick(side, home, away) == expected
-
-
-def test_grade_pick_integer_line_push():
-    assert uwr.grade_pick("OVER 2", 1, 1) == "push"   # total exactly 2
-    assert uwr.grade_pick("UNDER 3", 2, 1) == "push"  # total exactly 3
-
-
-def test_grade_pick_unknown_side_raises():
-    with pytest.raises(ValueError):
-        uwr.grade_pick("PARLAY", 1, 0)
 
 
 # ── normalize_position ───────────────────────────────────────────────────────
@@ -109,6 +81,48 @@ def test_raw_team_strength_skips_unknown_position_and_missing_data():
     raw_attack, attack_w, _, _ = cws.raw_team_strength(players)
     assert attack_w == 0
     assert raw_attack is None
+
+
+# ── bench_attack (FEATURE-002 bench nudge) ───────────────────────────────────
+
+def test_bench_attack_uses_players_below_top_11():
+    """The 11 most-played are the proxy XI; the bench is everyone else."""
+    starters = [_player("FWD", 0.2, 1.2, minutes=3000) for _ in range(11)]
+    subs = [_player("FWD", 0.9, 1.2, minutes=500),
+            _player("MID", 0.7, 1.2, minutes=400)]
+    bench = cws.bench_attack(starters + subs)
+    full = cws.raw_team_strength(starters + subs)[0]
+    # The bench here (high-rate subs) out-scores the starter-heavy full squad.
+    assert bench is not None and bench > full
+
+
+def test_bench_attack_none_when_no_bench():
+    eleven = [_player("FWD", 0.5, 1.2) for _ in range(11)]   # exactly an XI, no bench
+    assert cws.bench_attack(eleven) is None
+
+
+def _seed_team_squad(team_name, bench_goals):
+    """11 modest starters (most minutes) + one low-minute bench forward whose scoring
+    sets the bench index."""
+    tid = sdb.ensure_wc_team(team_name)
+    for i in range(11):
+        pid = sdb.add_wc_player(tid, f"{team_name}_s{i}", position="MID",
+                                club="C", club_league="Premier League")
+        sdb.upsert_wc_player_stats(pid, season=2025, minutes_played=3000,
+                                   goals=10, club_ga_per90=1.2, source="t")
+    pid = sdb.add_wc_player(tid, f"{team_name}_bench", position="FWD",
+                            club="C", club_league="Premier League")
+    sdb.upsert_wc_player_stats(pid, season=2025, minutes_played=900,
+                               goals=bench_goals, club_ga_per90=1.2, source="t")
+    return tid
+
+
+def test_compute_bench_indices_centered_and_ordered(db_path, conn):
+    strong = _seed_team_squad("Deepland", bench_goals=30)    # prolific bench forward
+    weak = _seed_team_squad("Shallowland", bench_goals=2)    # weak bench forward
+    idx = cws.compute_bench_indices(conn)
+    assert idx[strong] > idx[weak]            # deeper bench -> higher index
+    assert abs(idx[strong] + idx[weak]) < 1e-9  # field-centered (mean 0)
 
 
 # ── attack league exponent (BUG-002) ─────────────────────────────────────────

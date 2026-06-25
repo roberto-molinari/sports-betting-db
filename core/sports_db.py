@@ -154,12 +154,21 @@ def init_database():
             grp          TEXT,
             home_team_id INTEGER NOT NULL,
             away_team_id INTEGER NOT NULL,
-            home_score   INTEGER,
+            home_score   INTEGER,                  -- 90' regulation score (also grades 1X2 + O/U)
             away_score   INTEGER,
             match_status TEXT,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- Knockout-path columns kept LAST so a freshly-created DB matches the column
+            -- order of a migrated one (ensure_wc_advance_schema adds these via ALTER ADD
+            -- COLUMN, which appends to the end).
+            extra_time_home_score INTEGER,         -- cumulative score at end of ET (NULL if no ET)
+            extra_time_away_score INTEGER,
+            shootout_home_score   INTEGER,         -- penalty shootout tally (NULL if no shootout)
+            shootout_away_score   INTEGER,
+            decided_by   TEXT,                     -- regulation|extra_time|shootout (NULL for group)
             FOREIGN KEY (home_team_id) REFERENCES soccer_wc_teams(team_id),
-            FOREIGN KEY (away_team_id) REFERENCES soccer_wc_teams(team_id)
+            FOREIGN KEY (away_team_id) REFERENCES soccer_wc_teams(team_id),
+            CHECK (decided_by IN ('regulation', 'extra_time', 'shootout') OR decided_by IS NULL)
         );
 
         CREATE TABLE IF NOT EXISTS soccer_wc_odds (
@@ -175,6 +184,9 @@ def init_database():
             under_odds     REAL,
             notes          TEXT,
             created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- Kept LAST to match the migrated column order (see soccer_wc_matches note).
+            home_advance_ml REAL,                  -- 2-way 'to advance' odds (knockouts; NULL otherwise)
+            away_advance_ml REAL,
             FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
         );
 
@@ -223,6 +235,35 @@ def init_database():
             FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
         );
 
+        -- Individual penalty-shootout kicks (player-level), for PK analytics. Tournament-
+        -- agnostic name (no `wc`) to seed future reuse; its match_id/team_id/player_id still
+        -- reference the soccer_wc_* tables in this DB for now (see REFACTOR-001).
+        CREATE TABLE IF NOT EXISTS soccer_penalty_kicks (
+            penalty_kick_id INTEGER PRIMARY KEY,
+            match_id    INTEGER NOT NULL,
+            team_id     INTEGER NOT NULL,
+            player_id   INTEGER,
+            player_name TEXT,
+            kick_order  INTEGER,
+            result      TEXT,                       -- 'goal' | 'miss' | 'saved'
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id),
+            FOREIGN KEY (team_id)  REFERENCES soccer_wc_teams(team_id),
+            CHECK (result IN ('goal', 'miss', 'saved') OR result IS NULL)
+        );
+
+        CREATE TABLE IF NOT EXISTS soccer_extra_time_goals (
+            extra_time_goal_id INTEGER PRIMARY KEY,
+            match_id    INTEGER NOT NULL,
+            team_id     INTEGER NOT NULL,
+            player_id   INTEGER,
+            player_name TEXT,
+            minute      INTEGER,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id),
+            FOREIGN KEY (team_id)  REFERENCES soccer_wc_teams(team_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_soccer_match_date    ON soccer_matches(match_date);
         CREATE INDEX IF NOT EXISTS idx_soccer_league        ON soccer_matches(league);
         CREATE INDEX IF NOT EXISTS idx_soccer_season        ON soccer_matches(season);
@@ -243,10 +284,13 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wc_strength_team   ON soccer_wc_team_strength(team_id);
         CREATE INDEX IF NOT EXISTS idx_wc_picks_match     ON soccer_wc_picks(match_id);
         CREATE INDEX IF NOT EXISTS idx_wc_overrides_match ON soccer_wc_pick_overrides(match_id);
+        CREATE INDEX IF NOT EXISTS idx_penalty_kicks_match    ON soccer_penalty_kicks(match_id);
+        CREATE INDEX IF NOT EXISTS idx_extra_time_goals_match ON soccer_extra_time_goals(match_id);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
     ensure_wc_team_strength_schema(conn)
+    ensure_wc_advance_schema(conn)
 
     conn.commit()
     conn.close()
@@ -264,6 +308,39 @@ def ensure_wc_team_strength_schema(conn=None):
         existing = {row[1] for row in cur.fetchall()}
         if "method" not in existing:
             cur.execute("ALTER TABLE soccer_wc_team_strength ADD COLUMN method TEXT")
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def ensure_wc_advance_schema(conn=None):
+    """Add to-advance / knockout-path columns to older databases (idempotent).
+
+    The two new event tables (soccer_penalty_kicks, soccer_extra_time_goals) are created by
+    the CREATE TABLE IF NOT EXISTS block in init_database, so only column adds are needed here.
+    """
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(soccer_wc_matches)")
+        match_cols = {row[1] for row in cur.fetchall()}
+        for col in ("extra_time_home_score", "extra_time_away_score",
+                    "shootout_home_score", "shootout_away_score"):
+            if col not in match_cols:
+                cur.execute(f"ALTER TABLE soccer_wc_matches ADD COLUMN {col} INTEGER")
+        if "decided_by" not in match_cols:
+            cur.execute("ALTER TABLE soccer_wc_matches ADD COLUMN decided_by TEXT "
+                        "CHECK (decided_by IN ('regulation', 'extra_time', 'shootout') "
+                        "OR decided_by IS NULL)")
+
+        cur.execute("PRAGMA table_info(soccer_wc_odds)")
+        odds_cols = {row[1] for row in cur.fetchall()}
+        for col in ("home_advance_ml", "away_advance_ml"):
+            if col not in odds_cols:
+                cur.execute(f"ALTER TABLE soccer_wc_odds ADD COLUMN {col} REAL")
         conn.commit()
     finally:
         if owns_connection:
@@ -599,8 +676,13 @@ def update_wc_match_result(match_id, home_score, away_score):
 
 def upsert_wc_odds(match_id, sportsbook, odds_date,
                    home_moneyline=None, draw_moneyline=None, away_moneyline=None,
-                   over_under=None, over_odds=None, under_odds=None, notes=None):
-    """Insert or update odds for a World Cup match + sportsbook; return odds_id."""
+                   over_under=None, over_odds=None, under_odds=None,
+                   home_advance_ml=None, away_advance_ml=None, notes=None):
+    """Insert or update odds for a World Cup match + sportsbook; return odds_id.
+
+    home_advance_ml/away_advance_ml carry the 2-way knockout 'to advance' market (NULL for
+    group games / books that don't post it); the rest is the 90' 1X2 + O/U as before.
+    """
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
@@ -614,21 +696,84 @@ def upsert_wc_odds(match_id, sportsbook, odds_date,
                 """UPDATE soccer_wc_odds
                    SET odds_date = ?, home_moneyline = ?, draw_moneyline = ?,
                        away_moneyline = ?, over_under = ?, over_odds = ?,
-                       under_odds = ?, notes = ?
+                       under_odds = ?, home_advance_ml = ?, away_advance_ml = ?, notes = ?
                    WHERE odds_id = ?""",
                 (odds_date, home_moneyline, draw_moneyline, away_moneyline,
-                 over_under, over_odds, under_odds, notes, existing[0])
+                 over_under, over_odds, under_odds, home_advance_ml, away_advance_ml,
+                 notes, existing[0])
             )
             conn.commit()
             return existing[0]
         cur.execute(
             """INSERT INTO soccer_wc_odds
                (match_id, sportsbook, odds_date, home_moneyline, draw_moneyline,
-                away_moneyline, over_under, over_odds, under_odds, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                away_moneyline, over_under, over_odds, under_odds,
+                home_advance_ml, away_advance_ml, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (match_id, sportsbook, odds_date, home_moneyline, draw_moneyline,
-             away_moneyline, over_under, over_odds, under_odds, notes)
+             away_moneyline, over_under, over_odds, under_odds,
+             home_advance_ml, away_advance_ml, notes)
         )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def set_wc_match_advance_result(match_id, regulation_home, regulation_away,
+                                extra_time_home=None, extra_time_away=None,
+                                shootout_home=None, shootout_away=None, decided_by=None):
+    """Record a knockout match's full path and mark it completed.
+
+    The 90' regulation score goes in home_score/away_score (so 1X2 + O/U grade unchanged);
+    extra-time / shootout tallies and decided_by capture the rest. Who advanced is DERIVED
+    from these fields (see core.grading.advancing_side), not stored.
+    """
+    if decided_by not in (None, "regulation", "extra_time", "shootout"):
+        raise ValueError(f"invalid decided_by: {decided_by!r}")
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.execute(
+            """UPDATE soccer_wc_matches
+               SET home_score = ?, away_score = ?,
+                   extra_time_home_score = ?, extra_time_away_score = ?,
+                   shootout_home_score = ?, shootout_away_score = ?,
+                   decided_by = ?, match_status = 'completed'
+               WHERE match_id = ?""",
+            (regulation_home, regulation_away, extra_time_home, extra_time_away,
+             shootout_home, shootout_away, decided_by, match_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_penalty_kick(match_id, team_id, kick_order=None, result=None,
+                     player_id=None, player_name=None):
+    """Record one penalty-shootout kick; return penalty_kick_id."""
+    if result not in (None, "goal", "miss", "saved"):
+        raise ValueError(f"invalid penalty result: {result!r}")
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.execute(
+            """INSERT INTO soccer_penalty_kicks
+               (match_id, team_id, player_id, player_name, kick_order, result)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (match_id, team_id, player_id, player_name, kick_order, result))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def add_extra_time_goal(match_id, team_id, minute=None, player_id=None, player_name=None):
+    """Record one extra-time goal; return extra_time_goal_id."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.execute(
+            """INSERT INTO soccer_extra_time_goals
+               (match_id, team_id, player_id, player_name, minute)
+               VALUES (?, ?, ?, ?, ?)""",
+            (match_id, team_id, player_id, player_name, minute))
         conn.commit()
         return cur.lastrowid
     finally:

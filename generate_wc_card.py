@@ -24,7 +24,11 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from core.sports_db import DATABASE_PATH, get_latest_wc_strength, replace_wc_pick
-from core.poisson_model import analyse_match_wc, ev_to_stars, american_to_implied_prob
+from core.poisson_model import (
+    analyse_match_wc, advance_probs, ev_to_stars,
+    american_to_implied_prob, compute_ev,
+)
+from compute_wc_team_strength import compute_bench_indices
 
 # match_date is stored in UTC, but the tournament is hosted in North America and
 # matchdays are reckoned in Eastern time (the US broadcast/posting frame), so a
@@ -90,7 +94,8 @@ def fetch_matches(conn, start, end):
                m.home_team_id, m.away_team_id,
                ht.name AS home, at.name AS away,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
-               o.over_under, o.over_odds, o.under_odds
+               o.over_under, o.over_odds, o.under_odds,
+               o.home_advance_ml, o.away_advance_ml
         FROM soccer_wc_matches m
         JOIN soccer_wc_teams ht ON ht.team_id = m.home_team_id
         JOIN soccer_wc_teams at ON at.team_id = m.away_team_id
@@ -110,6 +115,10 @@ def display_pick(side, home, away):
         return away
     if side == "DRAW":
         return "Draw"
+    if side == "HOME ADVANCE":
+        return f"{home} to advance"
+    if side == "AWAY ADVANCE":
+        return f"{away} to advance"
     return side.replace("OVER", "Over").replace("UNDER", "Under")
 
 
@@ -155,10 +164,12 @@ def select_pick(priced):
     return best
 
 
-def best_pick_for_match(match, conn):
+def best_pick_for_match(match, conn, bench_indices=None):
     """Return the highest-EV pick dict for a match row, or None.
 
     None means we can't price the match (missing team strength or no markets).
+    bench_indices ({team_id: field-centered bench index}) feeds the ET/shootout nudge
+    for advance markets; omitted/None leaves the nudge off (zero indices).
     """
     home_strength = get_latest_wc_strength(match["home_team_id"], conn=conn)
     away_strength = get_latest_wc_strength(match["away_team_id"], conn=conn)
@@ -195,6 +206,24 @@ def best_pick_for_match(match, conn):
         (f"OVER {line_label}",  match["over_odds"],  r.get("p_over"),  r.get("ev_over")),
         (f"UNDER {line_label}", match["under_odds"], r.get("p_under"), r.get("ev_under")),
     ]
+
+    # Knockout "to advance" market. The book having posted advance odds is the SOLE
+    # trigger: for group games / ties we haven't ingested, these are NULL and the card
+    # is byte-for-byte unchanged. advance_probs reuses the 90' lambdas analyse_match_wc
+    # derived; bench nudge stays off (Step 5) via the default zero indices.
+    home_adv_ml = match["home_advance_ml"]
+    away_adv_ml = match["away_advance_ml"]
+    if home_adv_ml is not None and away_adv_ml is not None:
+        bench = bench_indices or {}
+        adv = advance_probs(
+            r["lambda_H"], r["lambda_A"],
+            bench_index_home=bench.get(match["home_team_id"], 0.0),
+            bench_index_away=bench.get(match["away_team_id"], 0.0))
+        candidates.append(("HOME ADVANCE", home_adv_ml, adv["p_home_advance"],
+                           compute_ev(adv["p_home_advance"], home_adv_ml)))
+        candidates.append(("AWAY ADVANCE", away_adv_ml, adv["p_away_advance"],
+                           compute_ev(adv["p_away_advance"], away_adv_ml)))
+
     priced = [
         {"side": side, "odds": odds, "prob": prob, "ev": ev,
          "implied": american_to_implied_prob(odds)}
@@ -223,10 +252,15 @@ def main():
     conn.row_factory = sqlite3.Row
     matches = fetch_matches(conn, start, end)
 
+    # Bench indices are only needed (and only computed) when the window has a knockout
+    # match with advance odds — group-stage cards do zero extra work.
+    has_advance = any(m["home_advance_ml"] is not None for m in matches)
+    bench_indices = compute_bench_indices(conn) if has_advance else None
+
     picks = []
     skipped = []
     for match in matches:
-        pick = best_pick_for_match(match, conn)
+        pick = best_pick_for_match(match, conn, bench_indices)
         if pick is None:
             skipped.append(f"{match['home']} vs {match['away']}")
             continue

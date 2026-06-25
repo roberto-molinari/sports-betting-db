@@ -205,6 +205,86 @@ def test_wc_odds_upsert_updates_in_place(db_path, conn):
     assert cur.fetchone() == (-180, 3.0)
 
 
+def test_wc_advance_schema_present(db_path, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {row[0] for row in cur.fetchall()}
+    assert {"soccer_penalty_kicks", "soccer_extra_time_goals"} <= tables
+    cur.execute("PRAGMA table_info(soccer_wc_matches)")
+    match_cols = {row[1] for row in cur.fetchall()}
+    assert {"extra_time_home_score", "extra_time_away_score", "shootout_home_score",
+            "shootout_away_score", "decided_by"} <= match_cols
+    cur.execute("PRAGMA table_info(soccer_wc_odds)")
+    odds_cols = {row[1] for row in cur.fetchall()}
+    assert {"home_advance_ml", "away_advance_ml"} <= odds_cols
+
+
+def test_upsert_wc_odds_stores_advance_market(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Serbia")
+    match_id = sports_db.ensure_wc_match("2026-06-30T19:00:00", home, away, stage="R32")
+    sports_db.upsert_wc_odds(match_id, "Bovada", "2026-06-29",
+                             home_moneyline=-200, draw_moneyline=320, away_moneyline=600,
+                             over_under=2.5, over_odds=-110, under_odds=-110,
+                             home_advance_ml=-450, away_advance_ml=350)
+    cur = conn.cursor()
+    cur.execute("SELECT home_advance_ml, away_advance_ml FROM soccer_wc_odds WHERE match_id = ?",
+                (match_id,))
+    assert cur.fetchone() == (-450, 350)
+
+
+def test_set_wc_match_advance_result_round_trip(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Croatia")
+    match_id = sports_db.ensure_wc_match("2026-06-30T19:00:00", home, away, stage="R32")
+    # 1-1 after 90', 2-2 after ET, Croatia win the shootout 4-3.
+    sports_db.set_wc_match_advance_result(
+        match_id, regulation_home=1, regulation_away=1,
+        extra_time_home=2, extra_time_away=2,
+        shootout_home=3, shootout_away=4, decided_by="shootout")
+    cur = conn.cursor()
+    cur.execute("""SELECT home_score, away_score, extra_time_home_score, extra_time_away_score,
+                          shootout_home_score, shootout_away_score, decided_by, match_status
+                   FROM soccer_wc_matches WHERE match_id = ?""", (match_id,))
+    assert cur.fetchone() == (1, 1, 2, 2, 3, 4, "shootout", "completed")
+
+
+def test_set_wc_match_advance_result_rejects_bad_decided_by(db_path):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Croatia")
+    match_id = sports_db.ensure_wc_match("2026-06-30T19:00:00", home, away, stage="R32")
+    with pytest.raises(ValueError):
+        sports_db.set_wc_match_advance_result(match_id, 1, 1, decided_by="golden_goal")
+
+
+def test_penalty_kick_and_extra_time_goal_round_trip(db_path, conn):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Croatia")
+    match_id = sports_db.ensure_wc_match("2026-06-30T19:00:00", home, away, stage="R32")
+    pk1 = sports_db.add_penalty_kick(match_id, home, kick_order=1, result="goal",
+                                     player_name="Neymar")
+    pk2 = sports_db.add_penalty_kick(match_id, away, kick_order=1, result="saved",
+                                     player_name="Modric")
+    assert pk1 != pk2
+    etg = sports_db.add_extra_time_goal(match_id, home, minute=98, player_name="Vinicius Jr")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_penalty_kicks WHERE match_id = ?", (match_id,))
+    assert cur.fetchone()[0] == 2
+    cur.execute("SELECT result FROM soccer_penalty_kicks WHERE penalty_kick_id = ?", (pk2,))
+    assert cur.fetchone()[0] == "saved"
+    cur.execute("SELECT minute, player_name FROM soccer_extra_time_goals WHERE extra_time_goal_id = ?",
+                (etg,))
+    assert cur.fetchone() == (98, "Vinicius Jr")
+
+
+def test_add_penalty_kick_rejects_bad_result(db_path):
+    home = sports_db.ensure_wc_team("Brazil")
+    away = sports_db.ensure_wc_team("Croatia")
+    match_id = sports_db.ensure_wc_match("2026-06-30T19:00:00", home, away, stage="R32")
+    with pytest.raises(ValueError):
+        sports_db.add_penalty_kick(match_id, home, kick_order=1, result="hit_post")
+
+
 def test_wc_team_strength_keeps_versions_and_returns_latest(db_path, conn):
     team = sports_db.ensure_wc_team("Brazil")
     sports_db.set_wc_team_strength(team, 2.1, 0.8, notes="initial")

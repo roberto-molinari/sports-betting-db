@@ -114,3 +114,44 @@ def test_ev_to_stars_boundaries(ev, expected):
 def test_ev_to_stars_never_abstains():
     """Even a deeply negative EV best pick is still rated (1 star), not 0."""
     assert pm.ev_to_stars(-5.0) == 1
+
+
+# ── advance_probs (knockout to-advance) ──────────────────────────────────────
+
+def test_advance_probs_symmetric_is_coinflip():
+    r = pm.advance_probs(1.3, 1.3)
+    assert r["p_home_advance"] == pytest.approx(0.5, abs=1e-6)
+    assert r["p_away_advance"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_advance_probs_sum_to_one():
+    r = pm.advance_probs(1.8, 0.9)
+    assert r["p_home_advance"] + r["p_away_advance"] == pytest.approx(1.0)
+
+
+def test_advance_probs_stronger_side_more_likely():
+    r = pm.advance_probs(1.9, 0.8)
+    assert r["p_home_advance"] > 0.5
+    assert r["p_home_advance"] > r["p_away_advance"]
+
+
+def test_advance_prob_exceeds_90min_win_prob():
+    """Advancing = win in 90' PLUS win after a draw, so it must exceed the bare 90'
+    win probability and stay below 1."""
+    reg = pm.outcome_probs(pm.scoreline_grid(1.9, 0.8, max_goals=pm.WC_MAX_GOALS))
+    r = pm.advance_probs(1.9, 0.8)
+    assert reg["p_home"] < r["p_home_advance"] < 1.0
+
+
+def test_advance_probs_bench_nudge_lifts_home():
+    """The bench hook is wired (off by default): a stronger home bench raises P(advance)."""
+    base = pm.advance_probs(1.3, 1.3)["p_home_advance"]
+    nudged = pm.advance_probs(1.3, 1.3, bench_index_home=1.0, bench_index_away=0.0)["p_home_advance"]
+    assert nudged > base
+
+
+def test_advance_probs_default_has_no_bench_effect():
+    """Default call (no bench indices) must equal explicitly-zero bench indices."""
+    a = pm.advance_probs(1.6, 1.1)["p_home_advance"]
+    b = pm.advance_probs(1.6, 1.1, bench_index_home=0.0, bench_index_away=0.0)["p_home_advance"]
+    assert a == b
