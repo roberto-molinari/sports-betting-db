@@ -453,6 +453,54 @@ Team strength can be recomputed and re-persisted during the tournament (e.g. aft
 the group stage) — `soccer_wc_team_strength` keeps every version, and the card
 always uses the latest.
 
+### Team strength: club stats + FIFA blending (`compute_wc_team_strength.py`)
+
+Club-stat aggregation alone misses national-team pedigree (a cohesive side whose
+players don't pile up club goals, or a talent-rich squad over-rated relative to
+its actual FIFA standing), so every stats-based team's lambdas are lightly pulled
+toward a FIFA-rank-implied estimate:
+
+- **`FIFA_BLEND_WEIGHT` (0.2, global)** — `λ = (1-w)·stats + w·fifa_fallback(rank)`,
+  applied to attack AND defense the same way for every team not covered below.
+  Kept deliberately small: over-blending just re-predicts the market's own ranking
+  and kills the value edge that's the point of using club stats at all.
+- **`FIFA_OVERRIDES`** — a full pin (`w=1.0` on both lambdas) for specific teams
+  with a known, understood data failure (e.g. a star's output diluted across a
+  weak-league squad). Discards all club-stat signal for that team — a blunt tool,
+  used only when the aggregate is too contaminated to trust at all.
+- **`FIFA_BLEND_OVERRIDES`** — per-team, **per-component** weight overrides (e.g.
+  `{"Mexico": {"defense": 0.7}}`), for the common case where only ONE lambda is
+  mis-modeled. Results sometimes argue for pulling a team's defense hard toward
+  FIFA while leaving its attack at the global weight (or vice versa) — a full pin
+  would overcorrect the lambda that was already fine. Direction matters: whether
+  more FIFA weight makes a lambda stronger or weaker depends on whether that
+  team's FIFA-implied number sits above or below its stats-only number, which is
+  team-specific, not a fixed rule — check both before picking a weight.
+
+Run `python compute_wc_team_strength.py --print` after any weight change to
+inspect the full 48-team field before `--persist`ing a new version.
+
+### Selection guardrails (`generate_wc_card.py`)
+
+Longshot moneylines amplify small probability errors into large fake EV%, so a
+candidate must clear all of the following to be eligible (a failing candidate is
+demoted to the next-best eligible pick, logged in the card's `GUARDRAIL LOG`):
+
+- **`MIN_PICK_PROBABILITY` (0.25)** — floor on model probability, any market.
+- **`MAX_UNDERDOG_MARKET_DISAGREEMENT` (2.0×)** — an underdog can't be picked if
+  the model rates it at 2x+ the market's implied probability (only a dog can
+  trip this; a favorite can't be 2x its own high implied prob).
+- **`MAX_ADVANCE_ABSOLUTE_DISAGREEMENT` (0.07)** — an **absolute-points** cap for
+  the knockout "to advance" market specifically, where the ratio cap above can't
+  see the mirage: advance probabilities compress toward 0.5 (the draw→ET→penalty
+  path), so a dog's advance prob has a small *ratio* to the market even when the
+  *absolute* over-rating is large. Demotes an underdog ADVANCE candidate when
+  `model_prob − market_implied ≥ 0.07`.
+
+If nothing clears every gate, the card falls back to the single most-likely side
+(highest model probability, not highest EV — EV would just hand it back to the
+excluded longshot).
+
 ## Next Steps
 
 1. **Populate with real data**: Connect to APIs or import historical data

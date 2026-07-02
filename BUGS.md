@@ -9,6 +9,178 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-009 — Codify the two-step "best pick" selection (never pass) — **TOP OF BACKLOG**
+
+- **Type:** core selection redesign · **Status:** TOP PRIORITY — build next session the user has
+  time (user 2026-06-29: "it's not ok to say 'pass'… codify this rather than have it be a discussion
+  every time and me overriding"). Design **not yet locked** — user "doesn't agree with everything"
+  discussed; thresholds + step-2 rule still to be settled before coding.
+
+**Why.** The system's mandate is **one best pick per match, no abstention**. Today `select_pick`
+only ever optimizes **EV** (with a floor + cap), so on games where the model finds no honest value
+(e.g. contaminated knockouts like SA/Canada) it still posts a thin/mirage EV pick, and the *only*
+correction is a hand-override. That's a recurring manual tax and it isn't reproducible. "Pass" /
+"stake ~0" is **not** an acceptable answer — the model must always name a best pick.
+
+**The design (user's two-step spec, 2026-06-29).**
+- **Step 1 — value mode (trust the model).** Look at EV only and find a **good** pick = good payout
+  **with** a good + *realistic* probability. If found, take it and stop.
+- **Step 2 — prediction mode (only if step 1 finds nothing good).** Stop trusting the model; use the
+  **market-implied** probabilities to pick the most-probable outcome, taking the **best payout among
+  the genuinely-likely** ones. (Using *implied* prob is deliberate: step 1 fails precisely where the
+  model is unreliable, so the fallback defers to the market.)
+
+**Open design decisions (must settle with user before building — these determine whether it works).**
+1. **Step-1 "realistic probability" bar.** Must reject mirages (SA-advance, model 0.346) AND thin
+   contaminated value (SA/Canada Over 2, model 0.518) — a ~0.55 model-prob bar does both; ~0.40 lets
+   Over 2 through (and it lost). Grounded in calibration: model is reliable only in **p 0.45–0.70**.
+   Likely = a **higher** prob floor than today's 0.25 + tighter market-agreement than the 2× cap.
+2. **Step-2 probability-vs-payout balance.** Naive "best payout among probable" can land back on the
+   coin-flip loser (Over 2 −148 beats Canada-win −152 on payout). Needs a **high implied-prob bar
+   (~0.60)** so "best payout" is chosen only among genuine favorites → Canada-win (won), not Over 2.
+3. **Staking tie-in (natural, optional).** Step-1 picks = real **value bets** (staked); step-2 picks
+   = **predictions** (post them, ~0/min stake). Formalizes the user's "stake ~0" intuition without
+   abstaining. Ties to **FEATURE-005**.
+
+**Validation done (SA/Canada, the motivating case).** With sane bars (step-1 prob ~0.55, step-2
+implied ~0.60): step 1 rejects all (SA-advance mirage + thin Over 2) → step 2 → **Canada win 90'
+−152 → WON**. The algorithm produces a winning, credible pick where today's EV-only logic posted a
+loser. Naive bars do NOT work — hence the open decisions above.
+
+**What it touches.** `select_pick` in `generate_wc_card.py` (the two-step logic), reusing the
+existing `excluded_by`/guardrail-log machinery; possibly a `selection_mode` (value/prediction) tag on
+`soccer_wc_picks`; the FEATURE-005 stake field if the staking tie-in is adopted. **Before coding:
+backtest the bars on the 72-game group stage** (compute-only, like the blend test) — show, per bar
+setting, the value-vs-prediction split and resulting P&L + hit-rate — so thresholds are tuned on data.
+
+---
+
+## FEATURE-008 — External-source xG ingestion for comparison ONLY (separate table)
+
+- **Type:** feature / analysis · **Status:** BACKLOG (build after the results-based review).
+  Feasibility confirmed + key constraint set with user 2026-06-28.
+
+**Why.** Results are the primary eval; external xG is a **secondary diagnostic** for the
+over-skew / calibration review (separates "good pick, bad variance" from genuine mispricing).
+Feasibility confirmed live: **TheStatsAPI already carries it** — `comp_6107` "FIFA World Cup",
+`xg_available=True`, season `sn_118868`, 72 finished matches. Per-team-per-game xG = sum
+`matches/{id}/player-stats → shooting.expected_goals` by team. Cross-checked vs the user's source
+on Colombia/Portugal: API 1.64/0.91 vs user 1.70/0.93 — agrees. No new dependency (existing
+`core/thestatsapi.Client`, key configured). ESPN not needed.
+
+**HARD CONSTRAINT (user, 2026-06-28) — do NOT confuse our xG with external xG.** The project's
+purpose is our OWN analytics; **the model's own xG (`soccer_wc_player_stats.xg_per90` from the
+per-match pass) is the source of truth.** External-sourced xG must **never** be written to
+`soccer_wc_matches` or any core-workflow table. Store it in a **new, clearly-labeled table**
+(e.g. `soccer_wc_external_xg`: `match_id`, `source`, `home_xg`, `away_xg`, `fetched_at`) used
+**only** for post-hoc comparison/learning, so the two sources are never mixed.
+
+**Scope.** `import_wc_match_xg.py`: map our matches → comp_6107 matches (team names + date, like
+`import_wc_odds.py`), pull team xG, write the new comparison table. ~72 requests (~6 min). Then
+"model expected total vs external xG total" is a join, kept entirely out of the core tables.
+
+---
+
+## FEATURE-007 — Dynamic odds refresh + realized-line capture (close the staleness gap)
+
+- **Type:** feature · **Status:** BACKLOG. Requested by user 2026-06-26 as the actionable
+  sibling of **ROI-STALENESS** (the caveat) and overlaps **FEATURE-003** (ladder ingestion).
+
+**Why.** Odds are captured once (CSV import at generation/capture time) and then go stale. By
+bet time the line can move a **lot**, with no fast path to refresh the stored line near post/bet
+time or to record the actual fill — so the model record and realized ROI drift apart, sometimes
+by more than a little per bet. Live evidence (2026-06-26, all stored vs realized within hours):
+- **NZ/Belgium Over 2.5** — stored **−122 @ line 2.5**, realized **−290 @ line 2.75** (kept bet;
+  large *adverse* move).
+- **Egypt/Iran Over 2** — stored **−108**, realized **+112** (override #5; move *in our favor*,
+  EV +16.3% → +25.5%).
+  Opposite directions the same day — the per-bet swing is real and two-sided.
+
+**What it touches (options, pick at build time).**
+- A quick **odds-refresh path** — single-match or slate re-import run close to post time so the
+  stored line ≈ the line actually bet (shrinks the gap at the source).
+- **Realized/closing-line capture** per pick — the `closing_odds`/`actual_odds` column from
+  ROI-STALENESS → compute ROI both ways (model-line vs realized-line / CLV).
+- Optionally **re-price the card against fresh odds** right before posting.
+- Naturally pairs with FEATURE-003's ladder table (a fresh-odds path wants somewhere to put the
+  ladder anyway).
+
+**Note.** The override tracker already captures real `user_odds`, so scrutinized/overridden picks
+are honest today; this feature generalizes that to *all* picks and to a pre-post refresh.
+
+---
+
+## ROI-STALENESS — Stored odds go stale; reported ROI is an optimistic ceiling (CLV)
+
+- **Type:** measurement caveat / accounting · **Status:** ACKNOWLEDGED, no action today
+  (deliberate). Surfaced by user 2026-06-26. Related to **FEATURE-003** (line movement).
+
+**Why.** Odds are stored at card-generation/capture time, but the line moves before the bet
+is actually placed. Scoring the next day uses the **stored** odds, so a winning pick is
+credited at the price we captured, not the price a bettor realistically got. Example (2026-06-26):
+NZ/Belgium Over 2.5 is stored at −122, but the total moved to 3.75, so the real Over-2.5 price
+is far worse (~−250); a win would be scored at the inflated −122.
+
+**The correction to "it comes out in the wash."** It does **not** cleanly wash for a model with
+genuine edge. Lines tend to move **toward** the model's number (the value gets bet away; the
+closing line is sharper), so stored (earlier) odds are **systematically better** than realized
+odds → reported ROI is biased **upward**, modestly but consistently (this is closing-line value).
+Magnitude is usually small per game, occasionally large (big total moves like NZ/Belgium). So
+**treat the model's reported ROI as an optimistic ceiling, not the realized figure** — paradoxically
+the better the model, the larger the overstatement.
+
+**Decision today.** Leave odds as-is (consistent with the 2026-06-26 "don't update the last two
+group-stage days' odds" call) and carry the caveat. No code.
+
+**Cheap mitigations (future, if we want honest realized ROI).**
+- Capture odds as close to **post/bet time** as possible to shrink the gap (discipline, not code).
+- At grading, record the **actual closing/bet line** per pick — a `closing_odds`/`actual_odds`
+  column on `soccer_wc_picks` → compute ROI **both ways** (model-line vs realized-line, i.e. a
+  CLV column). The real fix; ongoing per-pick data entry.
+- Note: the **override tracker already stores real `user_odds`**, so picks you actually scrutinize
+  are already honest — the bias mainly affects picks taken **as-is** without re-checking the line.
+
+---
+
+## FEATURE-006 — Suppress moneyline picks that bet *against* a FIFA-override-pinned team
+
+- **Type:** feature / selection guardrail · **Status:** BACKLOG — **scoped & ready to build**
+  (2026-06-26). Related to **BUG-005** (the pins it keys off). Logged in lieu of building now.
+
+**Why.** A pinned team's λ is a **hand-set FIFA-rank anchor** (`method = 'fifa_ranking'`), the
+model's least-reliable input, and the pin tends to **under-correct** (the market rates the team
+*above* the rank pin — the very reason the raw stats looked broken). So a 1X2 pick that needs the
+pinned team to **underperform** (opponent ML, or draw) rests on the model's weakest leg. **Totals
+are robust** — they route through the goal *sum*, not the win-split, and the BUG-005 error
+(attack under-rated) pushes the total *up*, which *helps* an over. Same model, sturdier leg.
+
+**Live case (2026-06-26).** Egypt/Iran: model #1 = **Iran ML +260 (3★, +39.1%)**, resting entirely
+on Egypt's pinned rating; hand-overridden to the model's own #2, **Over 2 −108 (+16.3%)** — logged
+as override #5 [robustness]. This rule would surface that pick **through the model** instead of by
+hand, exactly as the v8 Egypt pin already self-demoted the NZ moneyline (see BUG-005).
+
+**Scope (checked against the code 2026-06-26 — relatively easy, ~40–60 lines + 1–2 tests, no
+schema change / no migration).**
+- **Detection** trivial: `method = 'fifa_ranking'` on the latest strength row (6 teams currently
+  pinned). Add `is_wc_strength_pinned(team_id, conn)` in `core/sports_db.py` (~6 lines; avoids
+  touching `get_latest_wc_strength`'s signature + its callers).
+- **Hook** in `best_pick_for_match`: compute `home_pinned`/`away_pinned` from the strengths it
+  already fetches (~3 lines).
+- **Rule** in `select_pick`: reuse the existing **BUG-003 exclusion machinery** (`excluded_by` /
+  reasons / demoted-log) to drop the **against-pin 1X2 candidates**; selection falls through to the
+  next eligible pick automatically (~10 lines). The guardrail log line comes free.
+- **Test**: seed a `method='fifa_ranking'` game with an ML dog as top EV + a +EV total; assert the
+  total is selected and the ML is logged excluded. Egypt/Iran is a ready-made fixture.
+
+**Design choice (recommended):** exclude only the picks that bet **against** the pinned team
+(opponent ML + draw); **keep totals and backing the pinned team itself** eligible. Surgical and
+matches the reasoning (the pin under-corrects → betting *against* it is the fragile bet; backing it
+is fine). Alternatives — blunt "exclude all 1X2 in pinned games" (over-suppresses) or an EV haircut
+(adds a tuning constant; needs ~58%+ to flip Egypt/Iran) — rejected for v1. Fully logged, so grading
+measures whether suppressed picks would've won (same as BUG-003).
+
+---
+
 ## REFACTOR-001 — Generalize schema for multi-tournament reuse (drop `wc_`)
 
 - **Type:** refactor / tech-debt · **Status:** BACKLOG — **post-deadline**, deliberate one-shot.
@@ -164,7 +336,11 @@ on 90-min 1X2 + totals — to-advance is additive value, not a prerequisite.
 
 ## w-VALIDATION — calibration snapshot at group-stage end (BUG-005)
 
-- **Type:** analysis task · **Status:** PENDING (run when group stage completes ~2026-06-27)
+- **Type:** analysis task · **Status:** ✅ DONE (run 2026-06-28, full 72-pick group stage).
+  **Result:** model well-calibrated in the meat (p 0.45–0.70 ≈ actual) but still over-rates dogs
+  (0.30–0.45 bucket predicts 38%, delivers 28%; model-rated dogs above market won at 27.8% =
+  market's 26.9%, not model's 36.7%). P&L contained (dogs +0.05u; blend +4.78u). Full discussion +
+  the re-prioritization decision under **BUG-005 → Update 2026-06-28**.
 
 **Why now-or-never.** The FIFA blend only does anything on strong-vs-weak FIFA-gap games,
 which concentrate in the **group stage** and dry up in the knockouts (the field clusters,
@@ -252,6 +428,23 @@ hinge on attack/defense *level* with skepticism.
   2026-06-21). Root metric issue (goals-not-xG) still open.
 - **Discovered:** 2026-06-14, reviewing the Jun 14 card (Côte d'Ivoire vs Ecuador;
   model gave CIV win +78% EV — a +255 market dog read as a ~50% favorite).
+
+**Update 2026-06-28 — group-stage calibration (w-VALIDATION) result + re-prioritization.**
+Across all 72 graded group-stage picks the model is well-calibrated in the meat (p 0.45–0.70 ≈
+actual) but **still over-rates dogs**: the 0.30–0.45 bucket predicts 38% / delivers 28%, and
+model-rated dogs above market won at **27.8% — the market's 26.9%, NOT the model's 36.7%**. So
+**w=0.2 did not fix the dog over-rating** (BUG-005 persists at the probability level). BUT the
+**P&L is contained**: those dogs went **+0.05u (break-even)** and the blend added **+4.78u**
+(`blend_impact.py`), vs the early-tournament −2.45u bleed — the floor/cap guardrails + blend
+neutralized the damage even though the bias remains. Big-underdog MLs (+150+) finished 4–13 /
+−1.00u; strip them and the model ran **+14.6% ROI** (vs +9.8% overall).
+**Re-prioritization decision: do NOT pull a deeper fix forward to now.** The over-rating is a
+strong-vs-weak-FIFA-gap effect that concentrates in the **group stage, which is now over**; the
+knockout field has clustered, so the blend goes quiet and the leak largely disappears. With the
+P&L already contained, a deeper dog-ML suppression (tighter BUG-003 cap / dog-specific blend /
+**FEATURE-006**) is the **top model improvement for the NEXT group-stage cycle**, not a today task
+— and re-tuning the engine right before a live knockout card adds risk for little remaining
+group-stage upside.
 
 **Symptom.** Teams whose squads are full of genuine club *scorers* but who are only
 mid-tier *internationally* get an inflated `lambda_attack`. CIV is the standout:
@@ -392,6 +585,39 @@ the **highest-model-probability** side (not highest EV — that would hand it ba
 the longshot). A `GUARDRAIL LOG` section prints every demotion. This is *mitigation*;
 the root over-rating of dogs is unchanged (BUG-005 / DESIGN-001).
 
+**Update 2026-06-29 — the 2× cap is structurally the WRONG guardrail for the to-advance market.**
+Two knockout days running, a dog **to-advance** mirage slipped the `MAX_UNDERDOG_MARKET_DISAGREEMENT
+= 2.0` cap that *would* have caught the same team's 90-min win pick:
+- **Paraguay to advance (Jun 29):** model 0.377 vs market 0.190 = **1.98×** (cleared) — yet the
+  *absolute* edge is **+18.7 pts**, LARGER than Paraguay's 90-min WIN (model 0.269 vs 0.121 =
+  **2.22×**, correctly capped, +14.8 pts). The card posted Paraguay-advance at **3★**.
+- **South Africa to advance (Jun 28):** model 0.346 vs market 0.278 = **1.24×** (cleared), lost.
+**Root cause:** advance probabilities compress toward 0.5 (the draw→ET→PK path inflates the dog),
+so the *ratio* shrinks while the *absolute* over-rating stays large — the multiplicative cap can't
+see it. **SHIPPED 2026-06-29 — `MAX_ADVANCE_ABSOLUTE_DISAGREEMENT = 0.07` in `generate_wc_card.py`.**
+An **absolute-points** guardrail on underdog ADVANCE candidates (market implied < 0.5): demote when
+`model_prob − market_implied ≥ 0.07`, reusing the existing BUG-003 `excluded_by` / demoted-log
+machinery (logged like the floor/cap). Threshold set to **0.07** (user chose the aggressive end) to
+catch both knockout mirages — Paraguay (+18.7 pts) and yesterday's SA (+6.8 pts) — on the principle
+that the club-stats inputs make mismatches look closer than they are, so a dog's *advance* number is
+inflated past any realistic edge. Verified live on the Jun 29 card: Paraguay-advance (model 0.375 vs
+market 0.190) demoted → Germany/Paraguay self-resolves to Under 2.5 (1★), no hand-override. Tests:
+`test_select_pick_advance_edge_*` (demotes over-rated dog, keeps small-gap dog, ignores favorite,
+advance-only). Only targets the **underdog** side (a favorite's model advance prob sits *below*
+market here, so it never trips). FEATURE-009's step-1 bar still supersedes this later as the general
+fix; this is the durable interim.
+
+**First live result (2026-06-29, n=1) — demoted a WINNER.** The suppressed Paraguay-to-advance
+(+425) *did* advance (1-1, won pens 4-3), so it would have returned +4.25u; the model instead
+recorded Under 2.5 (+1.15 win), scoreboard unhurt but upside forgone. Expected soundness-filter
+behaviour (trade occasional upside to not post unsupportable picks — cf. SA-advance Jun 28, posted
+and LOST). Tally so far: 1 suppressed winner (Paraguay) vs 1 posted loser (SA, pre-guardrail) — a
+wash at n=2; keep watching, do not retune. NOTE: suppressed advance picks are only in the card-gen
+log, not stored with a result, so this tally is **manual** — auto-grading demoted picks is a small
+follow-up if we want the guardrail's net effect measured automatically.
+
+---
+
 ## BUG-004 — Over-skew: model expects more total goals than the market (LEVEL bias)
 
 - **Severity:** medium · **Status:** OPEN — and possibly *not* a bug (2026-06-13)
@@ -496,6 +722,39 @@ reproduces, across the whole field, the ~1.65 endpoint the manual Canada data-fi
 reached. **Still OPEN:** the deeper issues — club-concede ≠ national defense, and
 wrong-keeper-by-minutes — are untouched, so the **keeper-quality override (option
 A)** remains the follow-up for the residual distortion.
+
+**Update 2026-06-28 — bucket scoped; FIFA anchor + global blend both tested and REJECTED.**
+The first live knockout (South Africa/Canada R32) surfaced BUG-001: Canada's λ_def **1.60**
+inflated South Africa to **0.346 to advance** (vs market 0.278). Findings:
+- **Bucket (who else is affected):** decent national teams whose players are in weaker leagues, so
+  club-concede over-states national leakiness — **Canada (1.60), Australia (1.44), Mexico (1.35),
+  USA (1.32 borderline)**. Genuinely weak teams (Ghana, Bosnia, Cape Verde) are *correctly* leaky
+  (FIFA agrees) — not in the bucket.
+- **FIFA anchor is insufficient.** Pinning Canada to FIFA #31 only yields def **1.39** (still
+  leaky); SA-advance drops 0.41→0.37, nowhere near market 0.278. Canada's FIFA rank is itself too
+  low to capture how good the market/reality rates it.
+- **Global split-weight blend tested & REJECTED.** A defense-heavy blend (w_attack 0.2, w_defense
+  0.5–0.6) *improves* goal-MAE — defense fit improves monotonically toward pure-FIFA, **confirming
+  the defense proxy is the broken part** — BUT **destroys betting P&L: −11.6u (w_d=0.5) / −12.1u
+  (w_d=0.6)** over the 72 graded group games (re-priced; baseline +6.44u → −5.15u). It flips
+  longshot-value *winners* (Ecuador +360, Türkiye +245, Saudi/Uruguay draw +340) to chalk. A
+  textbook **results-vs-fit divergence** — the better-fitting model loses money; do NOT ship on
+  goal-MAE.
+- **Conclusion:** the fix must be **TARGETED, not global** — per-team **keeper-quality tiers** (the
+  documented proper fix) or **manual value overrides** for the ~4 bucket teams — which repair the
+  broken defenses *without* globally shifting all defenses and killing the longshot value carrying
+  the P&L. Interim: handle **case-by-case** (pass / override per game), as done for SA/Canada
+  (passed the to-advance; took the push-protected Over instead).
+
+**Update 2026-06-30 — Mexico pinned to FIFA #17 (v10), results-driven.** Group form (3 clean
+sheets, incl. vs a decent South Korea) confirmed the club-concede-derived defense (blend 1.354,
+≈field-avg) was too leaky vs FIFA pedigree (1.133); user pinned Mexico to FIFA. Effect on
+Mexico/Ecuador R32: def 1.354→1.133 suppresses Ecuador 1.30→1.08, so Mexico-advance *rises*
+0.666→0.690 (the leaky-D bug had been masking, not inflating, Mexico's edge) and total eases
+3.31→2.95. **Known imperfection (documented in the override reason):** the full pin also drops the
+attack 1.69→1.57, which the group goals (6 in 3) do NOT support — a **defense-only / per-component
+blend** is the cleaner fix (FEATURE candidate; the global split-weight version was already rejected
+on P&L, so per-team is the targeted path). Revisit Mexico's pin when per-component weights exist.
 
 **Related / also worth a look:**
 - The `matches_played` denominator is unreliable from TheStatsAPI for some clubs

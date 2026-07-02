@@ -169,6 +169,41 @@ FIFA_OVERRIDES = {
     "Egypt": "goals/90 buries the squad's quality — Salah's Liverpool output is diluted across an Egyptian-league squad, leaving net attack 1.01 (below baseline) for a #32 side the market makes a clear favorite (e.g. ~60% vs New Zealand); pin to FIFA rank (BUG-005)",
     "Côte d'Ivoire": "BUG-005 poster child — talent-rich club scorers (Bundesliga/Ligue 1) inflate attack to ~Germany tier (1.59) for a #34 international side, so the model read CIV a coin-flip vs Germany (market a +445 dog); pin to FIFA rank",
     "Jordan": "weak-league inflation over-credits a #62 squad — attack 1.15 (near baseline) reads Jordan a ~30% live dog vs Algeria, whom the market makes a clear ~63% favorite (1.89x over market, just under the cap); pin to FIFA rank (BUG-005, same family as Uzbekistan)",
+    "Mexico": "BUG-001 — club-concede overstates national leakiness: 3 group clean sheets (incl. vs a decent South Korea) show a defense (FIFA 1.13) far stingier than the blend's 1.35. Pinned to FIFA #17 (2026-06-30). CAVEAT: the full pin also drops the attack 1.69->1.57, which the group goals (6 in 3) do NOT support — a defense-only / per-component blend would be cleaner; revisit when that capability is built.",
+}
+
+# Per-team, per-COMPONENT blend weight overrides (targeted BUG-001/BUG-005 fix).
+# A full FIFA_OVERRIDES pin forces w=1.0 on BOTH attack and defense together, but
+# results sometimes argue for moving only one lambda toward FIFA (e.g. a team's
+# defense is genuinely mis-modeled while its attack matches the club-stat number).
+# {team_name: {"attack": w, "defense": w}} — a component absent from the inner
+# dict falls back to the global FIFA_BLEND_WEIGHT. Only applies to stats-based
+# teams (has_attack and has_defense); FIFA_OVERRIDES and thin-coverage fallback
+# both take precedence and are untouched by this. Keep the reason for audit.
+FIFA_BLEND_OVERRIDES = {
+    "Algeria": {
+        "defense": 0.7,
+        # rationale (2026-07-02, bumped from 0.5): actual GA (7 in 3) far exceeds
+        # the w=0.2 blend's proxy (4.14), and the leak includes a concession to
+        # FIFA-pinned Jordan (weak team) — not just quality opponents, so it reads
+        # as genuine leakiness, not opponent-quality confound. More FIFA weight
+        # (#43, a weak-ish rank) moves defense the RIGHT direction (leakier).
+        # Attack is left at the global weight: Algeria's actual attack (5 in 3)
+        # exceeds the blend's proxy (4.07) too, so pulling attack further toward
+        # FIFA (which would lower it) moves the WRONG direction — only defense
+        # is bumped.
+    },
+    "Switzerland": {
+        "attack": 0.5,
+        # rationale (2026-07-02): actual goals (7 in 3) far exceed the w=0.2
+        # blend's proxy (4.95), the field's 2nd-worst attack under-projection.
+        # Some of this is a confound (2 of 3 opponents, Canada + Bosnia, are
+        # independently documented as genuinely leaky defenses), so it is not
+        # treated as fully genuine — a moderate w=0.5 (not a full pin) pulls
+        # attack toward FIFA's #18-implied number (1.541) without assuming the
+        # entire surge reflects true Swiss attacking quality. Defense left at the
+        # global weight: no comparable calibration problem there (gap +0.79).
+    },
 }
 
 
@@ -415,11 +450,15 @@ def compute_strengths(teams):
             # the field mean at baseline — it only redistributes strength).
             la_stats = normalize_attack(r["ra"])
             ld_stats = r["rd"] * defense_scale
-            w = FIFA_BLEND_WEIGHT
-            if w > 0:
+            overrides = FIFA_BLEND_OVERRIDES.get(info["name"], {})
+            w_att = overrides.get("attack", FIFA_BLEND_WEIGHT)
+            w_def = overrides.get("defense", FIFA_BLEND_WEIGHT)
+            if w_att > 0 or w_def > 0:
                 fa, fd = fifa_fallback(info["fifa"], field_ranks)
-                la, ld = (1 - w) * la_stats + w * fa, (1 - w) * ld_stats + w * fd
-                basis = f"stats+fifa{w:g}"
+                la = (1 - w_att) * la_stats + w_att * fa
+                ld = (1 - w_def) * ld_stats + w_def * fd
+                basis = (f"stats+fifa{w_att:g}" if w_att == w_def
+                         else f"stats+fifa(att={w_att:g},def={w_def:g})")
             else:
                 la, ld, basis = la_stats, ld_stats, "stats"
             out[tid] = {

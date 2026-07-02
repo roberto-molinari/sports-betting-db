@@ -218,6 +218,50 @@ def test_compute_strengths_override_pins_to_fifa(monkeypatch):
     assert out[2]["basis"].startswith("stats")  # same squad, not overridden -> stat-based
 
 
+# ── compute_strengths: per-team, per-component blend overrides (BUG-001) ──────
+
+def test_compute_strengths_per_component_override_applies_independent_weights(monkeypatch):
+    """A team in FIFA_BLEND_OVERRIDES with only a defense weight gets its defense
+    pulled harder toward FIFA than its attack, which stays at the global weight —
+    the two lambdas move independently, unlike a uniform FIFA_BLEND_WEIGHT."""
+    monkeypatch.setattr(cws, "FIFA_BLEND_WEIGHT", 0.2)
+    monkeypatch.setattr(cws, "FIFA_BLEND_OVERRIDES", {"Custom": {"defense": 0.6}})
+    teams = {
+        1: {"name": "Custom", "fifa": 40, "players": _covered_squad()},
+        2: {"name": "Baseline", "fifa": 40, "players": _covered_squad()},
+    }
+    out = cws.compute_strengths(teams)
+    # identical squad + identical FIFA rank: attack (both at w=0.2) matches...
+    assert out[1]["lambda_attack"] == pytest.approx(out[2]["lambda_attack"])
+    # ...but defense (w=0.6 vs w=0.2) is pulled further toward the FIFA fallback.
+    assert out[1]["lambda_defense"] != pytest.approx(out[2]["lambda_defense"])
+    assert out[1]["basis"] == "stats+fifa(att=0.2,def=0.6)"
+    assert out[2]["basis"] == "stats+fifa0.2"
+
+
+def test_compute_strengths_no_override_uses_global_weight_both_components(monkeypatch):
+    """A team absent from FIFA_BLEND_OVERRIDES is unaffected by the dict existing
+    at all — same result as the uniform-weight path (backward compatible)."""
+    monkeypatch.setattr(cws, "FIFA_BLEND_WEIGHT", 0.2)
+    monkeypatch.setattr(cws, "FIFA_BLEND_OVERRIDES", {"SomeOtherTeam": {"defense": 0.9}})
+    teams = {1: {"name": "Untouched", "fifa": 15, "players": _covered_squad()}}
+    out = cws.compute_strengths(teams)
+    assert out[1]["basis"] == "stats+fifa0.2"
+
+
+def test_compute_strengths_full_override_takes_precedence_over_blend_override(monkeypatch):
+    """A team in BOTH FIFA_OVERRIDES (full pin) and FIFA_BLEND_OVERRIDES still
+    takes the full pin — the pin is a stronger, more deliberate signal and must
+    win over a per-component nudge."""
+    monkeypatch.setattr(cws, "FIFA_OVERRIDES", {"Both": "test reason"})
+    monkeypatch.setattr(cws, "FIFA_BLEND_OVERRIDES", {"Both": {"defense": 0.9}})
+    teams = {1: {"name": "Both", "fifa": 12, "players": _covered_squad()}}
+    field = [12]
+    out = cws.compute_strengths(teams)
+    assert out[1]["basis"].startswith("fifa-override")
+    assert (out[1]["lambda_attack"], out[1]["lambda_defense"]) == cws.fifa_fallback(12, field)
+
+
 # ── apply_shrinkage: sample-size blend toward positional prior ────────────────
 
 def test_apply_shrinkage_pulls_thin_samples_not_full_seasons():

@@ -64,6 +64,16 @@ MIN_PICK_PROBABILITY = 0.25
 # 2.9x — cleared the floor at 0.353, but the disagreement is the model under-rating
 # the favorite, not edge). Set on principle ("twice the market's price"), not fit.
 MAX_UNDERDOG_MARKET_DISAGREEMENT = 2.0
+# advance-edge cap (BUG-003 update 2026-06-29) — the ratio cap above is the WRONG tool
+# for the "to advance" market. Advance probs compress toward 0.5 (the draw->ET->penalty
+# path drags every team toward a coin flip), so a dog's advance prob has a small RATIO to
+# the market even when the ABSOLUTE over-rating is huge — the mirage slips the 2x cap
+# (Paraguay 0.377 vs market 0.190 = 1.98x cleared, yet +18.7 pts; SA 0.346 vs 0.278 =
+# 1.24x cleared, +6.8 pts). The model's club-stats inputs make mismatches look closer than
+# they are, inflating the underdog's advance number past any realistic edge. So for an
+# underdog ADVANCE candidate we add an ABSOLUTE-points check: demote when model prob beats
+# market implied by >= this gap. 0.07 catches both knockout cases (Paraguay & SA).
+MAX_ADVANCE_ABSOLUTE_DISAGREEMENT = 0.07
 
 
 def parse_args():
@@ -146,6 +156,15 @@ def select_pick(priced):
             reasons.append(
                 f"cap (model {c['prob']:.3f} >= {MAX_UNDERDOG_MARKET_DISAGREEMENT:g}x "
                 f"market {c['implied']:.3f})")
+        # advance-edge: ABSOLUTE-points cap for the to-advance market, where the ratio cap
+        # above can't see the mirage (probs compress toward 0.5). Only an underdog ADVANCE
+        # candidate (market implied < 0.5) can trip it — a favorite's model advance prob is
+        # below the market here (the model under-rates favorites), so it never fires on them.
+        if ("ADVANCE" in c["side"] and c["implied"] and c["implied"] < 0.5
+                and c["prob"] - c["implied"] >= MAX_ADVANCE_ABSOLUTE_DISAGREEMENT):
+            reasons.append(
+                f"advance-edge (model {c['prob']:.3f} - market {c['implied']:.3f} "
+                f"= {c['prob'] - c['implied']:+.3f} >= +{MAX_ADVANCE_ABSOLUTE_DISAGREEMENT:g})")
         c["excluded_by"] = reasons
 
     eligible = [c for c in priced if not c["excluded_by"]]

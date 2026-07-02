@@ -197,6 +197,60 @@ def test_cap_demotes_overrated_underdog_end_to_end(db_path):
     assert any("cap" in r for r in away["excluded_by"])
 
 
+# ── advance-edge cap: absolute-points guardrail for the to-advance market ─────
+
+def test_select_pick_advance_edge_demotes_overrated_dog():
+    """An underdog to-advance pick the model rates well above market in ABSOLUTE
+    points is demoted even when the 2x RATIO cap misses it (advance probs compress
+    toward 0.5). Mirrors Paraguay: model 0.377 vs market 0.190 = 1.98x but +18.7 pts."""
+    cands = [
+        _cand("AWAY ADVANCE", prob=0.377, implied=0.190, ev=0.97),   # 1.98x < cap, +18.7 pts
+        _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "OVER 2.5"
+    dog = next(c for c in cands if c["side"] == "AWAY ADVANCE")
+    assert dog["excluded_by"] == [r for r in dog["excluded_by"] if "advance-edge" in r]
+    assert any("advance-edge" in r for r in dog["excluded_by"])
+    assert not any("cap (" in r for r in dog["excluded_by"])   # ratio cap did NOT fire
+    assert dog in best["demoted"]
+
+
+def test_select_pick_advance_edge_keeps_small_gap():
+    """An advance dog within the absolute gap is kept (a sound knockout value pick)."""
+    cands = [
+        _cand("AWAY ADVANCE", prob=0.32, implied=0.28, ev=0.14),   # +4 pts < 0.07
+        _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "AWAY ADVANCE"
+    assert cands[0]["excluded_by"] == []
+
+
+def test_select_pick_advance_edge_ignores_favorite():
+    """The advance-edge cap targets only the underdog side (market implied < 0.5);
+    a favorite to advance is never tripped by it."""
+    cands = [
+        _cand("HOME ADVANCE", prob=0.65, implied=0.55, ev=0.18),   # +10 pts but favorite
+        _cand("OVER 2.5", prob=0.40, implied=0.52, ev=-0.10),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "HOME ADVANCE"
+    assert not any("advance-edge" in r for r in cands[0]["excluded_by"])
+
+
+def test_select_pick_advance_edge_is_advance_only():
+    """A regular (non-advance) ML dog with the same absolute gap is NOT tripped by
+    the advance-edge cap — it applies only to the to-advance market."""
+    cands = [
+        _cand("AWAY", prob=0.40, implied=0.28, ev=0.44),   # +12 pts, but not an advance pick
+        _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "AWAY"
+    assert not any("advance-edge" in r for r in cands[0]["excluded_by"])
+
+
 # ── to-advance market (FEATURE-002) ──────────────────────────────────────────
 
 def _seed_knockout(db_path, with_advance):
