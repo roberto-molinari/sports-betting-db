@@ -204,16 +204,17 @@ def init_database():
         );
 
         CREATE TABLE IF NOT EXISTS soccer_wc_picks (
-            pick_id      INTEGER PRIMARY KEY,
-            match_id     INTEGER NOT NULL,
-            generated_at TIMESTAMP NOT NULL,
-            side         TEXT,
-            odds         REAL,
-            model_prob   REAL,
-            ev           REAL,
-            stars        INTEGER,
-            result       TEXT,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            pick_id        INTEGER PRIMARY KEY,
+            match_id       INTEGER NOT NULL,
+            generated_at   TIMESTAMP NOT NULL,
+            side           TEXT,
+            odds           REAL,
+            model_prob     REAL,
+            ev             REAL,
+            stars          INTEGER,
+            result         TEXT,
+            selection_mode TEXT,   -- FEATURE-009: 'value' | 'prediction' | 'fallback'
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
         );
 
@@ -291,6 +292,7 @@ def init_database():
     ensure_soccer_betting_odds_schema(conn)
     ensure_wc_team_strength_schema(conn)
     ensure_wc_advance_schema(conn)
+    ensure_wc_picks_schema(conn)
 
     conn.commit()
     conn.close()
@@ -341,6 +343,24 @@ def ensure_wc_advance_schema(conn=None):
         for col in ("home_advance_ml", "away_advance_ml"):
             if col not in odds_cols:
                 cur.execute(f"ALTER TABLE soccer_wc_odds ADD COLUMN {col} REAL")
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def ensure_wc_picks_schema(conn=None):
+    """Add the `selection_mode` column to soccer_wc_picks on older databases
+    (FEATURE-009: which of value/prediction/fallback mode chose the pick)."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(soccer_wc_picks)")
+        existing = {row[1] for row in cur.fetchall()}
+        if "selection_mode" not in existing:
+            cur.execute("ALTER TABLE soccer_wc_picks ADD COLUMN selection_mode TEXT")
         conn.commit()
     finally:
         if owns_connection:
@@ -828,16 +848,18 @@ def get_latest_wc_strength(team_id, conn=None):
 
 
 def add_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
-                result=None):
+                result=None, selection_mode=None):
     """Store a generated pick for later scoring; return pick_id."""
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
         cur.execute(
             """INSERT INTO soccer_wc_picks
-               (match_id, generated_at, side, odds, model_prob, ev, stars, result)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+               (match_id, generated_at, side, odds, model_prob, ev, stars, result,
+                selection_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, generated_at, side, odds, model_prob, ev, stars, result,
+             selection_mode)
         )
         conn.commit()
         return cur.lastrowid
@@ -846,7 +868,7 @@ def add_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
 
 
 def replace_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
-                    result=None):
+                    result=None, selection_mode=None):
     """Store a pick for a match, replacing any prior *ungraded* pick for that
     match so re-running the card supersedes (rather than stacks) picks. Already
     graded picks (result IS NOT NULL) are left intact — once a pick is settled
@@ -864,9 +886,11 @@ def replace_wc_pick(match_id, generated_at, side, odds, model_prob, ev, stars,
         )
         cur.execute(
             """INSERT INTO soccer_wc_picks
-               (match_id, generated_at, side, odds, model_prob, ev, stars, result)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (match_id, generated_at, side, odds, model_prob, ev, stars, result)
+               (match_id, generated_at, side, odds, model_prob, ev, stars, result,
+                selection_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, generated_at, side, odds, model_prob, ev, stars, result,
+             selection_mode)
         )
         conn.commit()
         return cur.lastrowid

@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 from core.sports_db import DATABASE_PATH, get_latest_wc_strength, replace_wc_pick
 from core.poisson_model import (
     analyse_match_wc, advance_probs, ev_to_stars,
-    american_to_implied_prob, compute_ev,
+    american_to_implied_prob, american_to_decimal, compute_ev,
 )
 from compute_wc_team_strength import compute_bench_indices
 
@@ -74,6 +74,30 @@ MAX_UNDERDOG_MARKET_DISAGREEMENT = 2.0
 # underdog ADVANCE candidate we add an ABSOLUTE-points check: demote when model prob beats
 # market implied by >= this gap. 0.07 catches both knockout cases (Paraguay & SA).
 MAX_ADVANCE_ABSOLUTE_DISAGREEMENT = 0.07
+
+# FEATURE-009 two-step selection (2026-07-03) — codifies "always name a best pick,
+# never pass" as an explicit two-mode decision instead of a one-off hand-override.
+# Both bars were backtested against all 85 graded picks to date (feature009_backtest.py)
+# before being set; a full b1 x b2 grid sweep plus a neighboring-cell stress test (units,
+# hit-rate, and a group-vs-knockout stage split) support these values. Kept as separate
+# constants (not folded into the existing BUG-003 guardrails) because they gate a
+# different decision — MODE selection (trust the model vs. trust the market), not
+# per-candidate exclusion — and are expected to move independently as more results land.
+#
+# Step 1 — VALUE MODE (trust the model): among candidates that clear the existing
+# guardrails AND have model probability >= this bar, take the highest-EV one IF that
+# EV is positive. This is today's "realistic probability" floor from BUGS.md's
+# FEATURE-009 design note — set well above MIN_PICK_PROBABILITY (0.25) because a model
+# probability merely clearing the noise floor isn't enough to trust the model's own EV
+# ranking; it must be in the range the model is actually well-calibrated.
+VALUE_MODE_MIN_PROBABILITY = 0.60
+# Step 2 — PREDICTION MODE (only if step 1 finds nothing): stop trusting the model's
+# EV ranking and defer to the market instead. Among ALL candidates (guardrails don't
+# apply here — we've already given up on the model for this match) with a market-
+# IMPLIED probability >= this bar, take the best payout. The bar keeps "best payout"
+# from landing back on a coin-flip loser (e.g. a -148 near-toss-up beating a genuine
+# -152 favorite on payout alone) by restricting the payout search to genuine favorites.
+PREDICTION_MODE_MIN_IMPLIED_PROBABILITY = 0.60
 
 
 def parse_args():
@@ -133,19 +157,33 @@ def display_pick(side, home, away):
 
 
 def select_pick(priced):
-    """Choose the pick from a list of priced candidates, applying the two BUG-003
-    guardrails. Pure (no DB) so it's directly testable.
+    """Choose the pick from a list of priced candidates via FEATURE-009's two-step,
+    never-pass selection. Pure (no DB) so it's directly testable.
 
     Each candidate dict needs ``side``, ``odds``, ``prob`` (model probability),
-    ``implied`` (market-implied probability), and ``ev``. The two guardrails are
-    evaluated INDEPENDENTLY on every candidate (no short-circuit) so each exclusion
-    records which check(s) fired:
+    ``implied`` (market-implied probability), and ``ev``.
+
+    Guardrails (BUG-003) are evaluated INDEPENDENTLY on every candidate (no
+    short-circuit) so each exclusion records which check(s) fired:
       - floor: model prob below ``MIN_PICK_PROBABILITY`` (any market).
       - cap:   model prob >= ``MAX_UNDERDOG_MARKET_DISAGREEMENT`` x implied prob
                (only underdogs can trip it; catches the model over-rating a dog).
-    A candidate must clear BOTH to be eligible. The chosen dict is returned with
-    ``excluded_by`` set on every candidate, ``demoted`` = the higher-EV candidates
-    that were excluded, and ``fallback`` = True if no candidate cleared both gates.
+      - advance-edge: absolute-points version of the cap, for the to-advance market.
+    A candidate must clear ALL THREE guardrails to be eligible for step 1.
+
+    Step 1 — VALUE MODE (trust the model). Among guardrail-clear candidates with
+    model prob >= ``VALUE_MODE_MIN_PROBABILITY``, take the highest-EV one IF that
+    EV is positive. If found, stop here.
+    Step 2 — PREDICTION MODE (only if step 1 finds nothing). Guardrails no longer
+    apply — we've stopped trusting the model's own ranking for this match. Among
+    ALL candidates with market-implied prob >= ``PREDICTION_MODE_MIN_IMPLIED_PROBABILITY``,
+    take the best payout (not EV).
+    Fallback — neither step qualifies: back the most likely side (highest model
+    prob among ALL candidates), same as today's existing safety net.
+
+    The chosen dict is returned with ``excluded_by`` set on every candidate,
+    ``demoted`` = the higher-EV guardrail-excluded candidates, ``mode`` =
+    "value" | "prediction" | "fallback", and ``fallback`` = True in the fallback case.
     """
     for c in priced:
         reasons = []
@@ -167,17 +205,31 @@ def select_pick(priced):
                 f"= {c['prob'] - c['implied']:+.3f} >= +{MAX_ADVANCE_ABSOLUTE_DISAGREEMENT:g})")
         c["excluded_by"] = reasons
 
-    eligible = [c for c in priced if not c["excluded_by"]]
-    if eligible:
-        best = max(eligible, key=lambda c: c["ev"])
+    guardrail_clear = [c for c in priced if not c["excluded_by"]]
+    value_candidates = [c for c in guardrail_clear
+                        if c["prob"] >= VALUE_MODE_MIN_PROBABILITY and c["ev"] > 0]
+
+    if value_candidates:
+        best = max(value_candidates, key=lambda c: c["ev"])
+        best["mode"] = "value"
     else:
-        # No abstention: nothing cleared both gates, so back the MOST LIKELY
-        # outcome (highest model prob), not the highest EV — picking by EV would
-        # hand it straight back to the longshot we just excluded.
-        best = max(priced, key=lambda c: c["prob"])
-        best["fallback"] = True
-    # For the log: higher-EV candidates that were excluded (what we would have
-    # picked without the guardrails, and why we didn't).
+        prediction_candidates = [
+            c for c in priced
+            if c["implied"] and c["implied"] >= PREDICTION_MODE_MIN_IMPLIED_PROBABILITY
+        ]
+        if prediction_candidates:
+            best = max(prediction_candidates, key=lambda c: american_to_decimal(c["odds"]))
+            best["mode"] = "prediction"
+        else:
+            # No abstention: nothing cleared either mode, so back the MOST LIKELY
+            # outcome (highest model prob), not the highest EV — picking by EV would
+            # hand it straight back to a longshot mirage.
+            best = max(priced, key=lambda c: c["prob"])
+            best["mode"] = "fallback"
+            best["fallback"] = True
+
+    # For the log: higher-EV candidates that were excluded by a guardrail (what we
+    # would have picked without them, and why we didn't).
     best["demoted"] = [c for c in priced
                        if c["excluded_by"] and c["ev"] > best["ev"]]
     return best
@@ -293,7 +345,7 @@ def main():
             replace_wc_pick(
                 match_id=p["match_id"], generated_at=generated_at,
                 side=p["side"], odds=p["odds"], model_prob=p["prob"],
-                ev=p["ev"], stars=p["stars"],
+                ev=p["ev"], stars=p["stars"], selection_mode=p["mode"],
             )
     conn.close()
 
@@ -310,20 +362,25 @@ def main():
         imp = american_to_implied_prob(p["odds"])
         print(f"{i:>2}. {p['home']} vs {p['away']} | {p['side']:<9} "
               f"| odds {p['odds']:+.0f} | imp p {imp:.3f} | model p {p['prob']:.3f} "
-              f"| EV {p['ev']:+.1%} | {'⭐' * p['stars']}")
+              f"| EV {p['ev']:+.1%} | {'⭐' * p['stars']} | mode {p['mode']}")
     print("")
 
-    demoted_any = [p for p in picks if p.get("demoted") or p.get("fallback")]
-    if demoted_any:
-        print("=== GUARDRAIL LOG (BUG-003) ===")
-        for p in demoted_any:
+    notable = [p for p in picks if p.get("demoted") or p["mode"] != "value"]
+    if notable:
+        print("=== GUARDRAIL LOG (BUG-003 / FEATURE-009) ===")
+        for p in notable:
             for d in p["demoted"]:
                 print(f"  {p['home']} vs {p['away']}: {d['side']} "
                       f"(EV {d['ev']:+.1%}) EXCLUDED by {' & '.join(d['excluded_by'])} "
-                      f"-> selected {p['side']}")
+                      f"-> selected {p['side']} ({p['mode']} mode)")
+            if p["mode"] == "prediction":
+                print(f"  {p['home']} vs {p['away']}: no value-mode candidate qualified "
+                      f"-> deferred to the market, selected {p['side']} "
+                      f"(implied {p['implied']:.3f})")
             if p.get("fallback"):
-                print(f"  {p['home']} vs {p['away']}: no candidate cleared both gates "
-                      f"-> fell back to most-likely side {p['side']} (model {p['prob']:.3f})")
+                print(f"  {p['home']} vs {p['away']}: no candidate cleared value or "
+                      f"prediction mode -> fell back to most-likely side {p['side']} "
+                      f"(model {p['prob']:.3f})")
         print("")
 
     print("=== SOCIAL POST ===")

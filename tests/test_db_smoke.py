@@ -309,6 +309,21 @@ def test_wc_pick_add_and_grade(db_path, conn):
     assert cur.fetchone() == ("UNDER 3.5", 3, "win")
 
 
+def test_wc_pick_stores_selection_mode(db_path, conn):
+    """FEATURE-009: which mode (value/prediction/fallback) chose a pick is persisted
+    for later per-mode reporting."""
+    home = sports_db.ensure_wc_team("Portugal")
+    away = sports_db.ensure_wc_team("Ghana")
+    match_id = sports_db.ensure_wc_match("2026-06-11T19:00:00", home, away)
+    pick_id = sports_db.add_wc_pick(match_id, "2026-06-10T12:00:00", "HOME",
+                                    odds=-150, model_prob=0.65, ev=0.12, stars=2,
+                                    selection_mode="value")
+    cur = conn.cursor()
+    cur.execute("SELECT selection_mode FROM soccer_wc_picks WHERE pick_id = ?",
+                (pick_id,))
+    assert cur.fetchone() == ("value",)
+
+
 def test_replace_wc_pick_supersedes_ungraded(db_path, conn):
     home = sports_db.ensure_wc_team("France")
     away = sports_db.ensure_wc_team("Spain")

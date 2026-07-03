@@ -35,6 +35,11 @@ def test_guardrail_demotes_sub_floor_longshot(db_path, monkeypatch):
     assert len(matches) == 1
     match = matches[0]
 
+    # Isolate the BUG-003 floor/cap from FEATURE-009's mode-selection bars (tested
+    # separately) by disabling value/prediction mode so the fallback-vs-value split
+    # collapses back to the pre-FEATURE-009 "eligible -> highest EV" behavior.
+    monkeypatch.setattr(gwc, "VALUE_MODE_MIN_PROBABILITY", 0.0)
+    monkeypatch.setattr(gwc, "PREDICTION_MODE_MIN_IMPLIED_PROBABILITY", 1.1)
     # With the floor disabled, the +2000 longshot wins on EV despite a tiny prob.
     monkeypatch.setattr(gwc, "MIN_PICK_PROBABILITY", 0.0)
     raw = gwc.best_pick_for_match(match, conn)
@@ -66,6 +71,8 @@ def test_guardrail_demotes_sub_floor_draw(db_path, monkeypatch):
     conn.row_factory = sqlite3.Row
     match = gwc.fetch_matches(conn, "2026-06-21", "2026-06-21")[0]
 
+    monkeypatch.setattr(gwc, "VALUE_MODE_MIN_PROBABILITY", 0.0)
+    monkeypatch.setattr(gwc, "PREDICTION_MODE_MIN_IMPLIED_PROBABILITY", 1.1)
     monkeypatch.setattr(gwc, "MIN_PICK_PROBABILITY", 0.0)
     raw = gwc.best_pick_for_match(match, conn)
     assert raw["side"] == "DRAW"
@@ -83,6 +90,8 @@ def test_guardrail_leaves_solid_picks_alone(db_path, monkeypatch):
     _seed_longshot_game(db_path)
     conn, matches = _fetch_match(db_path)
     match = matches[0]
+    monkeypatch.setattr(gwc, "VALUE_MODE_MIN_PROBABILITY", 0.0)
+    monkeypatch.setattr(gwc, "PREDICTION_MODE_MIN_IMPLIED_PROBABILITY", 1.1)
     monkeypatch.setattr(gwc, "MIN_PICK_PROBABILITY", 0.01)
     pick = gwc.best_pick_for_match(match, conn)
     assert pick["side"] == "AWAY"
@@ -118,9 +127,20 @@ def _cand(side, prob, implied, ev, odds=100):
     return {"side": side, "prob": prob, "implied": implied, "ev": ev, "odds": odds}
 
 
-def test_select_pick_cap_demotes_overrated_underdog():
+def _disable_mode_bars(monkeypatch):
+    """These BUG-003 guardrail tests predate FEATURE-009's value/prediction mode
+    bars and are scoped to guardrail behavior specifically; disable the mode bars
+    so they isolate to the pre-FEATURE-009 "guardrail-clear -> highest EV, else
+    fall back to most-likely" behavior regardless of where VALUE_MODE_MIN_PROBABILITY /
+    PREDICTION_MODE_MIN_IMPLIED_PROBABILITY happen to be tuned."""
+    monkeypatch.setattr(gwc, "VALUE_MODE_MIN_PROBABILITY", 0.0)
+    monkeypatch.setattr(gwc, "PREDICTION_MODE_MIN_IMPLIED_PROBABILITY", 1.1)
+
+
+def test_select_pick_cap_demotes_overrated_underdog(monkeypatch):
     """A dog the model rates >= 2x the market's implied prob is demoted by the cap
     (it clears the floor, so only the cap fires)."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY", prob=0.40, implied=0.15, ev=1.50),      # 2.67x — over-rated dog
         _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
@@ -133,9 +153,10 @@ def test_select_pick_cap_demotes_overrated_underdog():
     assert away in best["demoted"]
 
 
-def test_select_pick_cap_leaves_reasonable_underdog_alone():
+def test_select_pick_cap_leaves_reasonable_underdog_alone(monkeypatch):
     """A dog the model rates only modestly above the market (< 2x) is kept — a
     sound underdog value pick, not the noise-amplification trap."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY", prob=0.40, implied=0.28, ev=0.44),      # 1.43x — below the cap
         _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
@@ -145,8 +166,9 @@ def test_select_pick_cap_leaves_reasonable_underdog_alone():
     assert cands[0]["excluded_by"] == []
 
 
-def test_select_pick_records_floor_and_cap_independently():
+def test_select_pick_records_floor_and_cap_independently(monkeypatch):
     """A candidate that trips BOTH gates records both reasons (no short-circuit)."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY", prob=0.22, implied=0.10, ev=1.20),      # <0.25 floor AND >=2x cap
         _cand("HOME", prob=0.60, implied=0.55, ev=0.05),
@@ -159,9 +181,10 @@ def test_select_pick_records_floor_and_cap_independently():
     assert best["side"] == "HOME"
 
 
-def test_select_pick_fallback_is_most_probable_side():
+def test_select_pick_fallback_is_most_probable_side(monkeypatch):
     """When nothing clears both gates, fall back to the most LIKELY side (highest
     model prob), not the highest EV."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY", prob=0.20, implied=0.08, ev=1.50),      # excluded (floor + cap)
         _cand("DRAW", prob=0.24, implied=0.21, ev=0.10),      # excluded (floor only)
@@ -199,10 +222,11 @@ def test_cap_demotes_overrated_underdog_end_to_end(db_path):
 
 # ── advance-edge cap: absolute-points guardrail for the to-advance market ─────
 
-def test_select_pick_advance_edge_demotes_overrated_dog():
+def test_select_pick_advance_edge_demotes_overrated_dog(monkeypatch):
     """An underdog to-advance pick the model rates well above market in ABSOLUTE
     points is demoted even when the 2x RATIO cap misses it (advance probs compress
     toward 0.5). Mirrors Paraguay: model 0.377 vs market 0.190 = 1.98x but +18.7 pts."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY ADVANCE", prob=0.377, implied=0.190, ev=0.97),   # 1.98x < cap, +18.7 pts
         _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
@@ -216,8 +240,9 @@ def test_select_pick_advance_edge_demotes_overrated_dog():
     assert dog in best["demoted"]
 
 
-def test_select_pick_advance_edge_keeps_small_gap():
+def test_select_pick_advance_edge_keeps_small_gap(monkeypatch):
     """An advance dog within the absolute gap is kept (a sound knockout value pick)."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY ADVANCE", prob=0.32, implied=0.28, ev=0.14),   # +4 pts < 0.07
         _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
@@ -227,9 +252,10 @@ def test_select_pick_advance_edge_keeps_small_gap():
     assert cands[0]["excluded_by"] == []
 
 
-def test_select_pick_advance_edge_ignores_favorite():
+def test_select_pick_advance_edge_ignores_favorite(monkeypatch):
     """The advance-edge cap targets only the underdog side (market implied < 0.5);
     a favorite to advance is never tripped by it."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("HOME ADVANCE", prob=0.65, implied=0.55, ev=0.18),   # +10 pts but favorite
         _cand("OVER 2.5", prob=0.40, implied=0.52, ev=-0.10),
@@ -239,9 +265,10 @@ def test_select_pick_advance_edge_ignores_favorite():
     assert not any("advance-edge" in r for r in cands[0]["excluded_by"])
 
 
-def test_select_pick_advance_edge_is_advance_only():
+def test_select_pick_advance_edge_is_advance_only(monkeypatch):
     """A regular (non-advance) ML dog with the same absolute gap is NOT tripped by
     the advance-edge cap — it applies only to the to-advance market."""
+    _disable_mode_bars(monkeypatch)
     cands = [
         _cand("AWAY", prob=0.40, implied=0.28, ev=0.44),   # +12 pts, but not an advance pick
         _cand("OVER 2.5", prob=0.55, implied=0.52, ev=0.06),
@@ -249,6 +276,75 @@ def test_select_pick_advance_edge_is_advance_only():
     best = gwc.select_pick(cands)
     assert best["side"] == "AWAY"
     assert not any("advance-edge" in r for r in cands[0]["excluded_by"])
+
+
+# ── FEATURE-009: two-step selection (value / prediction / fallback modes) ────
+
+def test_select_pick_value_mode_wins_when_bar_cleared():
+    """A guardrail-clear candidate with model prob >= VALUE_MODE_MIN_PROBABILITY
+    and positive EV is chosen by highest EV in value mode, even over a candidate
+    with higher EV that doesn't clear the probability bar."""
+    cands = [
+        _cand("HOME", prob=0.62, implied=0.50, ev=0.20),
+        _cand("OVER 2.5", prob=0.58, implied=0.52, ev=0.30),   # higher EV, below the value bar
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "HOME"
+    assert best["mode"] == "value"
+
+
+def test_select_pick_value_mode_requires_positive_ev():
+    """A candidate that clears the probability bar but has non-positive EV does
+    NOT qualify for value mode -- it falls through to prediction mode instead."""
+    cands = [
+        _cand("HOME", prob=0.65, implied=0.70, ev=-0.05),   # high-prob favorite, priced short
+        _cand("AWAY", prob=0.30, implied=0.25, ev=0.10),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["mode"] == "prediction"
+    assert best["side"] == "HOME"
+
+
+def test_select_pick_prediction_mode_takes_best_payout_not_ev():
+    """When step 1 finds nothing, prediction mode picks the best PAYOUT among
+    genuinely-likely (implied >= PREDICTION_MODE_MIN_IMPLIED_PROBABILITY)
+    candidates -- not the highest EV."""
+    cands = [
+        _cand("HOME", prob=0.50, implied=0.65, ev=0.05, odds=-160),          # better EV, worse payout
+        _cand("AWAY ADVANCE", prob=0.45, implied=0.62, ev=-0.02, odds=110),  # worse EV, better payout
+    ]
+    best = gwc.select_pick(cands)
+    assert best["mode"] == "prediction"
+    assert best["side"] == "AWAY ADVANCE"
+
+
+def test_select_pick_prediction_mode_ignores_guardrail_exclusion():
+    """Prediction mode considers ALL candidates, including ones a BUG-003 guardrail
+    excluded from value mode -- we've already stopped trusting the model's own
+    ranking once step 1 fails."""
+    cands = [
+        _cand("HOME", prob=0.20, implied=0.65, ev=-0.30),   # below the 0.25 floor
+        _cand("AWAY", prob=0.30, implied=0.25, ev=0.05),
+    ]
+    best = gwc.select_pick(cands)
+    home = next(c for c in cands if c["side"] == "HOME")
+    assert home["excluded_by"] != []          # guardrail-excluded
+    assert best["side"] == "HOME"             # still chosen, via prediction mode
+    assert best["mode"] == "prediction"
+
+
+def test_select_pick_fallback_when_neither_mode_qualifies():
+    """Neither value mode (no prob >= bar) nor prediction mode (no implied >= bar)
+    qualifies -- fall back to the most likely side, same as the pre-FEATURE-009
+    safety net."""
+    cands = [
+        _cand("HOME", prob=0.45, implied=0.40, ev=0.10),
+        _cand("AWAY", prob=0.35, implied=0.30, ev=0.05),
+    ]
+    best = gwc.select_pick(cands)
+    assert best["mode"] == "fallback"
+    assert best.get("fallback") is True
+    assert best["side"] == "HOME"    # 0.45 > 0.35
 
 
 # ── to-advance market (FEATURE-002) ──────────────────────────────────────────

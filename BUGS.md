@@ -9,12 +9,41 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
-## FEATURE-009 — Codify the two-step "best pick" selection (never pass) — **TOP OF BACKLOG**
+## FEATURE-009 — Codify the two-step "best pick" selection (never pass) — **SHIPPED 2026-07-03**
 
-- **Type:** core selection redesign · **Status:** TOP PRIORITY — build next session the user has
-  time (user 2026-06-29: "it's not ok to say 'pass'… codify this rather than have it be a discussion
-  every time and me overriding"). Design **not yet locked** — user "doesn't agree with everything"
-  discussed; thresholds + step-2 rule still to be settled before coding.
+- **Type:** core selection redesign · **Status:** IMPLEMENTED (user 2026-06-29: "it's not ok to say
+  'pass'… codify this rather than have it be a discussion every time and me overriding").
+
+**Implemented (2026-07-03).** `select_pick` in `generate_wc_card.py` now runs the two-step decision
+below instead of pure EV-with-guardrails. Bars are named, tunable module constants (not the ad hoc
+"B1"/"B2" used during backtesting):
+- `VALUE_MODE_MIN_PROBABILITY = 0.60` — step-1 "realistic probability" bar (item 1 below).
+- `PREDICTION_MODE_MIN_IMPLIED_PROBABILITY = 0.60` — step-2 implied-prob bar (item 2 below).
+
+**Backtest that set the bars (`feature009_backtest.py`, not the 72-game group-stage-only scope
+originally planned — extended to all 85 graded picks to date, group + R32).** Full `b1 x b2` grid
+sweep vs. the actual historical system (EV-only, no two-step: 40-40-5, +6.03u on these 85 games):
+- Best cell: **B1=0.60, B2=0.60 → +14.10u**, 70.7% hit rate (58-24-3), all three modes independently
+  profitable (value n=26 +8.05u, prediction n=37 +3.56u, fallback n=22 +2.48u).
+- Stage split (light stress test before locking): Group (72 games) +11.24u/69.6% hit; R32 (13 games)
+  +2.86u/76.9% hit — edge holds in both, not a group-stage-only artifact.
+- Robustness (3x3 neighboring cells): all profitable (range +3.65u to +14.10u), but 0.60/0.60 is a
+  clear local peak rather than a flat plateau — neighbors cluster ~8-12u. Read as "somewhere in
+  0.55-0.60 for both bars" being the durable signal; the exact peak may be somewhat sample-specific
+  at n=85. Revisit once more knockout results land.
+
+**Open design decisions — resolved.**
+1. Step-1 bar: **0.60** (backtested; see above).
+2. Step-2 bar: **0.60** (backtested; see above).
+3. Staking tie-in (FEATURE-005): **NOT adopted** — user decision 2026-07-03: same stake size
+   regardless of mode. Every mode is still just "the best pick we can name," not a partial bet.
+
+**Tracking added.** `soccer_wc_picks.selection_mode` (TEXT: `value` | `prediction` | `fallback`) —
+migration `ensure_wc_picks_schema` in `core/sports_db.py`, populated by `generate_wc_card.py`, so
+per-mode performance can be reviewed as more results land (the backtest's per-mode breakdown above
+was the first pass; this makes it an ongoing, queryable signal instead of a one-off computation).
+
+**Design retained from the original spec below**, now shipped as described.
 
 **Why.** The system's mandate is **one best pick per match, no abstention**. Today `select_pick`
 only ever optimizes **EV** (with a floor + cap), so on games where the model finds no honest value
@@ -30,7 +59,7 @@ correction is a hand-override. That's a recurring manual tax and it isn't reprod
   the genuinely-likely** ones. (Using *implied* prob is deliberate: step 1 fails precisely where the
   model is unreliable, so the fallback defers to the market.)
 
-**Open design decisions (must settle with user before building — these determine whether it works).**
+**Original open design decisions (historical — resolved above with 0.60/0.60).**
 1. **Step-1 "realistic probability" bar.** Must reject mirages (SA-advance, model 0.346) AND thin
    contaminated value (SA/Canada Over 2, model 0.518) — a ~0.55 model-prob bar does both; ~0.40 lets
    Over 2 through (and it lost). Grounded in calibration: model is reliable only in **p 0.45–0.70**.
@@ -648,6 +677,33 @@ follow-up if we want the guardrail's net effect measured automatically.
   Verde — the elite-attack-vs-leaky-defense corner we'd have widened *for* — went
   0-0. **Decision: leave `ATTACK_LAMBDA_SD` at 0.41.** Any future totals fix
   targets the LEVEL, pending results to confirm the over-skew is error vs edge.
+
+**Update 2026-07-03 — REOPENED. Direct model-vs-actual check (not EV-vs-market) shows the
+over-skew has resurfaced sharply in the KNOCKOUT stage, with a much cleaner signal than the
+group stage ever had.** Prompted by the Jul 3 Colombia/Ghana card: their calibration gaps
+looked like a Colombia/Ghana-specific problem at first (`proxy_goals_calibration.py` /
+`proxy_defense_calibration.py`, both teams badly over-projected on attack AND defense), but a
+compounding-error check showed the SAME pattern in all 6 of Colombia's/Ghana's group games
+(wins and the one loss alike) — meaning it isn't specific to these two teams. That prompted a
+new tool, `totals_calibration.py` (projected total λ_H+λ_A vs actual regulation total, by
+stage):
+```
+  Group    72 matches · mean signed gap -0.21 · mean |gap| 1.51 · over 34 / under 29 / flat 9
+  R32      13 matches · mean signed gap +0.43 · mean |gap| 0.68 · over 7 / under 1 / flat 5
+```
+Group stage (using fully-revised current lambdas) is noisy and roughly balanced. **R32 is
+different in kind, not just degree**: tighter errors (|gap| less than half the group stage's)
+with a decisive lean — **7 over-projected vs. 1 under-projected**. That's a systematic level
+shift, not scatter. Consistent with the knockout field being a stronger, more defensively
+organized set of teams than the model's shared baseline currently assumes.
+**Still only 13 games — real but not final evidence, same discipline as every other change
+today.** Candidate lever (per the original 2026-06-13 note, still valid): **lower
+`WC_BASELINE`** — in the current normalization, decreasing baseline shifts every team's attack
+lambda down additively (the defense/baseline ratio in `analyse_match_wc` is invariant to
+baseline, since defense values are constructed as `raw · baseline/mean_raw`), so this is a
+clean, single-parameter lever for the LEVEL, not a per-team patch. **Not applied yet** — this
+is a reopened watch item pending more knockout results, the same way the original bug waited
+for group-stage results before either fixing or dismissing it.
 
 ## BUG-002 — Weak-league forwards inflate attack lambda
 
