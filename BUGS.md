@@ -9,6 +9,93 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-010 — Per-match "close calls" candidate breakdown — **SHIPPED 2026-07-06**
+
+- **Type:** diagnostic / visibility · **Status:** SHIPPED 2026-07-06. Requested by user
+  after noticing two straight days of conservative (prediction/fallback mode) knockout
+  picks, wanting fast visibility into what else was close without changing any pick.
+
+**What it does.** `generate_wc_card.py` now prints a `CANDIDATE BREAKDOWN` section per
+match: the top 3 candidates for EACH of FEATURE-009's three modes (value/prediction/
+fallback), ranked by that mode's own rule (EV / payout / model prob respectively) —
+purely informational, never affects the actual selected pick. A BUG-003-guardrail-
+excluded candidate is still shown in the value list, tagged `near_miss`, if it missed
+clearing the guardrail by `CLOSE_CALL_TOLERANCE` (0.02 / 200bps) or less — e.g. a cap
+ratio of 2.01x instead of 2.0x. Candidates that miss by more stay excluded from the
+diagnostic too.
+
+**Implementation.** `guardrail_excess(c)` (worst/largest excess across any guardrails
+tripped — a candidate must clear ALL of them, so the hardest one to fix determines how
+close it really is) and `mode_breakdown(priced, top_n=3)` in `generate_wc_card.py`, both
+pure functions reusing `select_pick`'s `excluded_by` annotations. 8 new tests in
+`tests/test_generate_wc_card.py` covering the excess calculation, near-miss tagging,
+far-miss exclusion, per-mode ranking, and the top-N cap.
+
+**Update 2026-07-06 — added a `TOP EV` list (raw EV, no filter at all).** Requested the
+same day: the VALUE list is still filtered to prob>=0.60 & EV>0, so a high-EV candidate
+sitting just below that bar (or guardrail-excluded) never appeared anywhere marked as
+"actually the best EV on paper." `top_ev` in `mode_breakdown` sorts ALL candidates by raw
+EV with zero filtering, and `why_not_value(c)` annotates each with a plain-English reason
+it isn't a value pick — a BUG-003 guardrail reason if one fired, else "below the value
+bar" or "EV not positive." This is the direct answer to "why isn't the model finding value
+here?" — e.g. 2026-07-06's Portugal/Spain card: top EV was Portugal-to-advance at +25.7%,
+annotated `advance-edge` (the model over-rating a knockout-mismatch dog, per BUG-003's
+2026-06-29 update) — confirming the demotion was principled, not the model missing an
+obvious pick. 5 new tests.
+
+---
+
+## BUG-006 — Host venue-advantage boost applied without checking the match is actually domestic — **FIXED 2026-07-04**
+
+- **Severity:** medium (affects only host-nation knockout matches, but flips the selected
+  market/side when it fires) · **Status:** FIXED 2026-07-04.
+
+**Symptom.** `HOST_HOME_ADVANTAGE` (1.20x attack multiplier) was applied to any match where
+a host nation (USA/Mexico/Canada) appeared, purely by team identity — with no check on
+whether that specific match is actually played in that team's own country. This is true by
+tournament design for the GROUP STAGE (each host's group games are guaranteed domestic), but
+knockout-round stadium assignment is independent of host status, and a host can end up
+playing a knockout match in one of the other co-host countries.
+
+**Caught live 2026-07-04** reviewing the newly generated Canada v Morocco R16 card: Canada
+was still getting the boost despite this match being played in the USA. Quantified: with the
+(wrong) boost, Canada's attack λ = 1.55 → Over 2.5 priced at model 63.7%/+41.4% EV, selected
+via value mode. Without it, λ = 1.29 → model 58.2%/+29.2% EV — under the 60% value-mode bar
+entirely, changing the selected pick from OVER 2.5 to AWAY ADVANCE (Morocco).
+
+**Retroactive finding.** Checking history surfaced the same defect had already fired: Canada's
+R32 match (vs South Africa, 2026-06-28) was confirmed (user) to have been played in Los
+Angeles, USA — not Canada — so the ORIGINAL stored pick for that match (pick_id 87, HOME
+ADVANCE/South Africa, lost) was computed with an erroneous boost on Canada's lambda. Left as
+locked history (already graded); noted here for calibration awareness, not corrected
+retroactively.
+
+**Fix.** New single source of truth, `core/wc_host_advantage.py`, replacing two duplicate
+constant definitions (`generate_wc_card.py`, `generate_scoreline_heatmap.py`) and nine
+call sites across the codebase that each reimplemented the same
+`HOST_HOME_ADVANTAGE if team in HOST_NATIONS else 1.0` ternary. Two tiers, since a host's
+domestic run has to be tracked by hand (no venue/stadium column exists on
+`soccer_wc_matches` to derive this automatically):
+- `HOST_NATIONS` — currently-active hosts, boosted regardless of stage (as of 2026-07-04:
+  `{"USA", "Mexico"}`).
+- `GROUP_STAGE_HOST_NATIONS` — retired hosts, boosted only for the stage(s) confirmed
+  domestic (as of 2026-07-04: `{"Canada"}`, Group stage only — their R32 game was NOT
+  domestic per the finding above, so Group-only is the correct scope, not an oversight).
+- `host_advantage(team_name, stage)` — the one function every consumer now calls.
+
+**Planned next move (not yet executed, per user 2026-07-04):** once Mexico's confirmed-domestic
+run ends (they have Group + R32 + R16 matches in Mexico, including their R16 match vs England
+on 2026-07-05), retire Mexico from `HOST_NATIONS` into a new stage-scoped set covering all
+three of those stages (name TBD at that time — flagged so we don't repeat the Round-of-32-vs-
+Round-of-16 naming slip almost made here).
+
+**Files touched.** New: `core/wc_host_advantage.py`, `tests/test_wc_host_advantage.py`.
+Updated to source from it: `generate_wc_card.py`, `generate_scoreline_heatmap.py`,
+`card_ladder_compare.py`, `price_ladders.py`, `blend_impact.py`, `feature009_backtest.py`,
+`proxy_goals_calibration.py`, `proxy_defense_calibration.py`, `totals_calibration.py`.
+
+---
+
 ## FEATURE-009 — Codify the two-step "best pick" selection (never pass) — **SHIPPED 2026-07-03**
 
 - **Type:** core selection redesign · **Status:** IMPLEMENTED (user 2026-06-29: "it's not ok to say
@@ -86,8 +173,21 @@ setting, the value-vs-prediction split and resulting P&L + hit-rate — so thres
 
 ## FEATURE-008 — External-source xG ingestion for comparison ONLY (separate table)
 
-- **Type:** feature / analysis · **Status:** BACKLOG (build after the results-based review).
-  Feasibility confirmed + key constraint set with user 2026-06-28.
+- **Type:** feature / analysis · **Status:** BUILT 2026-07-06, scoped to survivors — not yet
+  run live against the API (needs a `--dry-run --team <one team>` smoke test first, same
+  convention as this repo's other TheStatsAPI import scripts). Feasibility confirmed + key
+  constraint set with user 2026-06-28.
+
+**Update 2026-07-06 — built, scoped to survivors by default.** `import_wc_match_xg.py` +
+`soccer_wc_external_xg` table + `upsert_wc_external_xg` shipped. Default `--scope survivors`
+only pulls matches involving a team that has reached R16 or later (currently: Brazil, Canada,
+England, France, Mexico, Morocco, Norway, Paraguay — 32 of 90 finished matches) — the live-DB-
+derived set of teams whose games can still inform a future pick, not a hardcoded list. Pass
+`--scope all` for the full tournament (identical code path, just skips the survivor filter) —
+that's the intended mode for the post-tournament postmortem this was requested for. Tests cover
+all the pure logic (name matching, date tie-breaking, xG aggregation, scope filtering);
+the live API call path is untested by design, matching this repo's convention for
+TheStatsAPI-calling scripts (validate with a small `--dry-run` pull, not a mock).
 
 **Why.** Results are the primary eval; external xG is a **secondary diagnostic** for the
 over-skew / calibration review (separates "good pick, bad variance" from genuine mispricing).
@@ -173,8 +273,14 @@ group-stage days' odds" call) and carry the caveat. No code.
 
 ## FEATURE-006 — Suppress moneyline picks that bet *against* a FIFA-override-pinned team
 
-- **Type:** feature / selection guardrail · **Status:** BACKLOG — **scoped & ready to build**
-  (2026-06-26). Related to **BUG-005** (the pins it keys off). Logged in lieu of building now.
+- **Type:** feature / selection guardrail · **Status:** BACKLOG — **LOWERED PRIORITY 2026-07-06**.
+  Scope/design still stands (below) if ever revisited, but of the 7 fully FIFA-pinned teams
+  (`method='fifa_ranking'`) only 3 remain alive at R16 (Mexico, Belgium, Egypt) — too few
+  remaining games to justify building this now. Also note the feature as scoped only catches
+  a **full** pin, not a per-component blend override (e.g. Algeria/Switzerland,
+  `method='player_aggregation'`), so the applicable set is narrower than "any FIFA-adjusted
+  team." Revisit at the start of a future tournament instead. Related to **BUG-005** (the
+  pins it keys off).
 
 **Why.** A pinned team's λ is a **hand-set FIFA-rank anchor** (`method = 'fifa_ranking'`), the
 model's least-reliable input, and the pin tends to **under-correct** (the market rates the team
@@ -261,8 +367,12 @@ and `roi_history` / grading weight units by stake. Small build.
 
 ## FEATURE-004 — Dead-rubber / motivation flag (demote win-picks on clinched teams)
 
-- **Type:** feature candidate · **Status:** WATCH — strong qualitative case, n=1 result.
-  **Test window is NOW (final group matchday, ~Jun 25-27)** when dead rubbers cluster.
+- **Type:** feature candidate · **Status:** CLOSED 2026-07-06 — test window (group stage) is
+  over; no more dead rubbers can occur (every knockout match is win-or-go-home by definition).
+  Final tally: 2 tagged `motivation` overrides, **2-0** (both won). A real, consistent pattern,
+  but too small a sample and now structurally out of runway to justify building the flag this
+  tournament. Revisit at the start of a future tournament's final group matchday if the
+  pattern is worth testing again from scratch.
 
 **Why.** The model is structurally blind to **stakes/motivation**. It prices a clinched
 (already-advanced) team the same in a meaningless final group game as in a must-win, so it
@@ -320,7 +430,9 @@ returns best-EV line) until shipped.
 
 ## KNOCKOUT-PRICING — confirm 90-minute markets at the knockout transition
 
-- **Type:** watch / reminder · **Status:** PENDING (fires ~2026-06-28, Round of 32)
+- **Type:** watch / reminder · **Status:** CLOSED 2026-07-06 — trigger fired and passed clean.
+  Every R32/R16 card since 2026-06-28 has correctly separated 90-minute markets from the
+  to-advance market (FEATURE-002); no mis-pricing observed. No further action.
 - **Trigger:** group stage ends ~2026-06-27; the first knockout card is the check.
 
 **What.** `analyse_match_wc` prices **90-minute** 1X2 + totals. Knockout games can't end
@@ -336,9 +448,10 @@ card as if it were 90-min (it would mis-price the draw and the moneylines). This
 
 ## FEATURE-002 — "To advance" market for knockout ties
 
-- **Type:** feature · **Status:** IN PROGRESS — **promoted to build FIRST** (user wants
-  to-advance live for Round of 32, ~2026-06-28; multi-line O/U FEATURE-003 demoted to nice-to-have,
-  2026-06-25). **Requirements locked** → see [FEATURE-002_TO_ADVANCE.md](FEATURE-002_TO_ADVANCE.md).
+- **Type:** feature · **Status:** SHIPPED 2026-06-29 (stale "IN PROGRESS" label corrected
+  2026-07-06). Live in every knockout card since: `advance_probs`, `home_advance_ml`/
+  `away_advance_ml` odds capture, ADVANCE candidates + guardrails in `select_pick`, graded via
+  `advancing_side`/`grade_pick`. **Requirements** → [FEATURE-002_TO_ADVANCE.md](FEATURE-002_TO_ADVANCE.md).
   Decisions: real ET/PK model with a proxy bench nudge, team+player-level ET/PK data capture,
   manual results entry, reusable market-agnostic grader in `core/` for the social/ROI tracker.
 
@@ -649,7 +762,8 @@ follow-up if we want the guardrail's net effect measured automatically.
 
 ## BUG-004 — Over-skew: model expects more total goals than the market (LEVEL bias)
 
-- **Severity:** medium · **Status:** OPEN — and possibly *not* a bug (2026-06-13)
+- **Severity:** medium · **Status:** FIXED 2026-07-05 (knockout-scoped correction; group
+  stage was never actually biased once the two stages were compared directly — see below)
 - **Symptom.** Across all 72 games, OVER has avg EV **+6.8%** (+EV in 48/72) vs
   UNDER **−14.4%** (+EV in only 17/72). The model's expected total goals sits
   above the market's on essentially every game — a *level* bias, distinct from
@@ -704,6 +818,52 @@ baseline, since defense values are constructed as `raw · baseline/mean_raw`), s
 clean, single-parameter lever for the LEVEL, not a per-team patch. **Not applied yet** — this
 is a reopened watch item pending more knockout results, the same way the original bug waited
 for group-stage results before either fixing or dismissing it.
+
+**Update 2026-07-05 — FIXED, knockout-scoped, `WC_BASELINE` ruled out.** Round of 32 finished
+(16/16 graded); rerunning `totals_calibration.py` on the complete set sharpened the signal
+further, and — critically — showed the two stages need corrections in OPPOSITE directions:
+```
+  Group  72 matches · mean proj 2.776 · mean actual 2.986 · ratio 1.076 (model UNDER-projects ~7.6%)
+  R32    16 matches · mean proj 2.901 · mean actual 2.375 · ratio 0.819 (model OVER-projects ~18.1%)
+```
+This rules out the originally-proposed `WC_BASELINE` lever outright: a single global constant
+cannot fix a bias that runs one way in Group and the opposite way in R32. Built a new tool,
+`knockout_baseline_backtest.py`, to size and validate a **stage-scoped** multiplier instead —
+applied only when `stage != "Group"`, so it can't retroactively disturb group-stage calibration
+(moot in any case: the group stage is finished, no more games to price). Swept candidate scales
+against the 16 R32 games, re-running FEATURE-009's locked selection (0.60/0.60) on each:
+```
+ SCALE  SIGNED GAP   MAE   W  L  P   UNITS
+ 1.000       +0.53  0.73  12  4  0   +2.92   (today's baseline, no correction)
+ 0.900       +0.24  0.65  12  4  0   +2.92
+ 0.850       +0.09  0.62  14  2  0   +5.22   <- shipped
+ 0.819       +0.00  0.62  14  2  0   +5.77   (exact calibration-zeroing value)
+ 0.800       -0.05  0.62  14  2  0   +5.77
+ 0.750       -0.20  0.62  12  3  1   +4.99   (overcorrects)
+```
+0.819 — derived purely from the calibration ratio above, with zero reference to betting
+outcomes — landed at the units-optimal point in the sweep, which is a good sign this isn't
+overfit to 16 games. **Shipped the more conservative 0.85** (user's choice) rather than the
+exact value: nearly all of the improvement (14-2-0, +5.22u vs. 1.00's 12-4-0, +2.92u) with a
+smaller departure from baseline. Per-game, the correction is genuinely mixed, not a clean
+sweep — worth remembering when reviewing future results: 3 picks flipped loss→win
+(Germany/Paraguay, Netherlands/Morocco, USA/Bosnia — all cases of an inflated
+OVER/HOME-favorite confidence the correction properly discounted), 1 flipped win→loss
+(Belgium/Senegal — a real 4-goal knockout game the correction now underrates).
+
+**Implementation.** `core/wc_knockout_scale.py` (new, single source of truth):
+`KNOCKOUT_GOAL_SCALE = 0.85`, `knockout_goal_scale(stage)` returns 1.0 for Group else the
+scale. Multiplies into the SAME `home_advantage`/`away_advantage` slot `host_advantage()`
+(BUG-006) already occupies in `analyse_match_wc` — no change to `core/poisson_model.py`,
+`WC_BASELINE`, or any team-strength data. Because it scales both teams' λ directly, it affects
+moneyline and to-advance pricing too, not only totals. Wired into every file that already
+composed `host_advantage()` (same 9 consumers as BUG-006, plus the new
+`knockout_baseline_backtest.py`). Tests: `tests/test_wc_knockout_scale.py`,
+`tests/test_generate_wc_card.py::test_knockout_stage_scales_projected_lambda_down`.
+
+**Applied starting 2026-07-05** (R16: Canada/Morocco, Paraguay/France) — no retroactive
+regrading of already-settled R32 picks (locked history, same convention as every other fix
+this tournament).
 
 ## BUG-002 — Weak-league forwards inflate attack lambda
 
@@ -819,3 +979,33 @@ on P&L, so per-team is the targeted path). Revisit Mexico's pin when per-compone
 - Host **defensive** advantage is not modeled — hosts get an attack boost
   (`HOST_HOME_ADVANTAGE`) but no defensive edge at home. Adding opponent-attack
   suppression for host home games is a clean general add (helps modestly).
+
+**Watch item 2026-07-06 — CLOSED (Paraguay eliminated, R16).** Paraguay's disruptive/
+physical style may have been underrated by club-stat defense proxies (same root cause
+as this bug, different symptom): user's eye-test on two straight results, Germany
+(R32, lost) and France (R16, a 0-1 "slog"), had BOTH visibly slowed down by Paraguay's
+defensive, physical approach — a *tactical* effect a club-aggregated `club_ga_per90`
+proxy has no way to see (it measures average defensive output across a squad's club
+seasons, not a specific national-team game-plan). Paraguay lost the France game and is
+now eliminated, so this stays a 2-data-point anecdote with no further evidence coming
+this tournament — not actionable, but the underlying blind spot (proxy can't see
+game-plan-driven defense) is real and may resurface with a different team.
+
+**Note 2026-07-06 — Canada/Morocco (R16) scoreline overstated the actual gap.** Final
+was 0-3, but user's own viewing had it roughly even on chances (xG 0.84 Canada vs 0.82
+Morocco) until Morocco took over in the second half. The model's pick that day (Morocco
+to advance, 59.9% model prob) was NOT a lopsided call — it read this correctly as
+close to a coin flip, and the blowout scoreline is second-half variance/execution, not
+a model miss. Recorded so a future calibration pass doesn't misread this result as
+"model badly underrated Morocco" from the scoreline alone.
+
+**Note 2026-07-06 — Paraguay/France (R16) scoreline UNDERSOLD the actual gap (opposite
+direction from Canada/Morocco, same day).** Final was 0-1, but external xG had France
+1.45 vs Paraguay 0.13 — a near-total territorial/chance-quality mismatch that the tight
+scoreline completely hides. The Over 2.5 pick's underlying thesis (France would
+eventually create enough to break the game open) was well-supported by the actual run
+of play; the loss was a finishing/variance issue (France just didn't convert), not a
+sign the model's/market's read of the game was wrong. Two games, same day, opposite
+score-vs-process divergence — a clean illustration of why single-game results (and
+even the model's own goals-based proxy, not true xG — see DESIGN-001) can diverge
+sharply from the underlying quality of play in either direction.

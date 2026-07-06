@@ -218,6 +218,21 @@ def init_database():
             FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
         );
 
+        -- FEATURE-008: external (non-model) per-match xG, for POST-HOC COMPARISON ONLY.
+        -- HARD CONSTRAINT: never joined into or confused with the model's own xG
+        -- (soccer_wc_player_stats.xg_per90) or any core-workflow table -- kept in this
+        -- separate table so the two sources can never be mixed.
+        CREATE TABLE IF NOT EXISTS soccer_wc_external_xg (
+            external_xg_id INTEGER PRIMARY KEY,
+            match_id       INTEGER NOT NULL,
+            source         TEXT NOT NULL,        -- e.g. 'thestatsapi'
+            home_xg        REAL,
+            away_xg        REAL,
+            fetched_at     TIMESTAMP,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_wc_matches(match_id)
+        );
+
         -- A tagged human deviation from the model's pick on a match. The model's
         -- pick (soccer_wc_picks) is left untouched (single source of truth); this
         -- records what the user took INSTEAD and WHY, so model-vs-user can be scored
@@ -285,6 +300,7 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wc_strength_team   ON soccer_wc_team_strength(team_id);
         CREATE INDEX IF NOT EXISTS idx_wc_picks_match     ON soccer_wc_picks(match_id);
         CREATE INDEX IF NOT EXISTS idx_wc_overrides_match ON soccer_wc_pick_overrides(match_id);
+        CREATE INDEX IF NOT EXISTS idx_wc_external_xg_match ON soccer_wc_external_xg(match_id);
         CREATE INDEX IF NOT EXISTS idx_penalty_kicks_match    ON soccer_penalty_kicks(match_id);
         CREATE INDEX IF NOT EXISTS idx_extra_time_goals_match ON soccer_extra_time_goals(match_id);
     ''')
@@ -948,6 +964,38 @@ def set_wc_override_result(override_id, result):
             (result, override_id)
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_wc_external_xg(match_id, source, home_xg, away_xg, fetched_at):
+    """Insert or update external (non-model) per-match xG for FEATURE-008 comparison
+    only; return external_xg_id. Kept in its own table so it can never be confused
+    with the model's own xG (see soccer_wc_external_xg's schema comment)."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT external_xg_id FROM soccer_wc_external_xg WHERE match_id = ? AND source = ?",
+            (match_id, source)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_wc_external_xg
+                   SET home_xg = ?, away_xg = ?, fetched_at = ?
+                   WHERE external_xg_id = ?""",
+                (home_xg, away_xg, fetched_at, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_wc_external_xg (match_id, source, home_xg, away_xg, fetched_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (match_id, source, home_xg, away_xg, fetched_at)
+        )
+        conn.commit()
+        return cur.lastrowid
     finally:
         conn.close()
 

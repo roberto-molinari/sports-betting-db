@@ -12,7 +12,9 @@ from core.poisson_model import (
     scoreline_grid, outcome_probs, totals_probs, compute_ev, compute_ev_totals,
     american_to_implied_prob, ev_to_stars, WC_BASELINE, WC_MAX_GOALS,
 )
-from generate_wc_card import select_pick, HOST_NATIONS, HOST_HOME_ADVANTAGE
+from generate_wc_card import select_pick
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 from price_ladders import LADDERS  # match_id -> (name, {label: (lines, over, under)})
 
 MAIN = {  # match_id -> (home_ml, draw_ml, away_ml, line, over_odds, under_odds)
@@ -24,14 +26,15 @@ MAIN = {  # match_id -> (home_ml, draw_ml, away_ml, line, over_odds, under_odds)
 
 
 def grid_for(conn, mid):
-    r = conn.execute("""SELECT m.home_team_id, m.away_team_id, ht.name h, at.name a
+    r = conn.execute("""SELECT m.home_team_id, m.away_team_id, m.stage, ht.name h, at.name a
         FROM soccer_wc_matches m JOIN soccer_wc_teams ht ON ht.team_id=m.home_team_id
         JOIN soccer_wc_teams at ON at.team_id=m.away_team_id
         WHERE m.match_id=?""", (mid,)).fetchone()
     h_att, h_def = get_latest_wc_strength(r["home_team_id"], conn=conn)
     a_att, a_def = get_latest_wc_strength(r["away_team_id"], conn=conn)
-    home_adv = HOST_HOME_ADVANTAGE if r["h"] in HOST_NATIONS else 1.0
-    away_adv = HOST_HOME_ADVANTAGE if r["a"] in HOST_NATIONS else 1.0
+    level = knockout_goal_scale(r["stage"])
+    home_adv = host_advantage(r["h"], r["stage"]) * level
+    away_adv = host_advantage(r["a"], r["stage"]) * level
     lh = max(h_att * (a_def / WC_BASELINE) * home_adv, 0.1)
     la = max(a_att * (h_def / WC_BASELINE) * away_adv, 0.1)
     return r["h"], r["a"], scoreline_grid(lh, la, max_goals=WC_MAX_GOALS)

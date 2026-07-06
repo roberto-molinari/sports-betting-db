@@ -22,7 +22,9 @@ import sqlite3
 from core.sports_db import DATABASE_PATH
 from core.poisson_model import (analyse_match_wc, american_to_implied_prob,
                                 american_to_decimal)
-from generate_wc_card import select_pick, HOST_NATIONS, HOST_HOME_ADVANTAGE, EASTERN_SQL_OFFSET
+from generate_wc_card import select_pick, EASTERN_SQL_OFFSET
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 from core.grading import grade_pick
 
 # v7 (FIFA blend) was persisted 2026-06-19; earlier slates ran on v6, so the blend
@@ -49,8 +51,9 @@ def strength(conn, team_id, blended):
 def pick_on(match, h_att, h_def, a_att, a_def):
     """The model's best pick for a match given a specific pair of strengths —
     mirrors generate_wc_card.best_pick_for_match's candidate build + select_pick."""
-    home_adv = HOST_HOME_ADVANTAGE if match["home"] in HOST_NATIONS else 1.0
-    away_adv = HOST_HOME_ADVANTAGE if match["away"] in HOST_NATIONS else 1.0
+    level = knockout_goal_scale(match["stage"])
+    home_adv = host_advantage(match["home"], match["stage"]) * level
+    away_adv = host_advantage(match["away"], match["stage"]) * level
     r = analyse_match_wc(
         lambda_home_attack=h_att, lambda_away_attack=a_att,
         lambda_home_defense=h_def, lambda_away_defense=a_def,
@@ -85,7 +88,7 @@ def settle(side, odds, hs, as_):
 def fetch(conn, date_filter):
     cur = conn.cursor()
     sql = """
-        SELECT m.match_id, m.match_date, h.name AS home, a.name AS away,
+        SELECT m.match_id, m.match_date, m.stage, h.name AS home, a.name AS away,
                m.home_team_id, m.away_team_id, m.home_score, m.away_score,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
                o.over_under, o.over_odds, o.under_odds

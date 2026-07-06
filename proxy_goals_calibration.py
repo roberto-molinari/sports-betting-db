@@ -14,13 +14,34 @@ strength model retrodicts reality and where it does not (BUG-005 / BUG-001 / pin
 
 Usage:
     python proxy_goals_calibration.py
+    python proxy_goals_calibration.py --team Mexico   # highlight + rank + summary
 """
 
+import argparse
 import sqlite3
+import sys
 
 from core.sports_db import DATABASE_PATH, get_latest_wc_strength
 from core.poisson_model import WC_BASELINE
-from generate_wc_card import HOST_NATIONS, HOST_HOME_ADVANTAGE
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
+
+HIGHLIGHT = "\033[1;32m"   # bold green
+RESET = "\033[0m"
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Score the model's expected-goals proxy against actual goals scored.")
+    ap.add_argument("--team", help="Highlight this team's row and print its rank/summary.")
+    return ap.parse_args()
+
+
+def ordinal(n):
+    if 11 <= n % 100 <= 13:
+        return f"{n}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def latest_method(conn, team_id):
@@ -36,18 +57,19 @@ def build_rows(conn):
     strength = {tid: get_latest_wc_strength(tid, conn=conn) for tid in teams}
 
     matches = conn.execute(
-        "SELECT home_team_id, away_team_id, home_score, away_score "
+        "SELECT home_team_id, away_team_id, home_score, away_score, stage "
         "FROM soccer_wc_matches WHERE home_score IS NOT NULL").fetchall()
 
     agg = {tid: {"proxy": 0.0, "actual": 0, "gp": 0} for tid in teams}
-    for h, a, hs, as_ in matches:
+    for h, a, hs, as_, stage in matches:
         if strength.get(h) is None or strength.get(a) is None:
             continue
         h_att, h_def = strength[h]
         a_att, a_def = strength[a]
         h_names, a_names = teams[h][0], teams[a][0]
-        h_boost = HOST_HOME_ADVANTAGE if h_names in HOST_NATIONS else 1.0
-        a_boost = HOST_HOME_ADVANTAGE if a_names in HOST_NATIONS else 1.0
+        level = knockout_goal_scale(stage)
+        h_boost = host_advantage(h_names, stage) * level
+        a_boost = host_advantage(a_names, stage) * level
         # home team's proxy: its attack vs the away defense, its own venue boost
         agg[h]["proxy"] += max(h_att * (a_def / WC_BASELINE) * h_boost, 0.1)
         agg[a]["proxy"] += max(a_att * (h_def / WC_BASELINE) * a_boost, 0.1)
@@ -76,19 +98,34 @@ METHOD_LABEL = {"fifa_ranking": "FIFA-pin", "player_aggregation": "blend(0.2)"}
 
 
 def main():
+    args = parse_args()
     conn = sqlite3.connect(DATABASE_PATH)
     rows = build_rows(conn)
     conn.close()
+
+    color = sys.stdout.isatty()
+    target_idx = None
+    if args.team:
+        for i, r in enumerate(rows):
+            if r["team"].lower() == args.team.lower():
+                target_idx = i
+                break
+        if target_idx is None:
+            print(f"WARNING: no calibration row for team {args.team!r} "
+                  f"(not enough finished matches, or unknown team name).\n")
 
     hdr = (f"{'TEAM':<22}{'ATT λ':>7}{'DEF λ':>7}{'PROXY xG':>10}{'ACTUAL':>8}"
            f"{'GAP':>8}{'GP':>4}  {'METHOD':<11}{'FIFA':>5}")
     print(hdr)
     print("-" * len(hdr))
-    for r in rows:
+    for i, r in enumerate(rows):
         method = METHOD_LABEL.get(r["method"], r["method"] or "?")
-        print(f"{r['team']:<22}{r['att']:>7.2f}{r['def']:>7.2f}{r['proxy']:>10.2f}"
-              f"{r['actual']:>8d}{r['gap']:>+8.2f}{r['gp']:>4d}  {method:<11}"
-              f"{r['fifa'] if r['fifa'] else '-':>5}")
+        line = (f"{r['team']:<22}{r['att']:>7.2f}{r['def']:>7.2f}{r['proxy']:>10.2f}"
+                f"{r['actual']:>8d}{r['gap']:>+8.2f}{r['gp']:>4d}  {method:<11}"
+                f"{r['fifa'] if r['fifa'] else '-':>5}")
+        if i == target_idx and color:
+            line = f"{HIGHLIGHT}{line}{RESET}"
+        print(line)
 
     n = len(rows)
     mae = sum(abs(r["gap"]) for r in rows) / n
@@ -96,6 +133,16 @@ def main():
     print("-" * len(hdr))
     print(f"{n} teams · mean |gap| {mae:.2f} · mean signed gap {bias:+.2f} "
           f"(+ = model over-projects goals)")
+
+    if target_idx is not None:
+        r = rows[target_idx]
+        method = METHOD_LABEL.get(r["method"], r["method"] or "?")
+        print()
+        print(f"=== {r['team']} ===")
+        print(f"Position: {ordinal(target_idx + 1)} out of {n} (ranked by |gap|, best-calibrated first)")
+        print(f"  ATT λ {r['att']:.2f}  DEF λ {r['def']:.2f}  PROXY xG {r['proxy']:.2f}  "
+              f"ACTUAL {r['actual']}  GAP {r['gap']:+.2f}  GP {r['gp']}  "
+              f"METHOD {method}  FIFA #{r['fifa'] if r['fifa'] else '-'}")
 
 
 if __name__ == "__main__":

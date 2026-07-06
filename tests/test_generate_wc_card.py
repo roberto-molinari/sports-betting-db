@@ -347,6 +347,27 @@ def test_select_pick_fallback_when_neither_mode_qualifies():
     assert best["side"] == "HOME"    # 0.45 > 0.35
 
 
+# ── BUG-004: knockout goal-level correction ──────────────────────────────────
+
+def test_knockout_stage_scales_projected_lambda_down():
+    """best_pick_for_match's venue-advantage computation (host_advantage x
+    knockout_goal_scale) must yield a strictly smaller total for a knockout
+    stage than for an identical Group-stage matchup, mirroring exactly what
+    generate_wc_card.py itself composes at the call site."""
+    h_att, h_def, a_att, a_def = 1.6, 1.1, 1.4, 1.2
+
+    def total_lambda(stage):
+        level = gwc.knockout_goal_scale(stage)
+        home_adv = gwc.host_advantage("Homeland", stage) * level
+        away_adv = gwc.host_advantage("Awayland", stage) * level
+        r = gwc.analyse_match_wc(h_att, a_att, h_def, a_def,
+                                 home_advantage=home_adv, away_advantage=away_adv)
+        return r["lambda_H"] + r["lambda_A"]
+
+    assert total_lambda("R32") < total_lambda("Group")
+    assert total_lambda("R16") < total_lambda("Group")
+
+
 # ── to-advance market (FEATURE-002) ──────────────────────────────────────────
 
 def _seed_knockout(db_path, with_advance):
@@ -393,6 +414,149 @@ def test_no_advance_candidate_without_advance_odds(db_path):
 def test_display_pick_advance():
     assert gwc.display_pick("HOME ADVANCE", "Brazil", "Chile") == "Brazil to advance"
     assert gwc.display_pick("AWAY ADVANCE", "Brazil", "Chile") == "Chile to advance"
+
+
+# ── close-calls diagnostic: guardrail_excess + mode_breakdown ────────────────
+
+def test_guardrail_excess_none_when_not_excluded(monkeypatch):
+    _disable_mode_bars(monkeypatch)
+    cands = [_cand("HOME", prob=0.60, implied=0.50, ev=0.10)]
+    gwc.select_pick(cands)
+    assert gwc.guardrail_excess(cands[0]) is None
+
+
+def test_guardrail_excess_measures_floor_miss(monkeypatch):
+    _disable_mode_bars(monkeypatch)
+    # MIN_PICK_PROBABILITY defaults to 0.25; 0.24 misses by 0.01.
+    cands = [_cand("HOME", prob=0.24, implied=0.50, ev=0.10),
+              _cand("AWAY", prob=0.40, implied=0.35, ev=0.05)]
+    gwc.select_pick(cands)
+    assert round(gwc.guardrail_excess(cands[0]), 3) == 0.01
+
+
+def test_guardrail_excess_takes_worst_of_multiple(monkeypatch):
+    """A candidate tripping both floor and cap reports the LARGER excess (the
+    harder-to-clear guardrail), not the smaller one."""
+    _disable_mode_bars(monkeypatch)
+    # floor: 0.25 - 0.10 = 0.15 excess. cap: prob >= 2x implied -> 0.10 >= 2*0.04=0.08,
+    # excess = 0.10 - 0.08 = 0.02. Floor's excess (0.15) is larger.
+    cands = [_cand("AWAY", prob=0.10, implied=0.04, ev=0.50),
+              _cand("HOME", prob=0.60, implied=0.55, ev=0.05)]
+    gwc.select_pick(cands)
+    away = next(c for c in cands if c["side"] == "AWAY")
+    assert round(gwc.guardrail_excess(away), 3) == 0.15
+
+
+def test_mode_breakdown_tags_near_miss_and_includes_in_value():
+    """A candidate excluded by the CAP guardrail within CLOSE_CALL_TOLERANCE of
+    clearing it is tagged near_miss and still surfaces in the value list -- but
+    select_pick's actual choice (guardrail-clear only) is unaffected. Uses the
+    real default bars, since this is exactly the production scenario the
+    diagnostic targets."""
+    cands = [
+        _cand("HOME", prob=0.62, implied=0.58, ev=0.15),   # guardrail-clear
+        _cand("AWAY", prob=0.63, implied=0.31, ev=0.35),   # cap: 0.63 >= 2*0.31=0.62, excess 0.01
+    ]
+    best = gwc.select_pick(cands)
+    assert best["side"] == "HOME"                          # AWAY still excluded -> unaffected pick
+    away = next(c for c in cands if c["side"] == "AWAY")
+    assert any("cap" in r for r in away["excluded_by"])
+
+    breakdown = gwc.mode_breakdown(cands)
+    assert away["near_miss"] is True
+    assert breakdown["value"][0]["side"] == "AWAY"         # higher EV, shown despite exclusion
+    assert breakdown["value"][1]["side"] == "HOME"
+
+
+def test_mode_breakdown_excludes_far_miss(monkeypatch):
+    """A guardrail-excluded candidate that misses by MORE than the tolerance is
+    left out of the value list entirely, even if its EV is high."""
+    _disable_mode_bars(monkeypatch)
+    monkeypatch.setattr(gwc, "CLOSE_CALL_TOLERANCE", 0.02)
+    cands = [
+        _cand("HOME", prob=0.61, implied=0.55, ev=0.10),
+        _cand("AWAY", prob=0.10, implied=0.08, ev=0.90),   # floor miss by 0.15 -- far miss
+    ]
+    gwc.select_pick(cands)
+    breakdown = gwc.mode_breakdown(cands)
+    away = next(c for c in cands if c["side"] == "AWAY")
+    assert away["near_miss"] is False
+    assert away not in breakdown["value"]
+
+
+def test_mode_breakdown_ranks_each_mode_by_its_own_rule():
+    """value ranks by EV, prediction by payout, fallback by model probability --
+    three independent orderings over the same candidate pool. Uses the real
+    default mode bars (0.60/0.60) since the point is to exercise them."""
+    cands = [
+        _cand("HOME", prob=0.65, implied=0.62, ev=0.05, odds=-140),
+        _cand("AWAY", prob=0.61, implied=0.60, ev=0.20, odds=+120),
+        _cand("OVER 2.5", prob=0.70, implied=0.55, ev=0.02, odds=-105),
+    ]
+    gwc.select_pick(cands)
+    breakdown = gwc.mode_breakdown(cands)
+    assert breakdown["value"][0]["side"] == "AWAY"          # highest EV (0.20)
+    assert breakdown["prediction"][0]["side"] == "AWAY"      # best payout among implied>=0.60
+    assert breakdown["fallback"][0]["side"] == "OVER 2.5"    # highest model prob (0.70)
+
+
+def test_mode_breakdown_caps_at_top_n(monkeypatch):
+    _disable_mode_bars(monkeypatch)
+    cands = [_cand(f"CAND{i}", prob=0.9 - i * 0.05, implied=0.5, ev=0.01) for i in range(5)]
+    gwc.select_pick(cands)
+    breakdown = gwc.mode_breakdown(cands, top_n=3)
+    assert len(breakdown["fallback"]) == 3
+
+
+# ── top-EV diagnostic: why_not_value + mode_breakdown's top_ev list ──────────
+
+def test_why_not_value_none_for_a_clean_value_candidate():
+    cands = [_cand("HOME", prob=0.65, implied=0.55, ev=0.20)]
+    gwc.select_pick(cands)
+    assert gwc.why_not_value(cands[0]) is None
+
+
+def test_why_not_value_reports_guardrail_reason_first():
+    """A guardrail-excluded candidate's reason takes priority over the bar checks
+    (it wouldn't even reach the value-mode bars in select_pick)."""
+    cands = [
+        _cand("AWAY", prob=0.10, implied=0.04, ev=0.90),   # floor-excluded
+        _cand("HOME", prob=0.65, implied=0.55, ev=0.05),
+    ]
+    gwc.select_pick(cands)
+    away = next(c for c in cands if c["side"] == "AWAY")
+    assert "floor" in gwc.why_not_value(away)
+
+
+def test_why_not_value_reports_sub_bar_when_guardrail_clear():
+    """A guardrail-clear candidate below the value-mode probability bar is
+    annotated with that specific reason, not a guardrail reason (none fired)."""
+    cands = [_cand("OVER 2.5", prob=0.52, implied=0.50, ev=0.05)]
+    gwc.select_pick(cands)
+    reason = gwc.why_not_value(cands[0])
+    assert "value bar" in reason and cands[0]["excluded_by"] == []
+
+
+def test_why_not_value_reports_negative_ev():
+    cands = [_cand("HOME", prob=0.65, implied=0.75, ev=-0.05)]
+    gwc.select_pick(cands)
+    assert gwc.why_not_value(cands[0]) == "EV not positive"
+
+
+def test_mode_breakdown_top_ev_ranks_by_raw_ev_unfiltered():
+    """top_ev ignores guardrails and mode bars entirely -- a guardrail-excluded
+    longshot with the highest EV on the board still tops this list, unlike the
+    value list, which would drop it."""
+    cands = [
+        _cand("AWAY ADVANCE", prob=0.377, implied=0.190, ev=0.97),   # advance-edge excluded
+        _cand("HOME", prob=0.65, implied=0.60, ev=0.10),
+    ]
+    gwc.select_pick(cands)
+    breakdown = gwc.mode_breakdown(cands)
+    assert breakdown["top_ev"][0]["side"] == "AWAY ADVANCE"
+    assert "advance-edge" in gwc.why_not_value(breakdown["top_ev"][0])
+    # confirms it's genuinely absent from the value list despite topping top_ev
+    assert all(c["side"] != "AWAY ADVANCE" for c in breakdown["value"])
 
 
 def test_card_passes_bench_index_into_advance(db_path):

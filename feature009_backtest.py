@@ -31,6 +31,8 @@ from core.poisson_model import (
     american_to_decimal, compute_ev,
 )
 from core.grading import grade_pick, advancing_side
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 from compute_wc_team_strength import compute_bench_indices
 import generate_wc_card as gwc
 
@@ -80,8 +82,9 @@ def load_games(conn):
             continue
         h_att, h_def = h_strength
         a_att, a_def = a_strength
-        home_adv = gwc.HOST_HOME_ADVANTAGE if home in gwc.HOST_NATIONS else 1.0
-        away_adv = gwc.HOST_HOME_ADVANTAGE if away in gwc.HOST_NATIONS else 1.0
+        level = knockout_goal_scale(stage)
+        home_adv = host_advantage(home, stage) * level
+        away_adv = host_advantage(away, stage) * level
 
         r = analyse_match_wc(
             h_att, a_att, h_def, a_def,

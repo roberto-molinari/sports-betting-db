@@ -13,7 +13,8 @@ from core.poisson_model import (
     scoreline_grid, totals_probs, compute_ev_totals, american_to_implied_prob,
 )
 from core.poisson_model import WC_BASELINE, WC_MAX_GOALS
-from generate_wc_card import HOST_NATIONS, HOST_HOME_ADVANTAGE
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 
 # label -> (component_lines, over_american, under_american).
 # Single line -> one component; split/quarter line -> two components.
@@ -64,14 +65,15 @@ def ev_for_line(grid, lines, over_odds, under_odds):
 
 
 def model_grid(conn, match_id):
-    r = conn.execute("""SELECT m.home_team_id, m.away_team_id, ht.name h, at.name a
+    r = conn.execute("""SELECT m.home_team_id, m.away_team_id, m.stage, ht.name h, at.name a
         FROM soccer_wc_matches m JOIN soccer_wc_teams ht ON ht.team_id=m.home_team_id
         JOIN soccer_wc_teams at ON at.team_id=m.away_team_id
         WHERE m.match_id=?""", (match_id,)).fetchone()
     h_att, h_def = get_latest_wc_strength(r["home_team_id"], conn=conn)
     a_att, a_def = get_latest_wc_strength(r["away_team_id"], conn=conn)
-    home_adv = HOST_HOME_ADVANTAGE if r["h"] in HOST_NATIONS else 1.0
-    away_adv = HOST_HOME_ADVANTAGE if r["a"] in HOST_NATIONS else 1.0
+    level = knockout_goal_scale(r["stage"])
+    home_adv = host_advantage(r["h"], r["stage"]) * level
+    away_adv = host_advantage(r["a"], r["stage"]) * level
     lambda_H = max(h_att * (a_def / WC_BASELINE) * home_adv, 0.1)
     lambda_A = max(a_att * (h_def / WC_BASELINE) * away_adv, 0.1)
     grid = scoreline_grid(lambda_H, lambda_A, max_goals=WC_MAX_GOALS)

@@ -32,16 +32,13 @@ from core.sports_db import DATABASE_PATH, get_latest_wc_strength
 from core.poisson_model import (
     analyse_match_wc, scoreline_grid, outcome_probs, WC_MAX_GOALS,
 )
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 
 # Dark tweet palette (matches roi_history.py / the group-stage report).
 BG, PANEL, MUTED, ACCENT = "#15202b", "#22303c", "#8899a6", "#1d9bf0"
 # Outcome-region colours (home win / draw / away win).
 HOME_COLOR, DRAW_COLOR, AWAY_COLOR = "#2e8b57", "#b8a878", "#3b6fb5"
-
-# Host venue edge, kept in sync with generate_wc_card so the heatmap's λ match the
-# card's λ exactly (a host gets the boost on whichever side it is listed).
-HOST_NATIONS = {"USA", "Mexico", "Canada"}
-HOST_HOME_ADVANTAGE = 1.20
 
 CHROME_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -70,10 +67,10 @@ def parse_args():
 
 
 def resolve_match(conn, args):
-    """Return (home_id, home_name, away_id, away_name, date) for the requested match."""
+    """Return (home_id, home_name, away_id, away_name, date, stage) for the requested match."""
     if args.match_id:
         row = conn.execute(
-            """SELECT m.home_team_id, h.name, m.away_team_id, a.name, m.match_date
+            """SELECT m.home_team_id, h.name, m.away_team_id, a.name, m.match_date, m.stage
                FROM soccer_wc_matches m
                JOIN soccer_wc_teams h ON m.home_team_id = h.team_id
                JOIN soccer_wc_teams a ON m.away_team_id = a.team_id
@@ -87,14 +84,15 @@ def resolve_match(conn, args):
         if not h or not a:
             sys.exit(f"Unknown team(s): {args.home!r} / {args.away!r}.")
         m = conn.execute(
-            """SELECT match_date FROM soccer_wc_matches
+            """SELECT match_date, stage FROM soccer_wc_matches
                WHERE home_team_id = ? AND away_team_id = ? ORDER BY match_date LIMIT 1""",
             (h[0], a[0])).fetchone()
-        return (h[0], args.home, a[0], args.away, m[0] if m else None)
+        date, stage = m if m else (None, None)
+        return (h[0], args.home, a[0], args.away, date, stage)
     sys.exit("Provide --match-id, or both --home and --away.")
 
 
-def model_lambdas(conn, home_id, home_name, away_id, away_name):
+def model_lambdas(conn, home_id, home_name, away_id, away_name, stage):
     """The combined Poisson rates λ_H / λ_A, computed exactly as the card does."""
     hs = get_latest_wc_strength(home_id, conn=conn)
     as_ = get_latest_wc_strength(away_id, conn=conn)
@@ -102,8 +100,9 @@ def model_lambdas(conn, home_id, home_name, away_id, away_name):
         sys.exit("Missing team strength for one side — cannot price the match.")
     h_att, h_def = hs
     a_att, a_def = as_
-    home_adv = HOST_HOME_ADVANTAGE if home_name in HOST_NATIONS else 1.0
-    away_adv = HOST_HOME_ADVANTAGE if away_name in HOST_NATIONS else 1.0
+    level = knockout_goal_scale(stage)
+    home_adv = host_advantage(home_name, stage) * level
+    away_adv = host_advantage(away_name, stage) * level
     r = analyse_match_wc(
         lambda_home_attack=h_att, lambda_away_attack=a_att,
         lambda_home_defense=h_def, lambda_away_defense=a_def,
@@ -242,10 +241,10 @@ def rasterize(svg_path, png_path, w, h, scale=2):
 def main():
     args = parse_args()
     conn = sqlite3.connect(DATABASE_PATH)
-    home_id, home, away_id, away, date = resolve_match(conn, args)
+    home_id, home, away_id, away, date, stage = resolve_match(conn, args)
     if args.date:
         date = args.date
-    lam_h, lam_a = model_lambdas(conn, home_id, home, away_id, away)
+    lam_h, lam_a = model_lambdas(conn, home_id, home, away_id, away, stage)
     conn.close()
 
     grid = scoreline_grid(lam_h, lam_a, max_goals=WC_MAX_GOALS)

@@ -26,7 +26,7 @@ from core.sports_db import (
     set_wc_pick_result,
     set_wc_override_result,
 )
-from core.grading import grade_pick
+from core.grading import grade_pick, advancing_side
 from import_wc_odds import load_team_map, load_match_index, resolve_team, find_match
 
 
@@ -77,9 +77,20 @@ def grade_match_overrides(conn, match_id, home_score, away_score, advanced=None)
 
 
 def record_result(conn, match_id, home_score, away_score):
+    """Record a match's regulation score and grade its picks/overrides.
+
+    Derives ``advanced`` from the regulation score alone (advancing_side falls
+    back to comparing regulation goals when no extra-time/shootout scores are
+    given), so knockout ties decided in 90 minutes grade their ADVANCE picks
+    correctly through this single-match/CSV path -- same as --grade-only.
+    A tie that goes to extra time/penalties still needs
+    core.sports_db.set_wc_match_advance_result (this path has no way to enter
+    ET/shootout scores) before its ADVANCE picks can be graded.
+    """
     update_wc_match_result(match_id, home_score, away_score)
-    n = grade_match_picks(conn, match_id, home_score, away_score)
-    grade_match_overrides(conn, match_id, home_score, away_score)
+    advanced = advancing_side(home_score, away_score)
+    n = grade_match_picks(conn, match_id, home_score, away_score, advanced)
+    grade_match_overrides(conn, match_id, home_score, away_score, advanced)
     return n
 
 
@@ -89,13 +100,17 @@ def main():
 
     if args.grade_only:
         cur = conn.cursor()
-        cur.execute("""SELECT match_id, home_score, away_score FROM soccer_wc_matches
+        cur.execute("""SELECT match_id, home_score, away_score,
+                              extra_time_home_score, extra_time_away_score,
+                              shootout_home_score, shootout_away_score
+                       FROM soccer_wc_matches
                        WHERE match_status = 'completed'
                          AND home_score IS NOT NULL AND away_score IS NOT NULL""")
         total = ov = 0
-        for match_id, hs, as_ in cur.fetchall():
-            total += grade_match_picks(conn, match_id, hs, as_)
-            ov += grade_match_overrides(conn, match_id, hs, as_)
+        for match_id, hs, as_, eth, eta, sh, sa in cur.fetchall():
+            advanced = advancing_side(hs, as_, eth, eta, sh, sa)
+            total += grade_match_picks(conn, match_id, hs, as_, advanced)
+            ov += grade_match_overrides(conn, match_id, hs, as_, advanced)
         conn.close()
         print(f"Re-graded {total} picks and {ov} overrides across completed matches.")
         return

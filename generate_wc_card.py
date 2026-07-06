@@ -28,6 +28,8 @@ from core.poisson_model import (
     analyse_match_wc, advance_probs, ev_to_stars,
     american_to_implied_prob, american_to_decimal, compute_ev,
 )
+from core.wc_host_advantage import host_advantage
+from core.wc_knockout_scale import knockout_goal_scale
 from compute_wc_team_strength import compute_bench_indices
 
 # match_date is stored in UTC, but the tournament is hosted in North America and
@@ -42,12 +44,12 @@ TOURNAMENT_TZ = ZoneInfo("America/New_York")
 # next calendar date. -8h total = -4h (UTC->ET) - 4h (midnight->4am boundary).
 EASTERN_SQL_OFFSET = "-8 hours"   # match_date -> matchday (4am-ET broadcast day)
 
-# The three host nations play their group games in their own countries, so they
-# carry a real home-field edge regardless of which side FIFA lists as "home"
-# (each host is the nominal away team in one of its three group games). We apply
-# the boost to whichever side the host is on. 1.20 ~ a moderate home edge.
-HOST_NATIONS = {"USA", "Mexico", "Canada"}
-HOST_HOME_ADVANTAGE = 1.20
+# Host-nation venue advantage (BUG-006): single source of truth is
+# core.wc_host_advantage, since a host only gets the boost when actually playing
+# in its own country -- true for group games by tournament design, but NOT
+# guaranteed for knockout stadium assignments. See that module for the team
+# lists; host_advantage(team, stage) is the one function every consumer (this
+# card, calibration/backtest scripts) should call.
 
 # Selection guardrails (BUG-003 — noise amplification on longshots). Both are
 # evaluated INDEPENDENTLY on every candidate so we can log which one excluded a
@@ -98,6 +100,14 @@ VALUE_MODE_MIN_PROBABILITY = 0.60
 # from landing back on a coin-flip loser (e.g. a -148 near-toss-up beating a genuine
 # -152 favorite on payout alone) by restricting the payout search to genuine favorites.
 PREDICTION_MODE_MIN_IMPLIED_PROBABILITY = 0.60
+
+# Close-calls diagnostic (2026-07-06) — informational only, never changes the
+# selected pick. A BUG-003-guardrail-excluded candidate still shows up in the
+# value-mode candidate list (see mode_breakdown) if it missed clearing the
+# guardrail by this little in probability points — e.g. a 2.01x cap instead of
+# 2.0x, or a 0.24 floor instead of 0.25. Widen/narrow to surface more/fewer
+# near-misses.
+CLOSE_CALL_TOLERANCE = 0.02  # 200 basis points
 
 
 def parse_args():
@@ -235,6 +245,85 @@ def select_pick(priced):
     return best
 
 
+def guardrail_excess(c):
+    """How far an EXCLUDED candidate sits past whichever guardrail(s) it tripped,
+    in probability points -- the LARGEST excess if more than one fired (a
+    candidate must clear ALL of them to become guardrail-clear, so the hardest
+    one to fix is what determines how close it really is). None if the
+    candidate wasn't excluded. Used only by mode_breakdown's close-calls
+    relaxation; requires ``excluded_by`` to already be set (a select_pick
+    side effect)."""
+    if not c["excluded_by"]:
+        return None
+    excesses = []
+    if c["prob"] < MIN_PICK_PROBABILITY:
+        excesses.append(MIN_PICK_PROBABILITY - c["prob"])
+    if c["implied"] and c["prob"] >= MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"]:
+        excesses.append(c["prob"] - MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"])
+    if ("ADVANCE" in c["side"] and c["implied"] and c["implied"] < 0.5
+            and c["prob"] - c["implied"] >= MAX_ADVANCE_ABSOLUTE_DISAGREEMENT):
+        excesses.append((c["prob"] - c["implied"]) - MAX_ADVANCE_ABSOLUTE_DISAGREEMENT)
+    return max(excesses) if excesses else None
+
+
+def why_not_value(c):
+    """Human-readable reason a candidate ISN'T eligible for value mode -- a
+    BUG-003 guardrail reason if one fired, else why it fails FEATURE-009's own
+    bars. None means the candidate actually clears everything (it IS a real
+    value-mode candidate -- if it's also the highest-EV one, it's the pick).
+    Used only by the top-EV diagnostic in mode_breakdown."""
+    if c["excluded_by"]:
+        return " & ".join(c["excluded_by"])
+    if c["prob"] < VALUE_MODE_MIN_PROBABILITY:
+        return f"model prob {c['prob']:.3f} < value bar {VALUE_MODE_MIN_PROBABILITY:g}"
+    if c["ev"] <= 0:
+        return "EV not positive"
+    return None
+
+
+def mode_breakdown(priced, top_n=3):
+    """Diagnostic-only "close calls" view: the top ``top_n`` candidates for EACH
+    of FEATURE-009's three modes, independent of which one select_pick actually
+    chose. Pure and read-only -- it never changes the pick; it exists purely so
+    a human can eyeball what else was close. Requires ``priced`` to already have
+    ``excluded_by`` set (select_pick does this as a side effect before this is
+    called).
+
+    - value: guardrail-clear (or a near-miss within CLOSE_CALL_TOLERANCE, tagged
+      ``near_miss``) candidates with prob >= VALUE_MODE_MIN_PROBABILITY and
+      positive EV, ranked by EV.
+    - prediction: candidates with implied >= PREDICTION_MODE_MIN_IMPLIED_PROBABILITY,
+      ranked by payout (decimal odds) -- guardrails don't apply here, matching
+      select_pick's own step 2.
+    - fallback: ALL candidates ranked by model probability -- guardrails don't
+      apply here either, matching select_pick's own last resort.
+    - top_ev: the top candidates by RAW EV, no probability filter and no
+      guardrail filter at all -- the honest "what looked best on paper" list,
+      each annotated (via why_not_value) with why it isn't a value pick. This
+      is what answers "why isn't the model finding value here?" at a glance.
+    """
+    for c in priced:
+        excess = guardrail_excess(c)
+        c["near_miss"] = bool(c["excluded_by"]) and excess is not None \
+            and excess <= CLOSE_CALL_TOLERANCE
+
+    value_pool = [c for c in priced if not c["excluded_by"] or c["near_miss"]]
+    value = sorted(
+        [c for c in value_pool if c["prob"] >= VALUE_MODE_MIN_PROBABILITY and c["ev"] > 0],
+        key=lambda c: c["ev"], reverse=True)[:top_n]
+
+    prediction = sorted(
+        [c for c in priced
+         if c["implied"] and c["implied"] >= PREDICTION_MODE_MIN_IMPLIED_PROBABILITY],
+        key=lambda c: american_to_decimal(c["odds"]), reverse=True)[:top_n]
+
+    fallback = sorted(priced, key=lambda c: c["prob"], reverse=True)[:top_n]
+
+    top_ev = sorted(priced, key=lambda c: c["ev"], reverse=True)[:top_n]
+
+    return {"value": value, "prediction": prediction, "fallback": fallback, "top_ev": top_ev}
+
+
 def best_pick_for_match(match, conn, bench_indices=None):
     """Return the highest-EV pick dict for a match row, or None.
 
@@ -250,10 +339,14 @@ def best_pick_for_match(match, conn, bench_indices=None):
     h_att, h_def = home_strength
     a_att, a_def = away_strength
 
-    # A host nation gets the venue edge on whichever side it's listed, since it
-    # plays its group games at home regardless of FIFA's home/away designation.
-    home_adv = HOST_HOME_ADVANTAGE if match["home"] in HOST_NATIONS else 1.0
-    away_adv = HOST_HOME_ADVANTAGE if match["away"] in HOST_NATIONS else 1.0
+    # A host nation gets the venue edge on whichever side it's listed, but ONLY for
+    # the stage(s) it's actually confirmed to be playing at home (BUG-006). Both
+    # sides also get the knockout goal-level correction (BUG-004): the model
+    # over-projects total goals in knockout play, so this scales both teams'
+    # lambda down uniformly for any non-Group stage.
+    level = knockout_goal_scale(match["stage"])
+    home_adv = host_advantage(match["home"], match["stage"]) * level
+    away_adv = host_advantage(match["away"], match["stage"]) * level
 
     r = analyse_match_wc(
         lambda_home_attack=h_att, lambda_away_attack=a_att,
@@ -305,6 +398,7 @@ def best_pick_for_match(match, conn, bench_indices=None):
         return None
 
     best = select_pick(priced)
+    best["breakdown"] = mode_breakdown(priced)
     best.update({
         "match_id": match["match_id"],
         "match_date": match["match_date"],
@@ -382,6 +476,31 @@ def main():
                       f"prediction mode -> fell back to most-likely side {p['side']} "
                       f"(model {p['prob']:.3f})")
         print("")
+
+    print("=== CANDIDATE BREAKDOWN (close calls; informational only, does not change the pick) ===")
+    for p in picks:
+        print(f"{p['home']} vs {p['away']}")
+        for label, key, rule in (
+            ("VALUE", "value", f"model probability>={VALUE_MODE_MIN_PROBABILITY:g} & EV>0"),
+            ("PREDICTION", "prediction", f"implied probability>={PREDICTION_MODE_MIN_IMPLIED_PROBABILITY:g} & highest payout"),
+            ("FALLBACK", "fallback", "highest model probability"),
+        ):
+            cands = p["breakdown"][key]
+            print(f"  {label:<10} ({rule}):")
+            if not cands:
+                print("    none")
+            for i, c in enumerate(cands, 1):
+                tag = f"  [near-miss: {' & '.join(c['excluded_by'])}]" if c.get("near_miss") else ""
+                print(f"    {i}. {c['side']:<9} odds {c['odds']:+.0f} | model {c['prob']:.3f} "
+                      f"| implied {c['implied']:.3f} | EV {c['ev']:+.1%}{tag}")
+
+        print("  TOP EV     (raw EV, no probability or guardrail filter -- why isn't this the pick?):")
+        for i, c in enumerate(p["breakdown"]["top_ev"], 1):
+            reason = why_not_value(c)
+            tag = f"  [not a value pick: {reason}]" if reason else "  [this IS a clean value candidate]"
+            print(f"    {i}. {c['side']:<9} odds {c['odds']:+.0f} | model {c['prob']:.3f} "
+                  f"| implied {c['implied']:.3f} | EV {c['ev']:+.1%}{tag}")
+    print("")
 
     print("=== SOCIAL POST ===")
     for p in picks:
