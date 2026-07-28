@@ -47,27 +47,25 @@ def run_one(conn, test_matches, shrinkage_k: float, decay: float) -> dict:
         if home_score is None or away_score is None:
             continue
 
-        league_avgs = pm.get_league_averages(conn, "Serie A", [SEASON])
-        home_ratings = pm.get_team_ratings(conn, home_id, match_date, decay=decay)
-        away_ratings = pm.get_team_ratings(conn, away_id, match_date, decay=decay)
-
+        # Routed through analyse_match() (the single entry point -- see BUG-008)
+        # rather than composing get_league_averages/get_team_ratings/estimate_lambdas
+        # by hand, so this sweep always evaluates the exact pipeline that live picks
+        # and backfills use, varying only shrinkage_k/decay.
         try:
-            lH, lA = pm.estimate_lambdas(home_ratings, away_ratings, league_avgs,
-                                          shrinkage_k=shrinkage_k)
+            result = pm.analyse_match(home_id, away_id, match_date,
+                                       home_moneyline=home_ml, away_moneyline=away_ml,
+                                       league="Serie A", conn=conn,
+                                       shrinkage_k=shrinkage_k, decay=decay)
         except Exception:
             continue
-
-        grid = pm.scoreline_grid(lH, lA)
-        probs = pm.outcome_probs(grid)
 
         actual_home_win = 1 if home_score > away_score else 0
         actual_away_win = 1 if away_score > home_score else 0
 
-        for side, p_model, ml, actual_win in [
-            ("home", probs["p_home"], home_ml, actual_home_win),
-            ("away", probs["p_away"], away_ml, actual_away_win),
+        for side, p_model, ev, ml, actual_win in [
+            ("home", result["p_home"], result["ev_home"], home_ml, actual_home_win),
+            ("away", result["p_away"], result["ev_away"], away_ml, actual_away_win),
         ]:
-            ev = pm.compute_ev(p_model, ml)
             dec = pm.american_to_decimal(ml)
 
             # calibration (all predictions regardless of EV)

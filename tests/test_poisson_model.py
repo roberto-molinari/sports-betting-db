@@ -218,6 +218,119 @@ def test_get_league_averages_empty_db_uses_fallback(conn):
     assert avgs == {"avg_home": 1.3, "avg_away": 1.1}
 
 
+def test_get_league_averages_before_date_cutoff(conn):
+    """BUG-008: a match on/after before_date must not leak into the league-average
+    baseline. Omitting before_date is the pre-fix behavior, still supported for
+    any caller that hasn't been updated to pass a cutoff."""
+    a = sports_db.ensure_soccer_team("Team A", "Serie A")
+    b = sports_db.ensure_soccer_team("Team B", "Serie A")
+    c = sports_db.ensure_soccer_team("Team C", "Serie A")
+
+    m1 = sports_db.add_soccer_match("Serie A", 2024, a, b, "2025-01-01")
+    sports_db.update_soccer_match_result(m1, 2, 0)
+    m2 = sports_db.add_soccer_match("Serie A", 2024, a, c, "2025-01-08")
+    sports_db.update_soccer_match_result(m2, 1, 1)
+    # A future match relative to the cutoff -- must not skew the average.
+    m3 = sports_db.add_soccer_match("Serie A", 2024, b, c, "2025-03-01")
+    sports_db.update_soccer_match_result(m3, 5, 5)
+
+    avgs = pm.get_league_averages(conn, league="Serie A", before_date="2025-02-01")
+    assert avgs["avg_home"] == pytest.approx(1.5)   # (2 + 1) / 2, m3 excluded
+    assert avgs["avg_away"] == pytest.approx(0.5)   # (0 + 1) / 2, m3 excluded
+
+    avgs_all = pm.get_league_averages(conn, league="Serie A")
+    assert avgs_all["avg_home"] == pytest.approx((2 + 1 + 5) / 3)
+    assert avgs_all["avg_away"] == pytest.approx((0 + 1 + 5) / 3)
+
+
+def test_get_league_averages_window_limits_to_recent_matches(conn):
+    """BUG-009: window caps the average to the N most recent qualifying matches,
+    excluding an older extreme result that would otherwise skew it."""
+    a = sports_db.ensure_soccer_team("Team A", "Serie A")
+    b = sports_db.ensure_soccer_team("Team B", "Serie A")
+    c = sports_db.ensure_soccer_team("Team C", "Serie A")
+
+    m1 = sports_db.add_soccer_match("Serie A", 2022, a, b, "2022-01-01")
+    sports_db.update_soccer_match_result(m1, 10, 0)   # old blowout -- must be excluded
+    m2 = sports_db.add_soccer_match("Serie A", 2025, a, c, "2025-01-01")
+    sports_db.update_soccer_match_result(m2, 2, 1)
+    m3 = sports_db.add_soccer_match("Serie A", 2025, b, c, "2025-01-08")
+    sports_db.update_soccer_match_result(m3, 1, 1)
+
+    avgs = pm.get_league_averages(conn, league="Serie A", window=2)
+    assert avgs["avg_home"] == pytest.approx((2 + 1) / 2)   # m1 excluded by window
+    assert avgs["avg_away"] == pytest.approx((1 + 1) / 2)
+
+    avgs_all = pm.get_league_averages(conn, league="Serie A", window=None)
+    assert avgs_all["avg_home"] == pytest.approx((10 + 2 + 1) / 3)   # unwindowed: m1 counts
+
+
+def test_get_league_averages_default_window_is_100(conn):
+    """BUG-009 (shipped default): calling with no window arg now caps to the 100
+    most recent matches, not unbounded history -- locks in the shipped default,
+    not just the window mechanism (see the test above)."""
+    from datetime import date, timedelta
+
+    a = sports_db.ensure_soccer_team("Team A", "Serie A")
+    b = sports_db.ensure_soccer_team("Team B", "Serie A")
+
+    m_old = sports_db.add_soccer_match("Serie A", 2022, a, b, "2022-01-01")
+    sports_db.update_soccer_match_result(m_old, 10, 10)   # would skew the average if included
+
+    start = date(2025, 1, 1)
+    for i in range(100):
+        match_date = (start + timedelta(days=i)).isoformat()
+        m = sports_db.add_soccer_match("Serie A", 2025, a, b, match_date)
+        sports_db.update_soccer_match_result(m, 1, 1)
+
+    avgs = pm.get_league_averages(conn, league="Serie A")   # default window, no override
+    assert avgs["avg_home"] == pytest.approx(1.0)   # only the 100 recent 1-1s count
+    assert avgs["avg_away"] == pytest.approx(1.0)
+
+
+def test_get_league_averages_decay_weights_recent_matches_more(conn):
+    """BUG-009: with decay < 1.0, more recent matches count more than older ones,
+    so the weighted average skews toward the most recent value versus a plain mean."""
+    a = sports_db.ensure_soccer_team("Team A", "Serie A")
+    b = sports_db.ensure_soccer_team("Team B", "Serie A")
+
+    m1 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-01")
+    sports_db.update_soccer_match_result(m1, 0, 0)
+    m2 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-08")
+    sports_db.update_soccer_match_result(m2, 2, 0)
+    m3 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-15")
+    sports_db.update_soccer_match_result(m3, 4, 0)   # most recent
+
+    plain = pm.get_league_averages(conn, league="Serie A", decay=1.0)
+    assert plain["avg_home"] == pytest.approx((0 + 2 + 4) / 3)
+
+    decayed = pm.get_league_averages(conn, league="Serie A", decay=0.5)
+    # most recent (4) weight 1.0, middle (2) weight 0.5, oldest (0) weight 0.25
+    expected = (1.0 * 4 + 0.5 * 2 + 0.25 * 0) / (1.0 + 0.5 + 0.25)
+    assert decayed["avg_home"] == pytest.approx(expected)
+    assert decayed["avg_home"] > plain["avg_home"]   # skews toward the recent, higher-scoring match
+
+
+def test_analyse_match_league_avg_excludes_future_matches(conn):
+    """Integration check for BUG-008: adding a later, wildly high-scoring match
+    to the DB must not change analyse_match()'s result for an earlier match."""
+    a = sports_db.ensure_soccer_team("Team A", "Serie A")
+    b = sports_db.ensure_soccer_team("Team B", "Serie A")
+    c = sports_db.ensure_soccer_team("Team C", "Serie A")
+    d = sports_db.ensure_soccer_team("Team D", "Serie A")
+
+    result_before = pm.analyse_match(a, b, match_date="2025-02-01", conn=conn)
+
+    future = sports_db.add_soccer_match("Serie A", 2024, c, d, "2025-06-01")
+    sports_db.update_soccer_match_result(future, 9, 9)
+
+    result_after = pm.analyse_match(a, b, match_date="2025-02-01", conn=conn)
+
+    assert result_after["league_avgs"] == result_before["league_avgs"]
+    assert result_after["lambda_H"] == pytest.approx(result_before["lambda_H"])
+    assert result_after["lambda_A"] == pytest.approx(result_before["lambda_A"])
+
+
 def test_get_team_ratings_weighted_average_and_cutoff(db_path, conn):
     """Seed known home results and verify the (unweighted, decay=1.0) ratings
     and the strict before-date cutoff."""

@@ -3,7 +3,8 @@ Sports Betting Database - Schema and Core Functions
 Supports Serie A (Soccer) and NHL (Hockey) with sport-specific tables.
 
 Tables:
-  soccer_teams, soccer_matches, soccer_betting_odds
+  soccer_teams, soccer_matches, soccer_betting_odds, soccer_model_predictions,
+  soccer_market_odds
   nhl_teams,    nhl_matches,    nhl_betting_odds
   soccer_wc_teams, soccer_wc_players, soccer_wc_player_stats,
   soccer_wc_matches, soccer_wc_odds, soccer_wc_team_strength, soccer_wc_picks
@@ -280,6 +281,63 @@ def init_database():
             FOREIGN KEY (team_id)  REFERENCES soccer_wc_teams(team_id)
         );
 
+        -- Model output (1X2 + O/U probabilities) for a club-league match, independent of
+        -- whether it was ever surfaced as a "pick". League-agnostic (soccer_matches already
+        -- keys club-league rows by `league`), so this covers Serie A now and any club league
+        -- added later without a schema change. `method` tags the model/version that produced
+        -- the row (e.g. 'poisson_v1') so re-runs after a model change don't get confused with
+        -- older rows for the same match.
+        CREATE TABLE IF NOT EXISTS soccer_model_predictions (
+            prediction_id   INTEGER PRIMARY KEY,
+            match_id        INTEGER NOT NULL,
+            league          TEXT NOT NULL,
+            match_date      TIMESTAMP NOT NULL,
+            generated_at    TIMESTAMP NOT NULL,
+            method          TEXT,
+            lambda_home     REAL,
+            lambda_away     REAL,
+            p_home          REAL,
+            p_draw          REAL,
+            p_away          REAL,
+            over_under_line REAL,
+            p_over          REAL,
+            p_under         REAL,
+            home_moneyline  REAL,
+            draw_moneyline  REAL,
+            away_moneyline  REAL,
+            over_odds       REAL,
+            under_odds      REAL,
+            ev_home         REAL,
+            ev_draw         REAL,
+            ev_away         REAL,
+            ev_over         REAL,
+            ev_under        REAL,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_matches(match_id)
+        );
+
+        -- 1X2 odds from an external book (sharp: Pinnacle, Betfair Exchange; soft:
+        -- Bet365), for measuring the model against a market read. `source` distinguishes
+        -- the book, `line_type` distinguishes opening vs closing. `p_*_fair` is the
+        -- devigged (overround-removed) implied probability, comparable directly against
+        -- soccer_model_predictions.p_*.
+        CREATE TABLE IF NOT EXISTS soccer_market_odds (
+            market_odds_id  INTEGER PRIMARY KEY,
+            match_id        INTEGER NOT NULL,
+            league          TEXT NOT NULL,
+            source          TEXT NOT NULL,
+            line_type       TEXT NOT NULL,
+            home_odds       REAL,
+            draw_odds       REAL,
+            away_odds       REAL,
+            p_home_fair     REAL,
+            p_draw_fair     REAL,
+            p_away_fair     REAL,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_matches(match_id),
+            CHECK (line_type IN ('opening', 'closing'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_soccer_match_date    ON soccer_matches(match_date);
         CREATE INDEX IF NOT EXISTS idx_soccer_league        ON soccer_matches(league);
         CREATE INDEX IF NOT EXISTS idx_soccer_season        ON soccer_matches(season);
@@ -303,6 +361,11 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_wc_external_xg_match ON soccer_wc_external_xg(match_id);
         CREATE INDEX IF NOT EXISTS idx_penalty_kicks_match    ON soccer_penalty_kicks(match_id);
         CREATE INDEX IF NOT EXISTS idx_extra_time_goals_match ON soccer_extra_time_goals(match_id);
+        CREATE INDEX IF NOT EXISTS idx_model_predictions_match ON soccer_model_predictions(match_id);
+        CREATE INDEX IF NOT EXISTS idx_model_predictions_league ON soccer_model_predictions(league);
+        CREATE INDEX IF NOT EXISTS idx_market_odds_match  ON soccer_market_odds(match_id);
+        CREATE INDEX IF NOT EXISTS idx_market_odds_source ON soccer_market_odds(source);
+        CREATE INDEX IF NOT EXISTS idx_market_odds_type   ON soccer_market_odds(line_type);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
@@ -532,6 +595,112 @@ def get_soccer_matches(league=None, season=None, status=None):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def clear_soccer_model_predictions(league, season, method, conn=None):
+    """Delete prior prediction rows for a league/season/method so a re-run of the
+    same backfill doesn't accumulate duplicates. season is matched via soccer_matches."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """DELETE FROM soccer_model_predictions
+               WHERE league = ? AND method = ?
+                 AND match_id IN (
+                     SELECT match_id FROM soccer_matches WHERE league = ? AND season = ?
+                 )""",
+            (league, method, league, season)
+        )
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def add_soccer_model_prediction(match_id, league, match_date, generated_at, method=None,
+                                 lambda_home=None, lambda_away=None,
+                                 p_home=None, p_draw=None, p_away=None,
+                                 over_under_line=None, p_over=None, p_under=None,
+                                 home_moneyline=None, draw_moneyline=None, away_moneyline=None,
+                                 over_odds=None, under_odds=None,
+                                 ev_home=None, ev_draw=None, ev_away=None,
+                                 ev_over=None, ev_under=None, conn=None):
+    """Insert a model-prediction row (1X2 + O/U probabilities) for a soccer match;
+    return prediction_id."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO soccer_model_predictions
+               (match_id, league, match_date, generated_at, method,
+                lambda_home, lambda_away, p_home, p_draw, p_away,
+                over_under_line, p_over, p_under,
+                home_moneyline, draw_moneyline, away_moneyline, over_odds, under_odds,
+                ev_home, ev_draw, ev_away, ev_over, ev_under)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, league, match_date, generated_at, method,
+             lambda_home, lambda_away, p_home, p_draw, p_away,
+             over_under_line, p_over, p_under,
+             home_moneyline, draw_moneyline, away_moneyline, over_odds, under_odds,
+             ev_home, ev_draw, ev_away, ev_over, ev_under)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def clear_soccer_market_odds(league, season, source, line_type, conn=None):
+    """Delete prior market-odds rows for a league/season/source/line_type so a
+    re-run of an import doesn't accumulate duplicates."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """DELETE FROM soccer_market_odds
+               WHERE league = ? AND source = ? AND line_type = ?
+                 AND match_id IN (
+                     SELECT match_id FROM soccer_matches WHERE league = ? AND season = ?
+                 )""",
+            (league, source, line_type, league, season)
+        )
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def add_soccer_market_odds(match_id, league, source, line_type,
+                            home_odds=None, draw_odds=None, away_odds=None,
+                            p_home_fair=None, p_draw_fair=None, p_away_fair=None,
+                            conn=None):
+    """Insert a market-odds row (opening or closing, devigged fair probabilities)
+    for a soccer match; return market_odds_id."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO soccer_market_odds
+               (match_id, league, source, line_type, home_odds, draw_odds, away_odds,
+                p_home_fair, p_draw_fair, p_away_fair)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, league, source, line_type, home_odds, draw_odds, away_odds,
+             p_home_fair, p_draw_fair, p_away_fair)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 # ── World Cup 2026 helpers ──────────────────────────────────────────────────────

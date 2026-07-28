@@ -48,6 +48,21 @@ RECENCY_DECAY = 1.0
 # Set to 0 to disable shrinkage.
 SHRINKAGE_K = 0
 
+# League-average window/decay (BUG-009): avg_home/avg_away are computed from
+# up to this many of the league's most recent matches (across all seasons on
+# record) instead of a flat average over full multi-year history -- so a real
+# shift in the league's scoring environment (e.g. Serie A's home-scoring edge
+# roughly halving from 2022-24 to 2024-26) is tracked instead of blended away.
+# window=100 (~10 matchdays, ~1 month of league-wide play): tested against
+# 10/20/30/40-matchday windows and a continuous decay alternative -- all
+# converge on the same result, so the smallest window that reaches the
+# plateau was chosen over a wider window or a second decay knob, for
+# simplicity. decay=1.0 (off): decay-weighting within the window tested
+# equivalent to the plain window average, not worth the added complexity.
+# window=None reverts to pre-BUG-009 behavior (all history, unwindowed).
+LEAGUE_AVG_WINDOW = 100
+LEAGUE_AVG_DECAY = 1.0
+
 # ── World Cup constants ──────────────────────────────────────────────────────
 # Baseline goals per team per international match.  Team strength lambdas are
 # normalized around this, and it scales the attack/defense combination in
@@ -101,30 +116,60 @@ def poisson_pmf(k: int, lam: float) -> float:
 # Data layer
 # ---------------------------------------------------------------------------
 
-def get_league_averages(conn, league: str = "Serie A", seasons: list = None) -> dict:
+def get_league_averages(conn, league: str = "Serie A", seasons: list = None,
+                        before_date: str = None,
+                        window: int = LEAGUE_AVG_WINDOW,
+                        decay: float = LEAGUE_AVG_DECAY) -> dict:
     """
     Return league-wide average goals per match (home and away separately).
     Used as the scaling baseline for attack/defense ratings.
+
+    before_date : if given, only matches strictly before this ISO date are
+                  averaged (same no-lookahead cutoff get_team_ratings applies).
+                  Omitting it averages over all matching rows regardless of
+                  date -- callers that need a point-in-time baseline (live
+                  picks, backtests) must pass it explicitly. See BUG-008.
+    window      : if given, only the this-many most recent qualifying matches
+                  (across all seasons) are used, instead of full history.
+    decay       : recency decay applied within that window -- the most recent
+                  match has weight 1.0, the next 'decay', then 'decay^2', etc.
+                  (same scheme get_team_ratings uses). 1.0 = plain average.
+                  Tracks a real shift in the league's scoring environment
+                  instead of blending it away; see BUG-009.
     """
     cur = conn.cursor()
+    clauses = ["league = ?", "home_score IS NOT NULL"]
+    params = [league]
     if seasons:
         placeholders = ",".join("?" * len(seasons))
-        cur.execute(f"""
-            SELECT AVG(home_score), AVG(away_score)
-            FROM soccer_matches
-            WHERE league = ? AND home_score IS NOT NULL
-              AND season IN ({placeholders})
-        """, [league] + list(seasons))
-    else:
-        cur.execute("""
-            SELECT AVG(home_score), AVG(away_score)
-            FROM soccer_matches
-            WHERE league = ? AND home_score IS NOT NULL
-        """, (league,))
-    row = cur.fetchone()
-    avg_home = row[0] or 1.3
-    avg_away = row[1] or 1.1
-    return {"avg_home": avg_home, "avg_away": avg_away}
+        clauses.append(f"season IN ({placeholders})")
+        params.extend(seasons)
+    if before_date:
+        clauses.append("match_date < ?")
+        params.append(before_date)
+
+    query = f"""
+        SELECT home_score, away_score FROM soccer_matches
+        WHERE {" AND ".join(clauses)}
+        ORDER BY match_date DESC
+    """
+    if window:
+        query += " LIMIT ?"
+        params.append(window)
+    cur.execute(query, params)
+    rows = cur.fetchall()
+
+    if not rows:
+        return {"avg_home": 1.3, "avg_away": 1.1}
+
+    total_w = total_h = total_a = 0.0
+    for k, (h, a) in enumerate(rows):
+        w = decay ** k
+        total_w += w
+        total_h += w * h
+        total_a += w * a
+
+    return {"avg_home": total_h / total_w, "avg_away": total_a / total_w}
 
 
 def get_team_ratings(conn, team_id: int, before_date: str,
@@ -370,9 +415,18 @@ def analyse_match(home_team_id: int, away_team_id: int,
                   draw_moneyline: float = None,
                   away_moneyline: float = None,
                   league: str = "Serie A",
-                  conn=None) -> dict:
+                  conn=None,
+                  shrinkage_k: float = SHRINKAGE_K,
+                  decay: float = RECENCY_DECAY,
+                  league_avg_window: int = LEAGUE_AVG_WINDOW,
+                  league_avg_decay: float = LEAGUE_AVG_DECAY) -> dict:
     """
-    Full model pipeline for a single match.
+    Full model pipeline for a single match. The single entry point for turning
+    DB state into a prediction -- every caller that needs a match's model
+    probabilities (live picks, backtests, the prediction backfill, parameter
+    sweeps) should go through this rather than re-composing get_team_ratings /
+    estimate_lambdas / scoreline_grid / outcome_probs by hand, so a fix to the
+    pipeline (e.g. BUG-008's lookahead cutoff) only has to happen once.
 
     Parameters
     ----------
@@ -382,6 +436,12 @@ def analyse_match(home_team_id: int, away_team_id: int,
                    (optional — EV skipped if None)
     league        : league filter for ratings and averages
     conn          : optional existing DB connection (created internally if None)
+    shrinkage_k   : override for estimate_lambdas' shrinkage constant (parameter sweeps vary
+                    this; defaults to the tuned module constant for normal use)
+    decay         : override for get_team_ratings' recency-decay constant (same)
+    league_avg_window, league_avg_decay : overrides for get_league_averages' rolling
+                    window/decay (BUG-009 -- tracks a shift in the league's scoring
+                    environment instead of blending it away with a flat all-history mean)
 
     Returns a dict with lambdas, probabilities, implied probs, EVs, and team ratings.
     """
@@ -390,11 +450,13 @@ def analyse_match(home_team_id: int, away_team_id: int,
         conn = sqlite3.connect(DATABASE_PATH)
 
     try:
-        league_avgs  = get_league_averages(conn, league)
-        home_ratings = get_team_ratings(conn, home_team_id, match_date, league=league)
-        away_ratings = get_team_ratings(conn, away_team_id, match_date, league=league)
+        league_avgs  = get_league_averages(conn, league, before_date=match_date,
+                                            window=league_avg_window, decay=league_avg_decay)
+        home_ratings = get_team_ratings(conn, home_team_id, match_date, league=league, decay=decay)
+        away_ratings = get_team_ratings(conn, away_team_id, match_date, league=league, decay=decay)
 
-        lambda_H, lambda_A = estimate_lambdas(home_ratings, away_ratings, league_avgs)
+        lambda_H, lambda_A = estimate_lambdas(home_ratings, away_ratings, league_avgs,
+                                               shrinkage_k=shrinkage_k)
         grid  = scoreline_grid(lambda_H, lambda_A)
         probs = outcome_probs(grid)
 
