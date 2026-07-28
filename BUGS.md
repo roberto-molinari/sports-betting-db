@@ -9,6 +9,495 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-011 — Player-level lambda model for club leagues
+
+- **Type:** enhancement (major) · **Status:** PROPOSED, not started. Logged 2026-07-27.
+  **Priority: highest** of three ideas logged together this session (user's explicit
+  ranking: FEATURE-011 > FEATURE-012 > FEATURE-013).
+
+**Problem.** Today's club-league model (`core/poisson_model.py`) computes team attack/
+defense ratings purely from that team's own recent match results (goals scored/
+conceded). Two structural weaknesses follow from that: **(1) cold start** — at the start
+of a season a team has little or no current-season history, and the roster itself may
+have changed (transfers, or for a promoted side, no top-flight history at all), so
+team-level ratings are least reliable exactly when they're most needed. **(2) lag** —
+team-level scoring stats only reflect a real change (a key player's absence, a tactical
+shift) after it's shown up across several matches worth of results; the model is
+reactive, never proactive.
+
+**Proposal.** Build a player-level lambda model — instead of, or alongside, the
+team-level one — aggregating individual player attacking/defensive contributions
+(weighted by minutes/position) into a team lambda for club matches, similar in spirit to
+how the World Cup side already builds squad-level λ from player stats
+(`compute_wc_team_strength.py`). Two direct benefits: works at season-start since it's
+built from players' established performance rather than this-team's-this-season
+results, and can react immediately to a player-availability announcement by removing
+that player's contribution at the moment it's known, rather than waiting for the gap to
+surface in team-level results.
+
+**Related, not overlapping.** FEATURE-001 already does something adjacent for the World
+Cup — a what-if diagnostic that excludes one player from an already-player-level squad
+λ. This proposal is different in kind: making player-level data the *primary*
+lambda-construction mechanism for club leagues, which have no player-level modeling at
+all today (no club-league equivalent of `soccer_wc_players`/`soccer_wc_player_stats`).
+
+**Open questions (unresolved, for scoping later).** Which player-level stats to use
+(club minutes/goals/assists, via a similar pipeline to the WC's `club_meta()`/
+TheStatsAPI pull?); how to weight position/role; whether to run fully in parallel with
+team-level and compare, or blend the two.
+
+---
+
+## FEATURE-012 — Pick/probability lineage and traceability
+
+- **Type:** enhancement / tooling · **Status:** PROPOSED, not started. Logged 2026-07-27.
+  **Priority: second** of three ideas logged together this session.
+
+**Problem.** As the model accumulates changes over time (parameter tuning, fixes like
+BUG-008/BUG-009, new features), there's no way to trace a specific historical pick or
+stored probability back to exactly which model version/constants/inputs produced it.
+Makes post-event analysis and debugging harder as the model matures — e.g. "was this
+pick's EV computed before or after the BUG-008 fix?" currently requires manually
+cross-referencing dates against this file rather than being answerable from the data.
+
+**Proposal.** Build a lineage view tracing pick → model probability → the specific
+factors/formula/constants/inputs that produced it. Some groundwork already exists
+piecemeal (`soccer_model_predictions.method` tags the model version;
+`soccer_wc_picks.selection_mode` tags which selection rule fired) but there's no unified
+view tying a pick back through every contributing factor (team ratings used, league
+averages used, shrinkage/decay constants in effect, odds snapshot used) in one place.
+
+**Related.** Would make bugs like BUG-009 easier to retroactively diagnose (e.g. "show
+every 2025-26 pick where the away-side bias plausibly changed the selected side") and
+would turn the poisson_v1/poisson_v2-style before/after comparison pattern (built ad hoc
+for BUG-008) into a reusable, general mechanism instead of a one-off script each time.
+
+**Open questions.** What granularity to store (full input snapshot per pick vs.
+reconstructible-on-demand from method + timestamp + constants-at-that-time); whether
+tunable constants (`SHRINKAGE_K`, `RECENCY_DECAY`, etc.) need their own versioned/
+timestamped table rather than living as module constants whose history only this file
+documents.
+
+---
+
+## FEATURE-013 — Incorporate additional external factors (fatigue/rest days, coaching changes, weather) — analysis first
+
+- **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-07-27.
+  **Priority: third (lowest)** of three ideas logged together this session, per user.
+
+**Problem.** Home vs. away is currently the only external/contextual factor the model
+incorporates (via separate home/away team ratings). Other, less-frequent but
+potentially impactful factors are entirely absent: fixture congestion/rest days between
+matches (e.g. 3 days' rest vs. 6), recent coaching changes (a "new manager bounce" is a
+commonly cited effect), weather, etc.
+
+**Proposal (deliberately staged).** Before building any data collection or model
+change, run an analysis on Serie A's last few seasons to check whether these factors
+actually correlate with results in a way the model would benefit from — don't invest in
+collecting/integrating a factor without first confirming a real trend exists. Only build
+the data-collection + model-integration work for factors that show a genuine, non-noise
+effect.
+
+**Note.** Same "verify before building" discipline already used elsewhere in this
+project — see `HYPOTHESES.md`'s away-heavy-underdog investigation, which was tested and
+found **false** rather than assumed true.
+
+---
+
+## BUG-009 — Model systematically undervalues home teams / overvalues away teams (confirmed via CLV + ROI; one contributing cause found + partially fixed, residual bias still open)
+
+- **Severity:** high (touches every match, every season; a material driver of negative
+  backtest ROI, not a cosmetic calibration footnote) · **Status:** OPEN. Goal agreed
+  2026-07-27. One contributing cause confirmed and partially fixed 2026-07-27 (stale
+  league-average baseline, ~35-40% of the signed bias); a real residual bias remains --
+  root cause of the rest not yet investigated (next candidate: `SHRINKAGE_K`).
+
+**Finding.** Comparing the model's 1X2 probabilities (`soccer_model_predictions`,
+`poisson_v2`) against sharp closing lines (Pinnacle, Betfair Exchange) and a soft book
+(Bet365), at both opening and closing, across three full Serie A seasons (2023-24,
+2024-25, 2025-26 -- `soccer_market_odds`, `compare_model_vs_market_odds.py`): the model
+shows a consistent, same-direction bias in 2024-25 and 2025-26 -- mean signed diff on
+home win probability is negative (model reads home teams as less likely to win than the
+market, roughly -0.035 to -0.05 depending on season/source) and positive on away
+(roughly +0.04 to +0.05). Present at **both** opening and closing lines (near-identical
+numbers) and consistent across **both** sharp and soft books -- so it isn't a
+late-line-movement artifact or one book's pricing quirk.
+
+**Confirmed costly, not just a calibration curiosity.** Full-season backtest ROI
+(`backtest.py`, all bets clearing EV threshold) is negative in all three seasons
+(-15.1% / -12.7% / -5.2% at EV>0%) and does **not** improve monotonically as the EV
+threshold is raised (2024: -12.7% → -14.9% → -14.6% at 0/5/10%) -- the miscalibration
+isn't confined to the low-confidence tail, it's present in the model's most confident
+bets too. By-side breakdown: away bets are the single worst-performing bucket in most
+seasons (2023: -33.2% ROI on 164 away bets), consistent with the model overvaluing away
+win probability and generating false-positive-EV away bets.
+
+**Goal (agreed 2026-07-27).** Not "match the market exactly" -- a model that exactly
+reproduces market probability has zero edge by construction, and some model/closing gap
+is structurally irreducible (closing lines price in late information -- injury/lineup/
+money -- the model can't have at generation time). The target is the **signed** bias
+specifically, not raw distance: get mean signed diff on home and away to within roughly
+±0.01-0.02 of zero, leaving the unbiased/idiosyncratic spread alone (that's where
+genuine edge, if any, should come from). Full-season ROI is the validation check for
+this goal over a multi-season horizon, not the tuning target itself -- ROI is noisy
+(raising the EV threshold didn't reliably move it here), a lesson already learned once
+in this log (see the knockout-ROI **WATCH** entry's "coin flip" finding).
+
+**Diagnosis #1, confirmed: stale league-average baseline (partial cause).**
+`get_league_averages()`'s `avg_home`/`avg_away` blended all history with no recency
+weighting (DESIGN-002), and `avg_home` enters `estimate_lambdas()` as a bare divisor
+(`lambda_H = h_att * (a_def / avg_h)`) that -- with `SHRINKAGE_K` at 0, i.e. shrinkage
+fully disabled -- was one of the only live channels through which the league average
+affected a prediction. Confirmed directly: per-season `avg_home - avg_away` (the
+league's home-scoring edge) is ~0.257-0.258 in 2022-23 and ~0.118-0.126 in 2024-25 --
+home advantage genuinely roughly halved -- while the old unweighted all-history blend
+sat at 0.190, overstating today's home advantage by ~0.06-0.07 goals of edge.
+
+**Fix shipped 2026-07-27 (partial).** `get_league_averages()` gained `window`/`decay`
+params (see `core/poisson_model.py`); `analyse_match()` exposes them as
+`league_avg_window`/`league_avg_decay` overrides, same single-entry-point pattern as
+BUG-008's fix. Tested window sizes (10/20/30/40 matchdays, ~100-400 matches) and decay
+values directly against the signed-bias metric on 2025-26 vs. Betfair closing: **all
+converge on the same plateau** (signed home ≈ -0.025, signed away ≈ +0.031) regardless
+of whether a short window, a long window, or continuous decay is used -- confirming this
+mechanism has a hard ceiling, not a tuning problem. Shipped the simplest option that
+reaches the plateau: `LEAGUE_AVG_WINDOW = 100` (~10 matchdays), `LEAGUE_AVG_DECAY = 1.0`
+(off -- adds no benefit over the window alone). New model version `poisson_v3`,
+backfilled to `soccer_model_predictions` for all three seasons. Tests: `test_get_league_
+averages_window_limits_to_recent_matches`, `test_get_league_averages_default_window_is_
+100`, `test_get_league_averages_decay_weights_recent_matches_more` (`tests/test_poisson_
+model.py`).
+
+**Result, validated across all seasons/books, not just the diagnosis slice:**
+
+| | signed home | signed away | favored agree |
+|---|---|---|---|
+| 2023 vs Pinnacle | +0.0109 → +0.0093 | +0.0074 → +0.0064 | 78.2% → 77.9% |
+| 2024 vs Pinnacle | -0.0353 → -0.0175 | +0.0520 → +0.0374 | 74.5% → 77.4% |
+| 2024 vs Betfair | -0.0361 → -0.0183 | +0.0531 → +0.0385 | 73.9% → 76.8% |
+| 2025 vs Betfair | -0.0423 → -0.0252 | +0.0396 → +0.0309 | 70.2% → 73.8% |
+
+Full-season backtest ROI (validation check, not the tuning target): 2023 -15.1% →
+-9.1%, 2024 -12.7% → -12.3% (barely moved), 2025 -5.2% → -3.9%. Still negative
+everywhere, consistent with a partial fix -- no surprises between the CLV and ROI reads.
+
+**Still open.** A real residual bias remains (~-0.02 to -0.03 signed home, ~+0.03-0.04
+signed away in 2024/2025), well outside the ±0.01-0.02 target. 2023 was already
+near-zero before this fix and stayed there -- worth noting the bias may not be uniform
+across seasons/eras, another thread to pull on. Next candidate per the original approach
+list: `SHRINKAGE_K` (currently 0, fully disabled) tested against this same signed-bias
+metric; team-tier segmentation after that if needed.
+
+---
+
+## DESIGN-002 — League-average baseline blends all prior seasons equally, with no season-scoping or recency weighting
+
+- **Status:** OPEN, not yet decided. Logged 2026-07-27, surfaced while deciding whether
+  `param_sweep.py` should route through `analyse_match()` (BUG-008 follow-up: promoting
+  `shrinkage_k`/`decay` to overrides on the single entry point).
+
+**The scenario, not just the code.** Imagine Serie A's scoring environment genuinely shifts
+over a few years — say a stricter (or looser) offside/VAR interpretation phases in, or the
+league's competitive balance changes because the promoted-from-Serie-B teams in one season are
+weaker defensively than in another. League-wide average goals/game drifts as a result — this
+kind of drift is a real, observed pattern in most soccer leagues over multi-year windows, not a
+hypothetical. Right now `get_league_averages()` (via `analyse_match()`) computes its baseline
+from **every** prior match in the league, with no season boundary and no weighting — a goal
+scored in 2022-23 counts exactly as much as one scored last week. If the current season's
+scoring rate has genuinely moved away from the 2022-24 average, the baseline lags that shift.
+
+**Why it concentrates in exactly the matches where it matters most.** Team-level ratings use
+shrinkage (`_shrink`) that falls back hard to the league-average baseline when a team has few
+same-season games — which is precisely true for **every team, every season, in the first few
+matchdays**. So a stale multi-season baseline has its largest effect exactly when the model is
+already leaning most heavily on it: the opening weeks of each season, before current-season
+form has accumulated enough to dominate the shrinkage-weighted rating. A season-wide scoring
+drift would show up there as a systematic, one-directional bias in early-season Over/Under and
+moneyline probabilities (e.g. persistently over- or under-predicting total goals) that
+gradually self-corrects as the season's own match count grows — a pattern that would be easy to
+miss match-by-match but should be visible in aggregate calibration checks restricted to
+early-season windows.
+
+**Two candidate fixes, each with a real cost — not yet chosen.**
+1. **Hard season-scoping** (baseline = current season only, or current + last N seasons).
+   Removes the stale-environment risk directly, but makes the *cold-start* problem worse for
+   **every** season's opening weeks, not just the first one — the same issue already true for
+   2022 (the earliest season on record, with zero prior history) would recur every August: with
+   less same-season data to fall back on, shrinkage would default toward the hardcoded 1.3/1.1
+   constants more often, which is arguably a worse approximation than a slightly-stale
+   multi-season blend.
+2. **Recency-weighted blend across season boundaries** (user's suggestion) — decay older
+   seasons' contribution to the baseline the same way `RECENCY_DECAY` already decays older
+   matches *within* a team's rating history, rather than a hard cutoff. Avoids the cold-start
+   cliff of option 1, but adds a new tunable constant and more surface area, and doesn't fully
+   solve cold-start either (a brand-new season still has zero same-season weight at kickoff).
+
+**Not fixed.** Deliberately left as the status quo (uniform blend, no scoping) for now — see
+BUG-008's fix for why: this affects `analyse_match()` directly, the shared entry point every
+caller (live picks, backfills, `param_sweep.py`) now goes through, so whichever way this is
+decided should apply uniformly rather than as a caller-specific override.
+
+---
+
+## BUG-008 — `get_league_averages()` has no date cutoff: league-average baseline leaks future-season data into historical backfills — **FIXED 2026-07-26**
+
+- **Severity:** low-medium (systematic but likely small; invisible during live single-season
+  pick generation, only surfaces when the model is run retroactively against a DB that already
+  holds later seasons) · **Status:** FIXED 2026-07-26.
+
+**Symptom.** `analyse_match()` calls `get_league_averages(conn, league)` with no `seasons`
+argument, so it defaults to averaging home/away goals over **every** `soccer_matches` row for
+that league currently in the DB — no `match_date <` cutoff. `get_team_ratings()` correctly
+restricts to matches strictly before the match being analyzed, but the league-average scaling
+baseline does not. During normal WC live use this was invisible (no future-season data existed
+yet in the DB). It becomes a real lookahead leak once the DB holds multiple completed seasons
+and the model is run retroactively: predicting an August 2025 fixture pulls in goal-scoring
+data from as late as May 2026.
+
+**Confirmed while backfilling.** The just-shipped `soccer_model_predictions` backfill for
+Serie A 2025-26 (380 rows, see `backfill_soccer_model_predictions.py`) used this same
+unfiltered league average for every match, including the season-opening fixtures — so those
+probabilities blend "what was knowable at the time" (team ratings, correctly cutoff) with "the
+full-season average including future results" (league baseline, not cutoff). Likely a small
+numeric effect season-to-season (league scoring rates are fairly stable), but it's a genuine,
+quantifiable bias, not a hypothetical one.
+
+**Scope if the backfill is extended to 2022/2023/2024.** Same defect applies to any season
+backfilled while later seasons already sit in the DB, and compounds as more seasons accumulate
+— a 2022 backfill run today would average in 2023/2024/2025 results too, none of which existed
+yet in August 2022.
+
+**Fix.** Added an optional `before_date` parameter to `get_league_averages()` (same
+`match_date <` semantics `get_team_ratings()` already used) and wired `analyse_match()` to
+always pass its own `match_date` through. Backward compatible — omitting `before_date` keeps
+the old unfiltered behavior for any caller not yet updated. `backtest.py` goes through
+`analyse_match()` so it's fixed for free.
+
+**`param_sweep.py` follow-up — fixed by routing through `analyse_match()`, not by patching its
+own call (2026-07-27).** It had the same leak independently (`get_league_averages()` called
+directly with an un-cutoff `[SEASON]`-scoped call, bypassing `analyse_match()` entirely) because
+it needed to vary `shrinkage_k`/`decay` per sweep iteration, which `analyse_match()` didn't
+expose. Rather than patch that one call site (leaving two independent implementations of the
+same pipeline, which is how this bug existed in two places to begin with), `analyse_match()`
+gained optional `shrinkage_k`/`decay` override params (default to the existing module constants
+— zero behavior change for every other caller) and `param_sweep.py`'s `run_one()` was rewritten
+to call `analyse_match()` directly, consuming its returned `p_home`/`p_away`/`ev_home`/`ev_away`
+instead of re-deriving them from `estimate_lambdas`/`scoreline_grid`/`outcome_probs` by hand.
+This also drops the season-2025-only restriction on the league-average baseline during
+tuning — see **DESIGN-002** for why blending prior seasons (matching what live picks/backfills
+already do) was chosen over preserving that restriction, and for the open question of whether
+the baseline should be season-scoped or recency-weighted at all.
+
+**Re-running the sweep post-fix changes the ranking.** With the same test split (152 matches,
+season 2025, 40% holdout), the currently-live constants (`SHRINKAGE_K=0`, `RECENCY_DECAY=1.0`)
+now rank below the new top combo: `k=2, decay=0.95` → +25.4% ROI / 5.8% calib. MAE vs. the
+live combo's +19.0% / 6.6%. Not acted on — updating the live constants is a separate decision
+from fixing the measurement pipeline, and wasn't requested.
+
+**Tests.** `tests/test_poisson_model.py`: `test_get_league_averages_before_date_cutoff`
+(unit, proves the cutoff and that omitting it reproduces the old behavior) and
+`test_analyse_match_league_avg_excludes_future_matches` (integration, proves a later
+high-scoring match added to the DB doesn't change an earlier match's `analyse_match()` result).
+
+**Quantified impact (Serie A 2025-26, 380 matches, `poisson_v1` vs `poisson_v2`).** Small, as
+expected — the leak here is only within a single season (2025-26 is the newest season in the
+DB, so `poisson_v1`'s baseline included the same season's own later-in-season results, not a
+whole extra season): mean abs diff `p_home` 0.0025, `p_draw` 0.0011, `p_away` 0.0018, `p_over`
+0.0024 (max diffs all < 0.012). EV shifts a bit more (mean abs diff ~0.006-0.007, max ~0.04)
+since it amplifies small probability changes against fixed odds. **Practical effect: the
+model-favored side changed on 2/380 matches**, and **an EV sign flipped on 2/380** (both
+`ev_away`, both crossing from slightly negative to slightly positive — Juventus/Parma
+2025-08-24 and Cagliari/Milan 2026-01-02; neither was ever an actual stored pick, since Serie A
+has no picks table, see the note above this bug). No `ev_home` sign flips. Confirms the bug was
+real but low-severity for a single-season backfill; the concern flagged above — that it
+compounds across multiple accumulated seasons — is still open for the 2023-24/2024-25 backfill,
+which will be diffed the same way once run.
+
+---
+
+## WATCH — Knockout ROI shortfall: selection-threshold backtest + variance decomposition
+
+- **Type:** analysis / watch, no action · **Status:** OPEN, revisit post-tournament with the
+  full sample. Prompted 2026-07-08 by the observation that R16 ROI is still slightly negative
+  (-0.9%, 8 picks) even after FEATURE-009's two-step modes replaced R32's plain-best-EV legacy
+  selection (R32 -15.7%, though the direct comparison is muddied since R32 never actually ran
+  the two-step framework).
+
+**Backtest 1 — prediction-mode floor (`PREDICTION_MODE_MIN_IMPLIED_PROBABILITY`, B2), swept
+50/55/60/65/70% against R32+R16 (24 games), B1 held at 60%.** Smooth, monotonic: 60% is at or
+near the best setting tested (combined ROI +28.2% vs +12.4%/+1.0% at 50/55%, +24.1%/+22.9% at
+65/70%). Mechanism: lowering B2 lets prediction mode reach for progressively more marginal
+("barely favored," near-50%-implied) candidates, which pay better but are less reliable —
+in this sample, more of those reaches lost than won. **No change indicated.**
+
+**Backtest 2 — value-mode floor (`VALUE_MODE_MIN_PROBABILITY`, B1), same sweep, B2 held at
+60%.** Less clean. Combined R32+R16 is non-monotonic (a dip at 55%), but **R16 alone is
+genuinely monotonic** (60%→-0.9%, 55%→+6.3%, 50%→+18.7% ROI) — the only period the two-step
+framework has actually been live, so it's a real test, not a hypothetical retrofit onto R32's
+legacy picks. Traced to source: the entire R16 curve is produced by exactly **4 game-level
+swaps** — Mexico/England and Portugal/Spain flip at the 55% step (net +0.58u, one is a wash),
+then Paraguay/France (**+2.32u**, a real winner previously excluded from value mode by the
+model-probability floor alone — the model's own EV read was correct, but 53.6% < 60% forced
+a fall-through to prediction mode, which grabbed the wrong side) and Argentina/Egypt
+(**-1.33u**, the opposite: a winner-under-prediction that turns into a loser-under-value) flip
+at the 50% step. Two large, opposite-signed swings netting positive twice in a row is not
+strong independent evidence — it's closer to a coin flip landing the same way twice.
+
+**Why no change was made despite the monotonic R16 shape — tested directly, not just
+reasoned about.** Decomposed the knockout total-goals gap into "model vs FIFA's own
+real-time xG" (the addressable part, if our process-read were off) vs. "FIFA xG vs actual"
+(the unavoidable part — pure in-game variance), using `soccer_wc_external_xg`:
+```
+              model vs actual   model vs FIFA xG   FIFA xG vs actual
+R32 (16 gm)      MAE 0.61            MAE 0.66            MAE 0.54
+R16 (8 gm)       MAE 1.62            MAE 0.78            MAE 1.48
+```
+The model's read of the underlying process (vs. FIFA's own measured xG) barely degrades from
+R32 to R16 (0.66 → 0.78) — **the model itself hasn't gotten worse.** What blows up is
+actual-score volatility: **even FIFA's own shot-by-shot, real-time xG measurement misses the
+final score by MAE 1.48** in R16 — nearly as badly as the model misses it (1.62). If the best
+possible in-game process measurement can't predict the scoreline much better than we can,
+no selection-threshold tweak reaches that gap; it isn't sitting in "which candidate we picked,"
+it's sitting in the games themselves. Compounding this for R16 specifically: 5 of 8 picks were
+on the to-advance market (not totals, so a different variance channel — who wins the tie, not
+goal count), and one of those five (Switzerland/Colombia) was decided by a **penalty
+shootout** — about as close to a structural coin flip as the sport has.
+
+**Conclusion: hold both floors at 60% through the semifinal.** Not just "sample too small" —
+the FIFA-xG decomposition is independent evidence that the R16 shortfall looks like inherent
+knockout-stage variance (including a shootout), not a fixable systematic bias to tune toward.
+Revisit with the full tournament sample (ideally next tournament's early rounds too) post-2026;
+Paraguay/France is worth a specific look then as the one concrete "model was right, floor
+excluded it" case.
+
+---
+
+## BUG-007 — FC Bayern München players pulled from DFB Pokal (cup) instead of Bundesliga — **FIXED 2026-07-08**
+
+- **Severity:** high (16 players across 10 national teams, including 2 live QF teams) ·
+  **Status:** FIXED 2026-07-08. Discovered during the Haaland/Norway attack-dilution analysis
+  when the user's own Google check of Harry Kane's Bundesliga minutes (~2300) didn't match the
+  ~537 minutes stored in the DB.
+
+**Root cause (confirmed live against TheStatsAPI).** `import_wc_player_stats.py`'s `club_meta()`
+trusts each club's `primary_competition` field to pick which league to pull season stats from.
+For FC Bayern München specifically (`api_club_id tm_98299`), TheStatsAPI's `teams/tm_98299`
+endpoint incorrectly returns **DFB Pokal** (`comp_3620`, the German Cup) as the primary
+competition instead of **Bundesliga** (`comp_4643`) — verified by checking Borussia Dortmund
+and RB Leipzig (`tm_51366` etc.), both of which correctly return Bundesliga. This is an
+upstream data error specific to Bayern's team profile in the API, not a bug in our import
+logic (which reasonably trusts the field). Every Bayern player in every WC squad silently got
+a tiny-sample cup stat line instead of a near-full domestic season.
+
+**Affected players (16, across 10 national teams) — old (wrong) vs. new (correct Bundesliga,
+season `sn_5789634`) minutes/goals/assists:**
+```
+Player               Team          OLD min/g/a        NEW min/g/a
+Konrad Laimer         Austria       373 / 0 / 0        1997 / 3 / 9
+Alphonso Davies       Canada        105 / 0 / 0        534 / 1 / 3
+Luis Díaz             Colombia      538 / 3 / 2        2450 / 15 / 14
+Josip Stanišić        Croatia       437 / 0 / 1        1855 / 2 / 3
+Harry Kane            England       537 / 10 / 0       2382 / 36 / 5
+Dayot Upamecano       France        450 / 0 / 0        1797 / 1 / 1
+Michael Olise         France        522 / 2 / 1        2317 / 15 / 19
+Aleksandar Pavlović   Germany       448 / 0 / 0        1461 / 3 / 1
+Jamal Musiala         Germany       181 / 0 / 1        685 / 3 / 4
+Jonathan Tah          Germany       540 / 0 / 0        2024 / 2 / 1
+Joshua Kimmich        Germany       540 / 0 / 2        2280 / 2 / 8
+Leon Goretzka         Germany       120 / 0 / 1        1954 / 5 / 3
+Manuel Neuer          Germany       270 / 0 / 0        1860 / 0 / 0
+Hiroki Ito            Japan         13 / 0 / 0         932 / 1 / 2
+Nicolas Jackson       Senegal       8 / 0 / 0           1037 / 8 / 1
+Kim Min-jae           South Korea   111 / 0 / 0        1622 / 1 / 1
+```
+`club_league` for all 16 also corrected from "DFB Pokal" (league_factor 0.95) to "Bundesliga"
+(0.97) — a minor secondary effect versus the minutes/goals correction. Defense-side fields
+(`club_xga_per90`/`club_ga_per90`) were already NULL for all 16 (not populated at all, not
+just wrong), so this fix is attack-side only; left out of scope rather than expanding the fix
+unprompted.
+
+**Directly relevant to two live QF teams: England (Kane) and France (Upamecano, Olise).**
+Also affects Austria/Canada/Colombia/Croatia/Germany/Japan/Senegal/South Korea, all already
+eliminated — corrected for data-integrity/postmortem accuracy, not because it changes any
+live pick.
+
+**Fix applied (attack side, v13):** `soccer_wc_player_stats` rows updated in place with the
+correct values (a factual data correction, not a modeling choice — no "old version" preserved
+at this layer, but the wrong values are fully documented above). `soccer_wc_team_strength` is
+versioned (no unique constraint on `team_id`; every `--persist` inserts rather than
+overwrites), so a new version was persisted on top of the existing v1–v12 history — **all
+prior versions remain queryable** for a postmortem comparison of old- vs. new-data-based λ.
+Because the model normalizes attack values across the whole 48-team field, persisting after
+this fix produced a new version row for all 48 teams, not just the 16 players'/10 teams'
+directly affected — expected, and the other teams' λ shift is negligible.
+
+**Completion (defense side, v14) — `club_ga_per90` was ALSO silently null for all 16 Bayern
+players, same root cause.** `club_defense()` fetches team-level stats via
+`teams/{api_club_id}/stats` using whatever `season_id` `club_meta()` resolved — the broken
+DFB-Pokal season for Bayern. Confirmed live: `teams/tm_98299/stats` under the DFB-Pokal
+season returns **no data at all** (`None`), while under the correct Bundesliga season it
+returns `matches_played=34, goals_against=36`. So Bayern's defenders/GK weren't just missing
+attack signal — their defense signal was silently **zero-weighted** (null, not wrong-but-present)
+in every team's aggregate. Backfilled `club_ga_per90 = 36/34 = 1.0588` for all 16 players and
+persisted **v14** ("backfilled Bayern Munich players' club_ga_per90 (BUG-007 completion)").
+Effect on the one live QF team this touches (Dayot Upamecano, France defender): France DEF
+1.0651 → 1.0626 — negligible, since one moderate (near-team-average) defensive data point
+added to an otherwise-full squad aggregate barely moves the mean. `club_xga_per90` remains
+null for every player tournament-wide — that's the separate, deliberate DESIGN-001 gap (no
+real xG-based defense metric was ever built), not part of this bug.
+
+---
+
+## FEATURE-008 (extension) — Official FIFA xG as a second external source — **SHIPPED 2026-07-07**
+
+- **Type:** feature / analysis · **Status:** SHIPPED 2026-07-07. Requested by user, who
+  pointed to FIFA's own match-report hub as a more authoritative xG source than
+  TheStatsAPI.
+
+**What it does.** `import_wc_fifa_xg.py` scrapes FIFA's two match-report hub pages
+(group + knockout stage), downloads each match's official "Post Match Summary Report"
+PDF, and extracts team-level xG from the "Match Summary - Key Statistics" page (found
+via search, not a hardcoded page index) using `pdfplumber`. Stored in the SAME
+`soccer_wc_external_xg` table as the TheStatsAPI pull, keyed by `source='fifa_official'`
+— no schema change, the two sources sit side by side per match. Same hard constraint as
+the original FEATURE-008: never mixed with the model's own xG or any core-workflow
+table. **Live run 2026-07-07: 94/94 matched and stored** (all finished matches to date;
+no `--scope survivors` restriction here since the hub pages only ever list finished
+matches anyway).
+
+**Two real bugs caught and fixed during the live run, not just theoretical:**
+1. Team-name spelling mismatches (Korea Republic, IR Iran, Czech Republic, Ivory Coast,
+   Bosnia and Herzegovina, Cabo Verde, Congo DR, Türkiye/Turkey) — `FIFA_TEAM_ALIASES`.
+2. **FIFA's page-1 score is the extra-time-INCLUSIVE final score for a tie decided in
+   ET, not the bare 90' score** (penalties aren't goals, so a shootout-decided tie's
+   page 1 still shows the 90' score — only ET differs). Caught live: Belgium 2-2
+   Senegal (ET winner 3-2) reported as "Belgium 3 - 2 Senegal", which tripped the
+   score-sanity-check against our stored 90' score (2-2) until `final_score()` was
+   added to compare against `extra_time_home_score`/`extra_time_away_score` when
+   present. A test (`test_scores_agree_uses_extra_time_inclusive_score`) locks this in.
+
+**Implementation.** Filenames on the hub pages are NOT a reliable naming pattern
+(separators vary space/hyphen, revised reports carry a `-V2`/`POST-V2` suffix) so team/
+date/score identity comes entirely from each PDF's own text (page 1), never guessed
+from the filename. Matching is by unordered team-pair (FIFA's listed order doesn't
+necessarily match our nominal home/away for a neutral-venue game), same pattern as
+`import_wc_match_xg.py`. New dependency: `pdfplumber` (not yet in a formal
+requirements file — this repo has none; installed ad hoc). 18 new tests in
+`tests/test_import_wc_fifa_xg.py` covering all the pure parsing/matching/scoring logic;
+the hub-scraping + PDF-download path is untested by design (same convention as this
+repo's other live-network import scripts).
+
+**Bonus deliverable.** `FIFA_MATCH_REPORT_DATA_SURVEY.md` catalogs everything else in
+these reports beyond xG (per-player passing networks, pressing maps, physical data,
+goalkeeping detail, etc.) — not implemented, just scoped for later. Flags that almost
+all of it is **national-team, per-match data**, which is the direct answer to the
+club-stats-don't-transfer problem behind DESIGN-001/BUG-001/BUG-005, and that the
+Phases-of-Play / Defensive-Pressure sections could quantify team "style" (press vs
+block, transition-heavy vs possession-heavy) — a dimension the Poisson model has no
+concept of today.
+
+---
+
 ## FEATURE-010 — Per-match "close calls" candidate breakdown — **SHIPPED 2026-07-06**
 
 - **Type:** diagnostic / visibility · **Status:** SHIPPED 2026-07-06. Requested by user
@@ -237,6 +726,14 @@ by more than a little per bet. Live evidence (2026-06-26, all stored vs realized
 **Note.** The override tracker already captures real `user_odds`, so scrutinized/overridden picks
 are honest today; this feature generalizes that to *all* picks and to a pre-post refresh.
 
+**Update 2026-07-08 — QF backlog review; confirmed BACKLOG, post-tournament.** Directly
+demonstrated this session: a Switzerland/Colombia totals quote was entered by overwriting the
+existing Bovada row in place (rather than capturing it as a separate realized-line snapshot),
+which silently lost the original 2.0 line and corrupted a downstream backtest until caught and
+fixed by hand. Real evidence the gap this feature closes is live, not theoretical. **Decision
+(user): leave as-is for the remainder of this tournament** — build after the World Cup
+completes, not mid-tournament.
+
 ---
 
 ## ROI-STALENESS — Stored odds go stale; reported ROI is an optimistic ceiling (CLV)
@@ -293,6 +790,13 @@ are robust** — they route through the goal *sum*, not the win-split, and the B
 on Egypt's pinned rating; hand-overridden to the model's own #2, **Over 2 −108 (+16.3%)** — logged
 as override #5 [robustness]. This rule would surface that pick **through the model** instead of by
 hand, exactly as the v8 Egypt pin already self-demoted the NZ moneyline (see BUG-005).
+
+**Update 2026-07-08 — QF backlog review; confirmed leave as-is.** Belgium is now the only
+fully FIFA-pinned team left alive (Mexico, Egypt eliminated) — Spain/Belgium is the sole match
+this would touch, and if built it would specifically exclude a Spain ML (and draw) pick,
+leaving only Belgium ML or totals eligible. **Decision (user): leave as-is, re-evaluate at the
+start of a future tournament** — consistent with the 2026-07-06 lowered-priority call, not
+worth building for one remaining match.
 
 **Scope (checked against the code 2026-06-26 — relatively easy, ~40–60 lines + 1–2 tests, no
 schema change / no migration).**
@@ -401,8 +905,11 @@ then, handle case-by-case via tagged `motivation` overrides (don't hand-fade sil
 
 ## FEATURE-003 — Price every posted O/U total line, not just the stored one
 
-- **Type:** feature · **Status:** QUEUED — **build first** (ahead of FEATURE-002), target
-  2026-06-24/25. Confirmed with user 2026-06-23.
+- **Type:** feature · **Status:** BACKLOG — **post-tournament**. Originally QUEUED
+  ("build first", target 2026-06-24/25) but never actually built; superseded in practice by
+  manual ladder pricing on request all tournament. Re-scoped to post-World-Cup 2026-07-08
+  during a QF backlog review (no user demand for it materialized once FEATURE-002 shipped and
+  knockout odds narrowed to fewer, simpler markets).
 
 **Why.** Books post a **ladder** of total lines per game (e.g. Portugal O/U 2.5 / 3.0 / 3.5 /
 4.0, all bettable at different prices). The card prices only the **single stored line**, so
@@ -499,7 +1006,10 @@ then.
 
 ## FEATURE-001 — Player-availability "what-if" (squad λ impact of an absence)
 
-- **Type:** enhancement (not a bug) · **Status:** PROPOSED (2026-06-20) · not built
+- **Type:** enhancement (not a bug) · **Status:** BACKLOG — **post-tournament**. Originally
+  PROPOSED 2026-06-20, never built. Re-scoped to post-World-Cup 2026-07-08 during a QF backlog
+  review — no specific injury/suspension case has forced the issue since Jun 19, and building
+  a squad-availability model mid-knockout-stage carries more risk than value this late.
 - **Prompted by:** the Jun 19 USA game — USA put up only ~1.08 xG (1.43 combined) with
   **Pulisic injured**, so the Over 2.5 loss and the low total partly reflect a missing
   creator the model never accounted for.
@@ -663,6 +1173,59 @@ value edge. Persisted as v7 (`notes LIKE 'v7:%'`); v6 rows retained, revert = de
 **Still open:** w=0.2 is a calibration nudge, not a cure — it trims EV on over-rated dogs
 but does not remove them (Scotland still posted at +36% / 3★). Tune `w` against results
 over the tournament; the goals→xG metric fix (DESIGN-001) is the orthogonal other half.
+
+**Update 2026-07-08 — QF backlog review: Morocco validated, Norway investigated.**
+Per-match `model proxy / actual / FIFA xG` comparison (`knockout_pick_review.py`) across
+Morocco's and Norway's R32+R16 games:
+```
+Morocco   R32 (v Netherlands)  proxy 1.05  actual 1  FIFA xG 1.30  gap-actual +0.05  gap-FIFA -0.25
+          R16 (v Canada)       proxy 1.47  actual 3  FIFA xG 0.85  gap-actual -1.53  gap-FIFA +0.62
+Norway    R32 (v Côte d'Ivoire) proxy 1.58  actual 2  FIFA xG 2.30  gap-actual -0.42  gap-FIFA -0.72
+          R16 (v Brazil)        proxy 1.19  actual 2  FIFA xG 1.41  gap-actual -0.81  gap-FIFA -0.22
+```
+**Morocco: no adjustment worthwhile (user call).** The blend's lift looks fine against FIFA xG
+in R32 (-0.25 gap); the R16 scoreline gap is explained by the already-logged note above (the
+0-3 final overstated the real chance-quality gap per FIFA xG and the user's own viewing) —
+not a model problem. **Decision: leave as-is.**
+
+**Norway: tested the "Haaland is watered down by teammates more than other stars" theory —
+supported, but via a different channel than first stated (corrected twice, see below).**
+User's hypothesis: Norway's proxy under-shoots because Haaland is a clear outlier surrounded
+by a weaker "cluster" of teammates, dragging the team average down relative to other elite
+scorers (Messi, Mbappé, Kane) whose teams have more depth near their level. Tested against
+`compute_wc_team_strength.py`'s actual aggregation — a weighted average
+`raw_attack = Σ(weight_i × rate_i × league_factor_i^1.5) / Σ(weight_i)`, weight_i = minutes ×
+position-weight — using each star's post-shrinkage attack_rate:
+```
+                 star rate   numerator share   team raw_attack   others_avg (rest of squad)
+Haaland (NOR)      0.736        42.4%              0.261              0.177
+Mbappé  (FRA)      0.759        33.9%              0.291              0.221
+Messi   (ARG)      0.695         8.2%              0.253              0.248
+Kane    (ENG)      0.911         6.8%              0.286              0.273
+```
+(First pass mistakenly reported a "weight share" of 15%/13%/3%/2.1% — an invalid ratio, a
+league-factor-adjusted numerator-style quantity divided by an un-adjusted weight denominator
+that don't actually correspond to the same terms in the formula. **`numerator share` above is
+the corrected, meaningful figure**: exactly what fraction of the team's final goal-proxy value
+is attributable to that player's own goals, since both share the same denominator.)
+
+**Correct reading:** Haaland is NOT diluted in a credit-share sense — at 42.4% he carries the
+*largest* share of any of the four stars, well above Mbappé's 33.9% and far above Messi's/
+Kane's (8.2%/6.8%, mostly because those two rows are partial-season club samples — Messi 1243
+MLS minutes, Kane only 537 minutes labeled "DFB Pokal" rather than his full Bundesliga season,
+likely a real TheStatsAPI coverage gap worth re-pulling if this is revisited). And yet Norway's
+team number (0.261) still sits below France's (0.291) despite Haaland's bigger share — which
+is only possible because Norway's **others_avg (0.177) is the lowest of the four**, well below
+France's 0.221 and further still below Argentina's/England's 0.248/0.273. So the mechanism is
+exactly the "no second/third player close to Haaland" effect the user described — it just
+shows up as a weak supporting-cast average dragging the linear blend down, not as Haaland's own
+number being proportionally diluted (he's actually over-carrying, not under-credited). Real,
+structural property of a flat weighted-average aggregation (any team with one clear outlier and
+thin depth behind him hits this ceiling) — not noise. **Still no fix queued** — consistent with
+this tournament's standing discipline against retuning the engine mid-knockout-stage on a
+single-team finding; revisit (e.g. a depth-weighted or top-N aggregation instead of a flat
+squad average) only if a future tournament shows the same pattern across multiple thin-depth,
+one-star teams.
 
 **Blend impact tracker — is w=0.2 earning its keep?** `python blend_impact.py` re-derives
 the pick the v6 (pre-blend) strengths WOULD have made and compares to the v7 pick on every
@@ -864,6 +1427,15 @@ composed `host_advantage()` (same 9 consumers as BUG-006, plus the new
 **Applied starting 2026-07-05** (R16: Canada/Morocco, Paraguay/France) — no retroactive
 regrading of already-settled R32 picks (locked history, same convention as every other fix
 this tournament).
+
+**Update 2026-07-08 — QF backlog review; leave the 0.85 scale as-is.** Raised as a live risk
+for the Spain/Belgium QF: Belgium is the one named case (Belgium/Senegal, R32) where the flat
+0.85 knockout scale underrated a genuine high-scoring game, and Belgium has since put up 4
+goals against USA in R16 too — a plausible pattern, not just one data point. **Decision (user):
+do not special-case Belgium mid-tournament** — leave `KNOCKOUT_GOAL_SCALE` at 0.85 for the
+Spain/Belgium QF and re-evaluate whether high-scoring teams need per-team handling only after
+the tournament completes (same one-shot-fix discipline as every other engine change this
+tournament — one team's two data points isn't enough to justify a targeted correction now).
 
 ## BUG-002 — Weak-league forwards inflate attack lambda
 
