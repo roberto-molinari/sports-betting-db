@@ -5,6 +5,7 @@ Supports Serie A (Soccer) and NHL (Hockey) with sport-specific tables.
 Tables:
   soccer_teams, soccer_matches, soccer_betting_odds, soccer_model_predictions,
   soccer_market_odds
+  soccer_players, soccer_player_stats, soccer_player_team_strength  (FEATURE-011 prototype)
   nhl_teams,    nhl_matches,    nhl_betting_odds
   soccer_wc_teams, soccer_wc_players, soccer_wc_player_stats,
   soccer_wc_matches, soccer_wc_odds, soccer_wc_team_strength, soccer_wc_picks
@@ -338,6 +339,61 @@ def init_database():
             CHECK (line_type IN ('opening', 'closing'))
         );
 
+        -- FEATURE-011 prototype: player-level lambda inputs for club leagues (Serie A
+        -- first). League-agnostic like soccer_model_predictions -- keys off the existing
+        -- soccer_teams table (a club-league team IS the club, unlike soccer_wc_teams
+        -- national teams, so no separate club table is needed).
+        CREATE TABLE IF NOT EXISTS soccer_players (
+            player_id     INTEGER PRIMARY KEY,
+            team_id       INTEGER NOT NULL,
+            name          TEXT NOT NULL,
+            position      TEXT,
+            api_player_id TEXT,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (team_id) REFERENCES soccer_teams(team_id)
+        );
+
+        -- Field names deliberately match soccer_wc_player_stats so the WC aggregation
+        -- logic (compute_wc_team_strength.py) is reusable with minimal changes.
+        CREATE TABLE IF NOT EXISTS soccer_player_stats (
+            stat_id        INTEGER PRIMARY KEY,
+            player_id      INTEGER NOT NULL,
+            season         INTEGER,
+            minutes_played INTEGER,
+            xg             REAL,
+            xg_per90       REAL,
+            goals          INTEGER,
+            assists        INTEGER,
+            club_xga_per90 REAL,
+            club_ga_per90  REAL,
+            source         TEXT,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (player_id) REFERENCES soccer_players(player_id)
+        );
+
+        -- Prototype-stage strength row: keeps the pure player-aggregation lambda, the
+        -- team-level equivalent it was blended against, the resulting blend, and the
+        -- weight used -- so a prototype run is self-documenting (no need to re-derive
+        -- "what would team-level alone have said" later). No UNIQUE on team_id, same
+        -- reasoning as soccer_wc_team_strength (multiple versions over time).
+        CREATE TABLE IF NOT EXISTS soccer_player_team_strength (
+            strength_id           INTEGER PRIMARY KEY,
+            team_id                INTEGER NOT NULL,
+            league                 TEXT NOT NULL,
+            lambda_attack_player   REAL,
+            lambda_defense_player  REAL,
+            lambda_attack_team     REAL,
+            lambda_defense_team    REAL,
+            lambda_attack_blend    REAL,
+            lambda_defense_blend   REAL,
+            weight_attack          REAL,
+            weight_defense         REAL,
+            basis                  TEXT,
+            computed_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes                  TEXT,
+            FOREIGN KEY (team_id) REFERENCES soccer_teams(team_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_soccer_match_date    ON soccer_matches(match_date);
         CREATE INDEX IF NOT EXISTS idx_soccer_league        ON soccer_matches(league);
         CREATE INDEX IF NOT EXISTS idx_soccer_season        ON soccer_matches(season);
@@ -366,6 +422,10 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_market_odds_match  ON soccer_market_odds(match_id);
         CREATE INDEX IF NOT EXISTS idx_market_odds_source ON soccer_market_odds(source);
         CREATE INDEX IF NOT EXISTS idx_market_odds_type   ON soccer_market_odds(line_type);
+        CREATE INDEX IF NOT EXISTS idx_players_team          ON soccer_players(team_id);
+        CREATE INDEX IF NOT EXISTS idx_player_stats_player    ON soccer_player_stats(player_id);
+        CREATE INDEX IF NOT EXISTS idx_player_team_strength_team ON soccer_player_team_strength(team_id);
+        CREATE INDEX IF NOT EXISTS idx_player_team_strength_league ON soccer_player_team_strength(league);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
@@ -1318,6 +1378,146 @@ def get_nhl_matches(season=None, status=None):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def add_player(team_id, name, position=None, api_player_id=None, conn=None):
+    """Insert a club-league player if not already present for this team; return
+    player_id. If the player already exists, refresh position/api id (a squad
+    re-import may carry newer info). Mirrors add_wc_player's upsert-by-name shape."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT player_id FROM soccer_players WHERE team_id = ? AND name = ?",
+            (team_id, name)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_players
+                   SET position = COALESCE(?, position),
+                       api_player_id = COALESCE(?, api_player_id)
+                   WHERE player_id = ?""",
+                (position, api_player_id, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_players (team_id, name, position, api_player_id)
+               VALUES (?, ?, ?, ?)""",
+            (team_id, name, position, api_player_id)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def upsert_player_stats(player_id, season=None, minutes_played=None, xg=None,
+                        xg_per90=None, goals=None, assists=None,
+                        club_xga_per90=None, club_ga_per90=None, source=None, conn=None):
+    """Insert or update a player's stat line for a season; return stat_id.
+
+    COALESCE on update so a partial refresh doesn't wipe previously stored fields
+    (same reasoning as upsert_wc_player_stats)."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT stat_id FROM soccer_player_stats WHERE player_id = ? AND season IS ?",
+            (player_id, season)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_player_stats
+                   SET minutes_played = COALESCE(?, minutes_played),
+                       xg             = COALESCE(?, xg),
+                       xg_per90       = COALESCE(?, xg_per90),
+                       goals          = COALESCE(?, goals),
+                       assists        = COALESCE(?, assists),
+                       club_xga_per90 = COALESCE(?, club_xga_per90),
+                       club_ga_per90  = COALESCE(?, club_ga_per90),
+                       source         = COALESCE(?, source)
+                   WHERE stat_id = ?""",
+                (minutes_played, xg, xg_per90, goals, assists,
+                 club_xga_per90, club_ga_per90, source, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_player_stats
+               (player_id, season, minutes_played, xg, xg_per90, goals, assists,
+                club_xga_per90, club_ga_per90, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (player_id, season, minutes_played, xg, xg_per90, goals, assists,
+             club_xga_per90, club_ga_per90, source)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def set_player_team_strength(team_id, league, lambda_attack_player=None, lambda_defense_player=None,
+                             lambda_attack_team=None, lambda_defense_team=None,
+                             lambda_attack_blend=None, lambda_defense_blend=None,
+                             weight_attack=None, weight_defense=None, basis=None,
+                             notes=None, conn=None):
+    """Persist a new player/team/blend lambda row for a club-league team; return
+    strength_id. Always inserts (no UNIQUE on team_id) so prior runs are kept,
+    same reasoning as set_wc_team_strength."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO soccer_player_team_strength
+               (team_id, league, lambda_attack_player, lambda_defense_player,
+                lambda_attack_team, lambda_defense_team,
+                lambda_attack_blend, lambda_defense_blend,
+                weight_attack, weight_defense, basis, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (team_id, league, lambda_attack_player, lambda_defense_player,
+             lambda_attack_team, lambda_defense_team,
+             lambda_attack_blend, lambda_defense_blend,
+             weight_attack, weight_defense, basis, notes)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def get_latest_player_team_strength(team_id, conn=None):
+    """Return the most recent soccer_player_team_strength row for a team as a
+    dict, or None."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT * FROM soccer_player_team_strength
+               WHERE team_id = ?
+               ORDER BY computed_at DESC, strength_id DESC
+               LIMIT 1""",
+            (team_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 if __name__ == "__main__":

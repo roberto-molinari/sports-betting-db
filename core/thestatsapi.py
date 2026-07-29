@@ -16,10 +16,12 @@ BASE_URL = "https://api.thestatsapi.com/api/football"
 API_KEY_ENV = "THE_STATS_API_API_KEY"
 
 # Pacing is driven by the API's own rate-limit headers (X-Ratelimit-Remaining /
-# X-Ratelimit-Reset), so we don't guess a fixed throttle. The key observed in
-# practice allows only ~12 requests per 60s window (the docs claim 120/min — a
-# higher tier may lift this). The client proactively sleeps until the window
-# resets when the bucket is empty, so requests almost never get a 429.
+# X-Ratelimit-Reset), so we don't guess a fixed throttle. Confirmed live 2026-07-29
+# (direct header check, current key): limit=120/min, matching the documented Starter
+# tier — an earlier version of this comment claimed ~12/min observed in practice,
+# which did not match a live check and should not be trusted. The client
+# proactively sleeps until the window resets when the bucket is empty, so requests
+# almost never get a 429.
 MAX_RETRIES = 4            # for network/5xx errors
 MAX_RATE_WAITS = 30        # how many times to wait out a full rate-limit window
 RATE_LIMIT_BUFFER = 1.0    # seconds added after a reset to avoid edge races
