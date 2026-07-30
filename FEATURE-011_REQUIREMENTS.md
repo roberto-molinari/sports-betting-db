@@ -118,9 +118,30 @@ old head coach and the new head coach
   `FIFA_BLEND_OVERRIDES`), just re-pointed at team-level lambdas instead of FIFA rank.
 - **Weight resolution:** a per-team weight is the default. Setting a league-wide weight for
   a given component (attack or defense) overrides every team's weight for that component in
-  that league. <!-- How the default per-team weight is derived (e.g. from data-coverage
-  thresholds, mirroring MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT) is an implementation detail,
-  not resolved here. -->
+  that league.
+- **Per-team default weight formula (resolved 2026-07-30):** the default weight is driven by
+  two factors, both required for real player-level trust — data alone isn't enough if the
+  team-level number still describes the same group of players; roster change alone isn't
+  enough if we don't actually know the new players yet.
+  - **Data coverage score** — of the *current* squad's tracked minutes, what fraction belongs
+    to players with at least `MIN_MINUTES_PER_PLAYER` (900) minutes in the **most recently
+    completed season** — recency, not career totals, since a stale track record is a weak
+    signal even if it's long. This is **team-agnostic**: a summer signing's minutes at their
+    *previous* club count in full (no cross-club discount) — the whole point of tracking
+    player identity across transfers.
+  - **Roster-change score** — last season's minutes lost to departed players (specifically at
+    this team) plus incoming players' last-season minutes (wherever they played), as a
+    fraction of the team's own total minutes last season. High churn means last season's
+    team-level number describes a squad that's mostly gone.
+  - **Combine:** `player_trust = data_coverage_score * roster_change_score`, then
+    `w = 1 - player_trust` (converting to this doc's `w` convention, where `w=1` means
+    pure team-level). The product means **both factors must be meaningfully non-zero** for
+    real player-level weight — a stable, well-tracked squad stays team-level (nothing to
+    gain from the player signal), and a thin-data squad that also just churned heavily still
+    falls back toward team-level (least-bad available option, not because it's trusted).
+  - No team-level history for the prior season (e.g. backfill not run yet) → `w = 1.0`
+    (full team-level fallback), not a crash.
+  - Implemented in `compute_club_player_strength.py`: `resolve_blend_weight()`.
 
 **Reporting:** every team's basis must be visible on demand — purely player-based (`w=0`),
 purely team-based (`w=1`, e.g. insufficient player data), or a mix (`0<w<1`) — reusing the

@@ -5,7 +5,8 @@ Supports Serie A (Soccer) and NHL (Hockey) with sport-specific tables.
 Tables:
   soccer_teams, soccer_matches, soccer_betting_odds, soccer_model_predictions,
   soccer_market_odds
-  soccer_players, soccer_player_stats, soccer_player_team_strength  (FEATURE-011 prototype)
+  soccer_players, soccer_player_stats, soccer_player_match_lineups,
+  soccer_player_team_strength  (FEATURE-011)
   nhl_teams,    nhl_matches,    nhl_betting_odds
   soccer_wc_teams, soccer_wc_players, soccer_wc_player_stats,
   soccer_wc_matches, soccer_wc_odds, soccer_wc_team_strength, soccer_wc_picks
@@ -46,6 +47,10 @@ def init_database():
             halftime_away_score INTEGER,
             match_status        TEXT,
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- Kept LAST to match the migrated column order (see soccer_wc_matches note
+            -- on this same pattern). FEATURE-011: TheStatsAPI's match id, resolved by
+            -- team+date matching, so per-match player-stats/lineups calls can be made.
+            api_match_id        TEXT,
             FOREIGN KEY (home_team_id) REFERENCES soccer_teams(team_id),
             FOREIGN KEY (away_team_id) REFERENCES soccer_teams(team_id)
         );
@@ -353,12 +358,21 @@ def init_database():
             FOREIGN KEY (team_id) REFERENCES soccer_teams(team_id)
         );
 
-        -- Field names deliberately match soccer_wc_player_stats so the WC aggregation
-        -- logic (compute_wc_team_strength.py) is reusable with minimal changes.
+        -- Per-match, not per-season (FEATURE-011_REQUIREMENTS.md Persistence): a
+        -- completed season and an in-progress season are stored identically -- one row
+        -- per player per match played. Season/rolling-window totals are a query
+        -- (aggregate rows over a date range), not a separate stored format. `venue`
+        -- captures home/away per row from day one even though v1's lambda calculation
+        -- doesn't split on it yet (Scenario 4 is deferred, the DATA isn't -- see Out of
+        -- Scope for v1). Field names otherwise match soccer_wc_player_stats so the WC
+        -- aggregation logic (compute_wc_team_strength.py) is reusable with minimal
+        -- changes.
         CREATE TABLE IF NOT EXISTS soccer_player_stats (
             stat_id        INTEGER PRIMARY KEY,
             player_id      INTEGER NOT NULL,
+            match_id       INTEGER NOT NULL,
             season         INTEGER,
+            venue          TEXT,
             minutes_played INTEGER,
             xg             REAL,
             xg_per90       REAL,
@@ -368,7 +382,29 @@ def init_database():
             club_ga_per90  REAL,
             source         TEXT,
             created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (player_id) REFERENCES soccer_players(player_id)
+            FOREIGN KEY (player_id) REFERENCES soccer_players(player_id),
+            FOREIGN KEY (match_id)  REFERENCES soccer_matches(match_id),
+            CHECK (venue IN ('home', 'away') OR venue IS NULL)
+        );
+
+        -- New (FEATURE-011_REQUIREMENTS.md Persistence): real starting-lineup history,
+        -- replacing the minutes-played proxy (Scenario 0). One row per player per match.
+        -- Backfill depth intentionally differs from soccer_player_stats (1 season vs 3)
+        -- -- rosters turn over enough that older lineups aren't a useful "who starts
+        -- next" signal. Code aggregating "all per-match player data for a team" must not
+        -- assume these two tables share the same date range.
+        CREATE TABLE IF NOT EXISTS soccer_player_match_lineups (
+            lineup_id   INTEGER PRIMARY KEY,
+            player_id   INTEGER NOT NULL,
+            match_id    INTEGER NOT NULL,
+            team_id     INTEGER NOT NULL,
+            started     BOOLEAN NOT NULL,
+            position    TEXT,
+            formation   TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (player_id) REFERENCES soccer_players(player_id),
+            FOREIGN KEY (match_id)  REFERENCES soccer_matches(match_id),
+            FOREIGN KEY (team_id)   REFERENCES soccer_teams(team_id)
         );
 
         -- Prototype-stage strength row: keeps the pure player-aggregation lambda, the
@@ -426,12 +462,16 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_player_stats_player    ON soccer_player_stats(player_id);
         CREATE INDEX IF NOT EXISTS idx_player_team_strength_team ON soccer_player_team_strength(team_id);
         CREATE INDEX IF NOT EXISTS idx_player_team_strength_league ON soccer_player_team_strength(league);
+        CREATE INDEX IF NOT EXISTS idx_player_lineups_player  ON soccer_player_match_lineups(player_id);
+        CREATE INDEX IF NOT EXISTS idx_player_lineups_match   ON soccer_player_match_lineups(match_id);
+        CREATE INDEX IF NOT EXISTS idx_player_lineups_team    ON soccer_player_match_lineups(team_id);
     ''')
 
     ensure_soccer_betting_odds_schema(conn)
     ensure_wc_team_strength_schema(conn)
     ensure_wc_advance_schema(conn)
     ensure_wc_picks_schema(conn)
+    ensure_player_stats_match_schema(conn)
 
     conn.commit()
     conn.close()
@@ -519,6 +559,43 @@ def ensure_soccer_betting_odds_schema(conn=None):
 
         if "draw_moneyline" not in existing_columns:
             cur.execute("ALTER TABLE soccer_betting_odds ADD COLUMN draw_moneyline REAL")
+
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def ensure_player_stats_match_schema(conn=None):
+    """Add match_id/venue to soccer_player_stats and api_match_id to soccer_matches on
+    older databases (FEATURE-011's move from per-season to per-match player stats).
+
+    Existing rows from the season-total prototype are left in place with match_id/venue
+    NULL -- they predate this schema and are superseded by re-running the per-match
+    import, not migrated in place."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+
+        cur.execute("PRAGMA table_info(soccer_player_stats)")
+        existing = {row[1] for row in cur.fetchall()}
+        if "match_id" not in existing:
+            cur.execute("ALTER TABLE soccer_player_stats ADD COLUMN match_id INTEGER")
+        if "venue" not in existing:
+            cur.execute("ALTER TABLE soccer_player_stats ADD COLUMN venue TEXT")
+
+        cur.execute("PRAGMA table_info(soccer_matches)")
+        existing = {row[1] for row in cur.fetchall()}
+        if "api_match_id" not in existing:
+            cur.execute("ALTER TABLE soccer_matches ADD COLUMN api_match_id TEXT")
+
+        # Created here, not in the main executescript, because on a migrated (not
+        # freshly-created) database the match_id column doesn't exist until the ALTER
+        # TABLE above runs.
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_player_stats_match ON soccer_player_stats(match_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_api_match_id ON soccer_matches(api_match_id)")
 
         conn.commit()
     finally:
@@ -1381,26 +1458,42 @@ def get_nhl_matches(season=None, status=None):
 
 
 def add_player(team_id, name, position=None, api_player_id=None, conn=None):
-    """Insert a club-league player if not already present for this team; return
-    player_id. If the player already exists, refresh position/api id (a squad
-    re-import may carry newer info). Mirrors add_wc_player's upsert-by-name shape."""
+    """Insert a club-league player if not already present; return player_id.
+
+    Looks up by api_player_id FIRST when given -- it's the one globally stable
+    identity TheStatsAPI gives us across a player's whole career, unlike (team_id,
+    name), which breaks for a player encountered via a historical match played for a
+    DIFFERENT team than they're on now (a transfer). Falls back to (team_id, name)
+    only when no api_player_id is available. team_id is treated as "most recently
+    seen team", not history -- per-match team_id on soccer_player_stats /
+    soccer_player_match_lineups is the source of truth for who played for whom when.
+    """
     owns_connection = conn is None
     if owns_connection:
         conn = sqlite3.connect(DATABASE_PATH)
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT player_id FROM soccer_players WHERE team_id = ? AND name = ?",
-            (team_id, name)
-        )
-        existing = cur.fetchone()
+        existing = None
+        if api_player_id:
+            cur.execute(
+                "SELECT player_id FROM soccer_players WHERE api_player_id = ?",
+                (api_player_id,)
+            )
+            existing = cur.fetchone()
+        if not existing:
+            cur.execute(
+                "SELECT player_id FROM soccer_players WHERE team_id = ? AND name = ?",
+                (team_id, name)
+            )
+            existing = cur.fetchone()
         if existing:
             cur.execute(
                 """UPDATE soccer_players
-                   SET position = COALESCE(?, position),
+                   SET team_id = ?,
+                       position = COALESCE(?, position),
                        api_player_id = COALESCE(?, api_player_id)
                    WHERE player_id = ?""",
-                (position, api_player_id, existing[0])
+                (team_id, position, api_player_id, existing[0])
             )
             conn.commit()
             return existing[0]
@@ -1416,27 +1509,34 @@ def add_player(team_id, name, position=None, api_player_id=None, conn=None):
             conn.close()
 
 
-def upsert_player_stats(player_id, season=None, minutes_played=None, xg=None,
-                        xg_per90=None, goals=None, assists=None,
-                        club_xga_per90=None, club_ga_per90=None, source=None, conn=None):
-    """Insert or update a player's stat line for a season; return stat_id.
+def add_player_match_stats(player_id, match_id, season=None, venue=None, minutes_played=None,
+                           xg=None, xg_per90=None, goals=None, assists=None,
+                           club_xga_per90=None, club_ga_per90=None, source=None, conn=None):
+    """Insert or update a player's stat line for ONE MATCH; return stat_id.
 
-    COALESCE on update so a partial refresh doesn't wipe previously stored fields
-    (same reasoning as upsert_wc_player_stats)."""
+    Replaces the old season-scoped upsert_player_stats (FEATURE-011_REQUIREMENTS.md
+    Persistence: per-match, not per-season -- season totals become a query over these
+    rows, not a separately stored/upserted format). Idempotent on (player_id, match_id)
+    so a re-run doesn't duplicate; COALESCE on update so a partial re-fetch doesn't
+    wipe previously stored fields."""
+    if venue not in (None, "home", "away"):
+        raise ValueError(f"invalid venue: {venue!r}")
     owns_connection = conn is None
     if owns_connection:
         conn = sqlite3.connect(DATABASE_PATH)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT stat_id FROM soccer_player_stats WHERE player_id = ? AND season IS ?",
-            (player_id, season)
+            "SELECT stat_id FROM soccer_player_stats WHERE player_id = ? AND match_id = ?",
+            (player_id, match_id)
         )
         existing = cur.fetchone()
         if existing:
             cur.execute(
                 """UPDATE soccer_player_stats
-                   SET minutes_played = COALESCE(?, minutes_played),
+                   SET season         = COALESCE(?, season),
+                       venue          = COALESCE(?, venue),
+                       minutes_played = COALESCE(?, minutes_played),
                        xg             = COALESCE(?, xg),
                        xg_per90       = COALESCE(?, xg_per90),
                        goals          = COALESCE(?, goals),
@@ -1445,21 +1545,75 @@ def upsert_player_stats(player_id, season=None, minutes_played=None, xg=None,
                        club_ga_per90  = COALESCE(?, club_ga_per90),
                        source         = COALESCE(?, source)
                    WHERE stat_id = ?""",
-                (minutes_played, xg, xg_per90, goals, assists,
+                (season, venue, minutes_played, xg, xg_per90, goals, assists,
                  club_xga_per90, club_ga_per90, source, existing[0])
             )
             conn.commit()
             return existing[0]
         cur.execute(
             """INSERT INTO soccer_player_stats
-               (player_id, season, minutes_played, xg, xg_per90, goals, assists,
-                club_xga_per90, club_ga_per90, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (player_id, season, minutes_played, xg, xg_per90, goals, assists,
-             club_xga_per90, club_ga_per90, source)
+               (player_id, match_id, season, venue, minutes_played, xg, xg_per90, goals,
+                assists, club_xga_per90, club_ga_per90, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (player_id, match_id, season, venue, minutes_played, xg, xg_per90, goals,
+             assists, club_xga_per90, club_ga_per90, source)
         )
         conn.commit()
         return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def add_player_match_lineup(player_id, match_id, team_id, started, position=None,
+                            formation=None, conn=None):
+    """Insert or update a player's lineup row for one match; return lineup_id.
+    Idempotent on (player_id, match_id), same reasoning as add_player_match_stats."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT lineup_id FROM soccer_player_match_lineups WHERE player_id = ? AND match_id = ?",
+            (player_id, match_id)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE soccer_player_match_lineups
+                   SET team_id = ?, started = ?,
+                       position = COALESCE(?, position), formation = COALESCE(?, formation)
+                   WHERE lineup_id = ?""",
+                (team_id, started, position, formation, existing[0])
+            )
+            conn.commit()
+            return existing[0]
+        cur.execute(
+            """INSERT INTO soccer_player_match_lineups
+               (player_id, match_id, team_id, started, position, formation)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (player_id, match_id, team_id, started, position, formation)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def set_match_api_id(match_id, api_match_id, conn=None):
+    """Store TheStatsAPI's match id for one of our soccer_matches rows, resolved by
+    team+date matching (see the club-league import scripts)."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.execute(
+            "UPDATE soccer_matches SET api_match_id = ? WHERE match_id = ?",
+            (api_match_id, match_id)
+        )
+        conn.commit()
     finally:
         if owns_connection:
             conn.close()

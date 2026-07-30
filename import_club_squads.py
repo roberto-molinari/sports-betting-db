@@ -95,6 +95,24 @@ def load_db_teams(league, season):
     return {tid: name for tid, name in rows}
 
 
+def match_teams_to_api(db_teams, api_teams):
+    """Match {db_team_id: name} against a list of API team dicts via normalize_team_name.
+    Returns (matched, unmatched_db, unmatched_api) where matched is
+    [(db_team_id, db_name, api_team_dict), ...]. Shared by squad import and match-id
+    mapping so both report the same match/unmatch story."""
+    api_by_norm = {normalize_team_name(t["name"]): t for t in api_teams}
+    matched, unmatched_db = [], []
+    for tid, name in db_teams.items():
+        api_team = api_by_norm.get(normalize_team_name(name))
+        if api_team:
+            matched.append((tid, name, api_team))
+        else:
+            unmatched_db.append(name)
+    matched_api_names = {m[2]["name"] for m in matched}
+    unmatched_api = [t["name"] for t in api_teams if t["name"] not in matched_api_names]
+    return matched, unmatched_db, unmatched_api
+
+
 def main():
     args = parse_args()
     search = args.search or args.league
@@ -121,18 +139,7 @@ def main():
         api_teams = list(client.paginate("teams", {"competition_id": comp["id"], "season_id": season_id}))
         print(f"API teams: {len(api_teams)}\n")
 
-        api_by_norm = {normalize_team_name(t["name"]): t for t in api_teams}
-        matched = []   # (db_team_id, db_name, api_team)
-        unmatched_db = []
-        for tid, name in db_teams.items():
-            api_team = api_by_norm.get(normalize_team_name(name))
-            if api_team:
-                matched.append((tid, name, api_team))
-            else:
-                unmatched_db.append(name)
-
-        matched_api_names = {m[2]["name"] for m in matched}
-        unmatched_api = [t["name"] for t in api_teams if t["name"] not in matched_api_names]
+        matched, unmatched_db, unmatched_api = match_teams_to_api(db_teams, api_teams)
 
         print(f"Matched: {len(matched)}/{len(db_teams)}")
         if unmatched_db:
