@@ -39,7 +39,7 @@ SOFT_SEASON_SOURCES = {
 }
 
 
-def fetch_pairs(conn, season, source, line_type=LINE_TYPE):
+def fetch_pairs(conn, season, source, line_type=LINE_TYPE, method=METHOD):
     cur = conn.cursor()
     cur.execute(
         """
@@ -51,7 +51,7 @@ def fetch_pairs(conn, season, source, line_type=LINE_TYPE):
         JOIN soccer_matches m ON m.match_id = mp.match_id
         WHERE mp.league = ? AND mp.method = ? AND m.season = ?
         """,
-        (source, line_type, LEAGUE, METHOD, season)
+        (source, line_type, LEAGUE, method, season)
     )
     return cur.fetchall()
 
@@ -85,11 +85,11 @@ def summarize(pairs):
     }
 
 
-def run_table(conn, title, season_sources, line_type):
+def run_table(conn, title, season_sources, line_type, method=METHOD):
     print(f"\n===== {title} =====")
     for season in sorted(season_sources):
         for source in season_sources[season]:
-            pairs = fetch_pairs(conn, season, source, line_type=line_type)
+            pairs = fetch_pairs(conn, season, source, line_type=line_type, method=method)
             if not pairs:
                 print(f"season={season} vs {source}: no overlapping rows")
                 continue
@@ -105,11 +105,21 @@ def run_table(conn, title, season_sources, line_type):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--line-type", choices=["opening", "closing"], default=LINE_TYPE)
+    parser.add_argument("--method", default=METHOD,
+                        help=f"soccer_model_predictions.method to compare (default: {METHOD})")
+    parser.add_argument("--seasons", type=int, nargs="+",
+                        help="Restrict to these seasons only (default: all configured).")
     args = parser.parse_args()
 
+    sharp = SHARP_SEASON_SOURCES
+    soft = SOFT_SEASON_SOURCES
+    if args.seasons:
+        sharp = {s: v for s, v in SHARP_SEASON_SOURCES.items() if s in args.seasons}
+        soft = {s: v for s, v in SOFT_SEASON_SOURCES.items() if s in args.seasons}
+
     conn = sqlite3.connect(DATABASE_PATH)
-    run_table(conn, f"Table 1: model vs sharp books ({args.line_type})", SHARP_SEASON_SOURCES, args.line_type)
-    run_table(conn, f"Table 2: model vs soft book ({args.line_type})", SOFT_SEASON_SOURCES, args.line_type)
+    run_table(conn, f"Table 1: {args.method} vs sharp books ({args.line_type})", sharp, args.line_type, args.method)
+    run_table(conn, f"Table 2: {args.method} vs soft book ({args.line_type})", soft, args.line_type, args.method)
     conn.close()
 
 

@@ -209,7 +209,7 @@ def test_player_season_minutes_is_team_agnostic(db_path, conn):
     assert totals[player] == 1000
 
 
-def test_team_last_season_roster_minutes_is_team_scoped(db_path, conn):
+def test_team_roster_minutes_is_team_scoped(db_path, conn):
     """Unlike player_season_minutes, this only counts minutes played AT team_id --
     a player's minutes for a DIFFERENT team must not leak in."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
@@ -218,10 +218,25 @@ def test_team_last_season_roster_minutes_is_team_scoped(db_path, conn):
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=400, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=600, conn=conn)
 
-    team_a_minutes = strength.team_last_season_roster_minutes(conn, team_a, 2025)
-    team_b_minutes = strength.team_last_season_roster_minutes(conn, team_b, 2025)
+    team_a_minutes = strength.team_roster_minutes(conn, team_a, 2025)
+    team_b_minutes = strength.team_roster_minutes(conn, team_b, 2025)
     assert team_a_minutes[player] == 400
     assert team_b_minutes[player] == 600
+
+
+def test_team_roster_minutes_before_date_excludes_later_matches(db_path, conn):
+    """before_date restricts to matches strictly before it -- the mechanism backtesting
+    relies on to avoid leaking later-season data into an earlier match's computation."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", season=2025, date="2025-11-01")
+    player = sports_db.add_player(team_a, "Timeline Player", conn=conn)
+    sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=90, conn=conn)
+    sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=90, conn=conn)
+
+    early = strength.team_roster_minutes(conn, team_a, 2025, before_date="2025-10-01")
+    full = strength.team_roster_minutes(conn, team_a, 2025)
+    assert early[player] == 90    # only m1
+    assert full[player] == 180    # both
 
 
 def test_player_trust_high_when_full_coverage_and_full_churn(db_path, conn):
@@ -314,3 +329,98 @@ def test_resolve_blend_weight_league_override_takes_precedence(db_path, conn, mo
     assert strength.resolve_blend_weight(conn, team_a, "Serie A", "defense", season=2026) == 1.0
     # A different league is unaffected by Serie A's override.
     assert strength.resolve_blend_weight(conn, team_a, "Premier League", "attack", season=2026) == 1.0
+
+
+# ── squad_as_of_date + before_date plumbing (backtesting support) ────────────────────
+
+def test_squad_as_of_date_uses_current_season_matches_when_available(db_path, conn):
+    """Once the season being backtested has its own match evidence, that's the signal
+    -- not last season's roster."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2024, date="2024-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", season=2025, date="2025-09-01")
+    p_old = sports_db.add_player(team_a, "Last Season Player", api_player_id="ext_lsp", conn=conn)
+    p_new = sports_db.add_player(team_a, "This Season Player", api_player_id="ext_tsp", conn=conn)
+    sports_db.add_player_match_stats(p_old, m1, season=2024, venue="home", minutes_played=900, conn=conn)
+    sports_db.add_player_match_stats(p_new, m2, season=2025, venue="home", minutes_played=90, conn=conn)
+
+    squad = strength.squad_as_of_date(conn, team_a, 2025, "2025-10-01")
+    assert squad == {p_new}   # NOT p_old -- last season's roster isn't consulted
+
+
+def test_squad_as_of_date_falls_back_to_last_season_when_no_matches_yet(db_path, conn):
+    """Before the current season has any match evidence (the very start of a season),
+    falls back to last season's final roster -- an honest, bounded approximation."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2024, date="2024-09-01")
+    p_old = sports_db.add_player(team_a, "Last Season Player", conn=conn)
+    sports_db.add_player_match_stats(p_old, m1, season=2024, venue="home", minutes_played=900, conn=conn)
+
+    # Querying "as of" the very first day of the 2025 season -- no 2025 matches exist yet.
+    squad = strength.squad_as_of_date(conn, team_a, 2025, "2025-08-01")
+    assert squad == {p_old}
+
+
+def test_squad_as_of_date_only_sees_matches_strictly_before_the_date(db_path, conn):
+    """A match that happens ON OR AFTER the query date must not count as evidence --
+    the whole point is no lookahead."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", season=2025, date="2025-11-01")
+    p_early = sports_db.add_player(team_a, "Early Player", conn=conn)
+    p_later = sports_db.add_player(team_a, "Later Player", conn=conn)
+    sports_db.add_player_match_stats(p_early, m1, season=2025, venue="home", minutes_played=90, conn=conn)
+    sports_db.add_player_match_stats(p_later, m2, season=2025, venue="home", minutes_played=90, conn=conn)
+
+    squad = strength.squad_as_of_date(conn, team_a, 2025, "2025-10-01")
+    assert squad == {p_early}   # NOT p_later -- that match hasn't happened yet
+
+
+def test_player_trust_score_accepts_current_squad_ids_override(db_path, conn):
+    """The override parameter actually changes the result -- confirms it's wired
+    through, not just accepted and ignored. Same setup as the full-churn headline
+    test, but passing an explicit (different) squad instead of the live default."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    p1 = sports_db.add_player(team_a, "Stayed Player", api_player_id="ext_stay", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+    # Live default: current_squad_player_ids(team_a) == {p1} -- roster unchanged, trust 0.
+    assert strength.player_trust_score(conn, team_a, season=2026) == pytest.approx(0.0)
+
+    # Override with a squad that looks completely different from last season's roster.
+    p2 = sports_db.add_player(team_a, "Hypothetical New Player", api_player_id="ext_hyp", conn=conn)
+    team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppC", season=2025, date="2025-09-08")
+    sports_db.add_player_match_stats(p2, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+    overridden_trust = strength.player_trust_score(conn, team_a, season=2026, current_squad_ids={p2})
+    assert overridden_trust == pytest.approx(1.0)
+
+
+def test_load_team_players_before_date_excludes_later_matches(db_path, conn):
+    """Same no-lookahead guarantee as team_roster_minutes, for the function that
+    actually feeds the player-level lambda computation."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-11-01")
+    player = sports_db.add_player(team_a, "Timeline Player", position="F", conn=conn)
+    sports_db.add_player_match_stats(player, m1, season=2025, venue="home",
+                                     minutes_played=90, goals=1, conn=conn)
+    sports_db.add_player_match_stats(player, m2, season=2025, venue="home",
+                                     minutes_played=90, goals=5, conn=conn)
+
+    early = strength.load_team_players(conn, [team_a], 2025, before_date="2025-10-01")
+    full = strength.load_team_players(conn, [team_a], 2025)
+    assert early[team_a][0]["minutes"] == 90     # only m1
+    assert full[team_a][0]["minutes"] == 180     # both
+
+
+def test_compute_falls_back_to_baseline_for_true_cold_start_team(db_path, conn):
+    """A newly-promoted team's very first match: zero team-level history (no prior
+    matches at all, so team_level_lambda returns None) AND zero player data (nothing
+    clears MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT). Real bug found running the actual
+    Success Criteria backtest: blend() returned None for both lambdas, crashing
+    analyse_match_wc's arithmetic downstream. Must fall back to the league baseline
+    instead -- same "assume average" philosophy estimate_lambdas() already uses for a
+    team-level-only team with no history."""
+    team_id, opp_id, m1 = _seed_match(conn, "NewlyPromoted", "Opponent", date="2025-08-23")
+
+    results = strength.compute(conn, [team_id], "Serie A", 2025, before_date="2025-08-23")
+    r = results[team_id]
+    assert r["lambda_attack_blend"] is not None
+    assert r["lambda_defense_blend"] is not None
+    assert r["lambda_attack_blend"] == pytest.approx(r["baseline"])
+    assert r["lambda_defense_blend"] == pytest.approx(r["baseline"])

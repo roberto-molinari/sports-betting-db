@@ -94,6 +94,28 @@ def test_match_by_team_pairing_skips_matches_with_unresolved_team():
     assert result == {}
 
 
+# ── pick_season_id ────────────────────────────────────────────────────────────────
+
+def test_pick_season_id_matches_by_start_year():
+    """OUR `season` convention IS the season's start_year (e.g. 2024 = "2024-25") --
+    confirms the mapping, not just that SOME id comes back."""
+    seasons = [
+        {"id": "sn_current", "start_year": 2025, "year": "25/26"},
+        {"id": "sn_prior", "start_year": 2024, "year": "24/25"},
+    ]
+    assert squads.pick_season_id(seasons, 2024) == "sn_prior"
+    assert squads.pick_season_id(seasons, 2025) == "sn_current"
+
+
+def test_pick_season_id_does_not_default_to_current_season():
+    """The real bug this guards against: resolve_competition()'s current_season_id is
+    always the API's CURRENT season regardless of which --season was requested.
+    Backfilling a past season with no matching start_year must return None (the caller
+    errors out), NOT silently fall back to whatever "is_current" season exists."""
+    seasons = [{"id": "sn_current", "start_year": 2025, "year": "25/26", "is_current": True}]
+    assert squads.pick_season_id(seasons, 2020) is None
+
+
 def test_match_by_team_pairing_only_returns_resolvable_matches():
     db_matches = [
         {"match_id": 1, "home_team_id": 1, "away_team_id": 2,

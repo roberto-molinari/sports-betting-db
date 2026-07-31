@@ -65,11 +65,42 @@ def resolve_competition(client, competition_id, search, country):
     return client.get_data(f"competitions/{candidates[0]['id']}")
 
 
+def pick_season_id(seasons, season):
+    """Pure matching logic behind resolve_season_id, split out for testing: find the
+    season dict whose start_year equals OUR `season` convention. Returns None (not an
+    error) if not found -- the caller decides how to fail."""
+    for s in seasons:
+        if s.get("start_year") == season:
+            return s["id"]
+    return None
+
+
+def resolve_season_id(client, competition_id, season):
+    """Resolve TheStatsAPI's season id for OUR `season` convention (a season's
+    start_year, e.g. 2024 = "2024-25") via competitions/{id}/seasons.
+
+    Deliberately NOT comp['current_season_id'] -- that's always the API's CURRENT
+    season regardless of which `--season` was requested. A real bug found backfilling
+    season=2024 while the API's current season was 2025-26: current_season_id would
+    have silently resolved to 2025-26's matches, mislabeling that season's data as
+    2024 in our DB (272/380 team-pairing "matches" were actually 2025-26 fixtures
+    coincidentally resolving against a mixed team set -- caught before any data was
+    written, by noticing relegated 2024-25 teams like Empoli/Monza/Venezia FC showing
+    as unmatched against what should have been their own season's team list)."""
+    seasons = client.get_data(f"competitions/{competition_id}/seasons") or []
+    season_id = pick_season_id(seasons, season)
+    if season_id is None:
+        available = ", ".join(f"{s.get('year')}={s.get('start_year')}" for s in seasons)
+        sys.exit(f"No season with start_year={season} for competition {competition_id}. "
+                  f"Available: {available or '(none)'}")
+    return season_id
+
+
 # Strips common Italian-club prefixes/suffixes so "AC Milan" / "Cagliari Calcio" /
 # "Como 1907" match the API's bare "Milan" / "Cagliari" / "Como". Verified against
 # TheStatsAPI's actual Serie A team list (all 20/20 matched cleanly) before writing this.
 _PREFIX_RE = re.compile(r"^(AC|AS|US|ACF)\s+", re.IGNORECASE)
-_SUFFIX_RE = re.compile(r"\s+(Calcio|CFC)\b", re.IGNORECASE)
+_SUFFIX_RE = re.compile(r"\s+(Calcio|CFC|FC)\b", re.IGNORECASE)
 _YEAR_RE = re.compile(r"\s+\d{4}$")
 
 
@@ -129,12 +160,10 @@ def main():
 
     try:
         comp = resolve_competition(client, args.competition_id, search, args.country)
-        season_id = comp.get("current_season_id")
+        season_id = resolve_season_id(client, comp["id"], args.season)
         print(f"Competition: {comp['id']}  {comp['name']} ({comp.get('country')})  "
               f"season={season_id}  has_player_stats={comp.get('has_player_stats')}  "
               f"xg_available={comp.get('xg_available')}")
-        if not season_id:
-            sys.exit("Competition has no current_season_id.")
 
         api_teams = list(client.paginate("teams", {"competition_id": comp["id"], "season_id": season_id}))
         print(f"API teams: {len(api_teams)}\n")

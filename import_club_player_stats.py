@@ -41,7 +41,7 @@ from core.sports_db import (
     set_match_api_id,
 )
 from core.thestatsapi import Client, TheStatsAPIError
-from import_club_squads import resolve_competition, match_teams_to_api, load_db_teams
+from import_club_squads import resolve_competition, resolve_season_id, match_teams_to_api, load_db_teams
 
 
 def parse_args():
@@ -85,7 +85,7 @@ def load_db_matches(league, season, team_name=None):
     return rows
 
 
-def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, conn):
+def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, conn, dry_run=False):
     """Fill in api_match_id for any db_matches row missing it, by (home team, away
     team) against the API's match list -- NOT date. A mismatch was found between our
     soccer_matches dates and TheStatsAPI's utc_date for ~13% of Serie A 2025 matches
@@ -96,23 +96,27 @@ def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, c
     two sources disagree on which date to report). Matching on team pairing alone
     sidesteps the cause entirely: in a double round-robin league each (home, away)
     ordered pair occurs exactly once per season, so there's no ambiguity to resolve
-    with a date anyway. Returns (n_resolved, n_unresolved)."""
+    with a date anyway. Returns (n_resolved, n_unresolved).
+
+    dry_run=True still computes and returns the resolution (for an honest preview) but
+    does NOT call set_match_api_id -- this used to write regardless of --dry-run, a
+    real bug caught when a season_id resolution mistake (see resolve_season_id) got
+    persisted by a "dry" run before the mistake was noticed. Returns
+    (n_resolved, n_unresolved, resolution) -- resolution is {match_id: api_match_id}
+    for everything resolved THIS call (whether or not persisted), so a caller can
+    preview the full downstream pipeline without a second API call or DB round trip."""
     needing = [m for m in db_matches if not m["api_match_id"]]
     if not needing:
-        return 0, 0
+        return 0, 0, {}
 
     api_matches = list(client.paginate("matches", {"competition_id": comp_id, "season_id": season_id}))
     resolution = match_db_matches_to_api_by_team_pairing(needing, team_api_id, api_matches)
 
-    resolved = unresolved = 0
-    for m in needing:
-        api_id = resolution.get(m["match_id"])
-        if api_id:
-            set_match_api_id(m["match_id"], api_id, conn=conn)
-            resolved += 1
-        else:
-            unresolved += 1
-    return resolved, unresolved
+    if not dry_run:
+        for match_id, api_id in resolution.items():
+            set_match_api_id(match_id, api_id, conn=conn)
+
+    return len(resolution), len(needing) - len(resolution), resolution
 
 
 def match_db_matches_to_api_by_team_pairing(db_matches, team_api_id, api_matches):
@@ -218,8 +222,8 @@ def main():
 
     try:
         comp = resolve_competition(client, args.competition_id, search, args.country)
-        season_id = comp.get("current_season_id")
         comp_id = comp["id"]
+        season_id = resolve_season_id(client, comp_id, args.season)
         print(f"Competition: {comp_id}  {comp['name']}  season={season_id}")
 
         api_teams = list(client.paginate("teams", {"competition_id": comp_id, "season_id": season_id}))
@@ -229,11 +233,15 @@ def main():
         team_api_id = {tid: api_team["id"] for tid, _, api_team in matched}
         team_api_id_reverse = {v: k for k, v in team_api_id.items()}
 
-        resolved, unresolved = resolve_match_api_ids(client, comp_id, season_id, db_matches,
-                                                       team_api_id, conn)
+        resolved, unresolved, new_resolution = resolve_match_api_ids(
+            client, comp_id, season_id, db_matches, team_api_id, conn, dry_run=args.dry_run)
         print(f"Match-id mapping: {resolved} newly resolved, {unresolved} unresolved this run")
 
-        matches = load_db_matches(args.league, args.season, team_name=args.team)
+        # Merge already-persisted api_match_id with this run's resolution in memory --
+        # works identically for a real run (both sources agree) and a dry run (nothing
+        # was persisted, so this is the only place the new resolution is visible).
+        matches = [dict(m, api_match_id=m["api_match_id"] or new_resolution.get(m["match_id"]))
+                   for m in db_matches]
         matches = [m for m in matches if m["api_match_id"]]
         if args.limit_matches:
             matches = matches[:args.limit_matches]

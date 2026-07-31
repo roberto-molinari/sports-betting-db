@@ -75,8 +75,14 @@ def normalize_position(pos):
     return None
 
 
-def load_team_players(conn, team_ids, season):
+def load_team_players(conn, team_ids, season, before_date=None):
     """Aggregate per-MATCH rows into one per-player-per-TEAM entry.
+
+    before_date: optional ISO date string, restricting to matches strictly before it.
+    Live/current use (the whole season so far) needs no cutoff; BACKTESTING a specific
+    historical match must pass one -- without it, an early-season match's player-level
+    lambda would leak in stats from later matches in the same season that hadn't been
+    played yet, the same class of lookahead bug as BUG-008.
 
     Rates are computed from summed raw totals (goals/xg over summed minutes), not by
     averaging each match's own per-90 rate -- a single sub appearance of a few minutes
@@ -102,14 +108,19 @@ def load_team_players(conn, team_ids, season):
     NULL never matches; s.match_id IS NOT NULL is kept for clarity).
     """
     cur = conn.cursor()
-    cur.execute("""
+    sql = """
         SELECT s.player_id, p.position, s.minutes_played, s.goals, s.xg, s.club_ga_per90,
                s.venue, m.home_team_id, m.away_team_id
         FROM soccer_player_stats s
         JOIN soccer_players p ON p.player_id = s.player_id
         JOIN soccer_matches m ON m.match_id = s.match_id
         WHERE s.season = ? AND s.match_id IS NOT NULL AND s.venue IS NOT NULL
-    """, (season,))
+    """
+    params = [season]
+    if before_date is not None:
+        sql += " AND m.match_date < ?"
+        params.append(before_date)
+    cur.execute(sql, params)
 
     team_id_set = set(team_ids)
     agg = {}  # (player_id, match_team_id) -> accumulators
@@ -209,33 +220,73 @@ def player_season_minutes(conn, season):
     return {pid: mins or 0 for pid, mins in cur.fetchall()}
 
 
-def team_last_season_roster_minutes(conn, team_id, season):
+def team_roster_minutes(conn, team_id, season, before_date=None):
     """{player_id: minutes played AT team_id specifically in `season`} -- team-scoped,
     since this answers "how much of team_id's OWN production is this player part of,"
-    not the player's overall total (that's player_season_minutes)."""
+    not the player's overall total (that's player_season_minutes).
+
+    before_date: optional ISO date string, restricting to matches strictly before it.
+    Used two ways: with no before_date, this gives a fully-completed season's final
+    roster (safe -- the whole season is in the past by construction). WITH a
+    before_date, it gives a point-in-time-correct read of the CURRENT season's roster
+    so far, for backtesting (see squad_as_of_date) -- no lookahead, since it only
+    counts matches that had already happened."""
     cur = conn.cursor()
-    cur.execute("""
+    sql = """
         SELECT s.player_id, SUM(s.minutes_played)
         FROM soccer_player_stats s
         JOIN soccer_matches m ON m.match_id = s.match_id
         WHERE s.season = ? AND s.match_id IS NOT NULL AND s.venue IS NOT NULL
           AND ((s.venue = 'home' AND m.home_team_id = ?)
                OR (s.venue = 'away' AND m.away_team_id = ?))
-        GROUP BY s.player_id
-    """, (season, team_id, team_id))
+    """
+    params = [season, team_id, team_id]
+    if before_date is not None:
+        sql += " AND m.match_date < ?"
+        params.append(before_date)
+    sql += " GROUP BY s.player_id"
+    cur.execute(sql, params)
     return {pid: mins or 0 for pid, mins in cur.fetchall()}
 
 
 def current_squad_player_ids(conn, team_id):
     """Players whose most-recently-seen team (soccer_players.team_id, see add_player's
     api_player_id-first identity resolution) is team_id right now -- the best available
-    read of "who's on the roster today," not scoped to any particular season."""
+    read of "who's on the roster today," not scoped to any particular season.
+
+    LIVE use only. This field only ever holds the single latest known team, so it
+    can't answer "who was on the roster as of a PAST date" -- for backtesting, use
+    squad_as_of_date instead (derived from real match appearances, so it's actually
+    point-in-time correct)."""
     cur = conn.cursor()
     cur.execute("SELECT player_id FROM soccer_players WHERE team_id = ?", (team_id,))
     return {row[0] for row in cur.fetchall()}
 
 
-def player_trust_score(conn, team_id, season):
+def squad_as_of_date(conn, team_id, season, before_date):
+    """Point-in-time "who's on this roster" for BACKTESTING a past season, where
+    current_squad_player_ids can't be trusted (soccer_players.team_id reflects TODAY's
+    state, not what was true at before_date). Derived from real match appearances:
+
+    1. Players who've played for team_id in `season`'s own matches so far (before
+       before_date) -- the season's own transfer activity, as it becomes visible.
+    2. If none yet (very early in the season, before any match has revealed summer
+       transfer activity), falls back to last season's full roster -- an honest
+       approximation: with no historical squad-list snapshot available, the first
+       matchday or two assumes roster continuity until match evidence says otherwise.
+       This understates day-one churn; a documented, bounded limitation (a season has
+       ~38 matchdays; this affects the first one or two), not a lookahead leak.
+
+    NOT for live use -- current_squad_player_ids is the better signal there (updated
+    from a squad-list pull before the season begins, so it knows about a transfer
+    before a ball is kicked; this only knows once the player actually plays)."""
+    this_season = team_roster_minutes(conn, team_id, season, before_date=before_date)
+    if this_season:
+        return set(this_season.keys())
+    return set(team_roster_minutes(conn, team_id, season - 1).keys())
+
+
+def player_trust_score(conn, team_id, season, current_squad_ids=None):
     """1.0 = fully trust the player-level lambda for this team; 0.0 = fully trust
     team-level. Two factors, BOTH required (product, not sum/average) -- a stable,
     well-tracked squad has nothing to gain from the player signal even with great
@@ -250,6 +301,11 @@ def player_trust_score(conn, team_id, season):
       played), as a fraction of the team's own total minutes last season. High churn
       means last season's team-level number describes a squad that's mostly gone.
 
+    current_squad_ids: optional override for "who's on the roster right now" --
+    defaults to current_squad_player_ids() (the live signal). Backtesting a PAST
+    season must pass a point-in-time squad instead (e.g. from squad_as_of_date), since
+    the live default has no history.
+
     NOTE: this is the INVERSE of the `w` convention used everywhere else in this file
     (blend(), soccer_player_team_strength.weight_attack/weight_defense -- there, 1.0
     means team-level). The inversion happens in exactly one place, resolve_blend_weight
@@ -258,13 +314,13 @@ def player_trust_score(conn, team_id, season):
     No last-season history for team_id at all (e.g. backfill not run yet) -> 0.0
     (caller falls back fully to team-level; not a crash)."""
     last_season = season - 1
-    team_minutes = team_last_season_roster_minutes(conn, team_id, last_season)
+    team_minutes = team_roster_minutes(conn, team_id, last_season)
     team_total_minutes = sum(team_minutes.values())
     if team_total_minutes <= 0:
         return 0.0
 
     all_minutes = player_season_minutes(conn, last_season)
-    current_squad = current_squad_player_ids(conn, team_id)
+    current_squad = current_squad_ids if current_squad_ids is not None else current_squad_player_ids(conn, team_id)
     last_season_roster = set(team_minutes.keys())
 
     qualifying = {p for p in current_squad if all_minutes.get(p, 0) >= MIN_MINUTES_PER_PLAYER}
@@ -280,13 +336,15 @@ def player_trust_score(conn, team_id, season):
     return data_coverage_score * roster_change_score
 
 
-def resolve_blend_weight(conn, team_id, league, component, season):
+def resolve_blend_weight(conn, team_id, league, component, season, current_squad_ids=None):
     """Default per-team weight (`w`; 0=pure player, 1=pure team), with a league-wide
-    override taking precedence per component (FEATURE-011_REQUIREMENTS.md, Blend)."""
+    override taking precedence per component (FEATURE-011_REQUIREMENTS.md, Blend).
+    current_squad_ids: see player_trust_score -- pass a point-in-time squad (e.g. from
+    squad_as_of_date) when backtesting a past season."""
     override = LEAGUE_WEIGHT_OVERRIDES.get(league, {}).get(component)
     if override is not None:
         return override
-    return 1.0 - player_trust_score(conn, team_id, season)
+    return 1.0 - player_trust_score(conn, team_id, season, current_squad_ids=current_squad_ids)
 
 
 def team_level_lambda(conn, team_id, league, before_date, n=25):
@@ -302,11 +360,21 @@ def team_level_lambda(conn, team_id, league, before_date, n=25):
     return attack, defense
 
 
-def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defense=None):
+def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defense=None,
+           current_squad_ids_by_team=None):
     """w_attack/w_defense: force this weight for EVERY team, bypassing per-team
     resolution -- a manual debugging/comparison override, not the normal path. Leave
-    as None (default) to use resolve_blend_weight() per team, per component."""
-    by_team = load_team_players(conn, team_ids, season)
+    as None (default) to use resolve_blend_weight() per team, per component.
+
+    current_squad_ids_by_team: optional {team_id: set(player_id)} override for the
+    blend-weight "current squad" signal, passed through to resolve_blend_weight per
+    team -- pass this (built from squad_as_of_date per team) when backtesting a past
+    season; leave None for live use. before_date is threaded through
+    load_team_players and get_league_averages too, for the same reason: computing a
+    PAST match's lambdas must only see data that existed before that match (live use,
+    where before_date is always "now" or later than all data on hand, is unaffected
+    either way)."""
+    by_team = load_team_players(conn, team_ids, season, before_date=before_date)
     apply_shrinkage(by_team)
 
     raw = {}
@@ -314,7 +382,7 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         ra, aw, rd, dw = raw_team_strength(players)
         raw[tid] = {"ra": ra, "aw": aw, "rd": rd, "dw": dw}
 
-    avgs = get_league_averages(conn, league=league, seasons=[season])
+    avgs = get_league_averages(conn, league=league, seasons=[season], before_date=before_date)
     baseline = (avgs["avg_home"] + avgs["avg_away"]) / 2
 
     attack_vals = [r["ra"] for r in raw.values() if r["ra"] is not None and r["aw"] >= MIN_ATTACK_WEIGHT]
@@ -336,6 +404,16 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         ld_player = (r["rd"] * defense_scale) if has_defense else None
 
         team_attack, team_defense = team_level_lambda(conn, tid, league, before_date)
+        # True cold start (a newly-promoted team's first few matches: zero team-level
+        # history AND player data too thin to clear MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT
+        # yet) -- fall back to the league baseline, same "assume average" philosophy
+        # estimate_lambdas() already uses for a team-level-only team with no history.
+        # Without this, blend() would return None (team_val) for a team with neither
+        # signal, crashing analyse_match_wc's lambda_H/lambda_A arithmetic downstream.
+        if team_attack is None:
+            team_attack = baseline
+        if team_defense is None:
+            team_defense = baseline
 
         def blend(player_val, team_val, w):
             if player_val is None:
@@ -344,8 +422,11 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                 return player_val, 0.0
             return (1 - w) * player_val + w * team_val, w
 
-        w_att = w_attack if w_attack is not None else resolve_blend_weight(conn, tid, league, "attack", season)
-        w_def = w_defense if w_defense is not None else resolve_blend_weight(conn, tid, league, "defense", season)
+        squad_ids = current_squad_ids_by_team.get(tid) if current_squad_ids_by_team is not None else None
+        w_att = w_attack if w_attack is not None else resolve_blend_weight(
+            conn, tid, league, "attack", season, current_squad_ids=squad_ids)
+        w_def = w_defense if w_defense is not None else resolve_blend_weight(
+            conn, tid, league, "defense", season, current_squad_ids=squad_ids)
         la_blend, w_a_used = blend(la_player, team_attack, w_att)
         ld_blend, w_d_used = blend(ld_player, team_defense, w_def)
 
@@ -361,6 +442,7 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
             "lambda_attack_team": team_attack, "lambda_defense_team": team_defense,
             "lambda_attack_blend": la_blend, "lambda_defense_blend": ld_blend,
             "weight_attack": w_a_used, "weight_defense": w_d_used, "basis": basis,
+            "baseline": baseline,
         }
     return results
 
