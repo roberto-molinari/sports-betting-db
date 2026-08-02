@@ -54,6 +54,24 @@ def main():
     parser.add_argument("--league", default="Serie A")
     parser.add_argument("--season", type=int, default=2025)
     parser.add_argument("--method", default=DEFAULT_METHOD)
+    parser.add_argument("--weight-attack", type=float, default=None,
+                        help="Force this attack weight for ALL teams (0=pure player, 1=pure "
+                             "team), bypassing per-team resolution. Debugging/comparison only "
+                             "-- e.g. --weight-attack 1 --weight-defense 1 isolates whether a "
+                             "bias regression comes from the blend pipeline itself rather than "
+                             "from player data.")
+    parser.add_argument("--weight-defense", type=float, default=None)
+    parser.add_argument("--attack-metric", choices=["xg", "goals"], default="xg",
+                        help="Player-level attack signal: xg (default) or goals. "
+                             "Debugging/comparison only -- see compute_club_player_strength."
+                             "load_team_players' docstring.")
+    parser.add_argument("--team-metric", choices=["xg", "goals"], default="xg",
+                        help="Team-level attack/defense signal: xg (default since "
+                             "2026-08-02, this file's own xG/xGA derivation -- cleared "
+                             "the Model Calibration success criterion) or goals (matches "
+                             "poisson_v3 exactly). Never changes poisson_v3 or "
+                             "core.poisson_model either way, see team_level_lambda's "
+                             "docstring.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DATABASE_PATH)
@@ -87,24 +105,33 @@ def main():
         squad_ids_by_team = {tid: strength.squad_as_of_date(conn, tid, args.season, match_date)
                              for tid in team_ids}
         results = strength.compute(conn, team_ids, args.league, args.season, match_date,
+                                   w_attack=args.weight_attack, w_defense=args.weight_defense,
+                                   attack_metric=args.attack_metric, team_metric=args.team_metric,
                                    current_squad_ids_by_team=squad_ids_by_team)
 
         for row in date_rows:
             home = results[row["home_team_id"]]
             away = results[row["away_team_id"]]
 
+            # baseline=avg_home, away_advantage=avg_home/avg_away reproduces estimate_lambdas()'s
+            # own dual-baseline formula (lambda_H normalized by avg_home, lambda_A by avg_away)
+            # through analyse_match_wc's existing venue-multiplier params -- see
+            # FEATURE-011_BUILD_TRACKER.md task 5 (2026-08-01 fix) for the derivation.
+            avg_home, avg_away = home["avg_home"], home["avg_away"]
             result = analyse_match_wc(
-                lambda_home_attack=home["lambda_attack_blend"],
-                lambda_away_attack=away["lambda_attack_blend"],
-                lambda_home_defense=home["lambda_defense_blend"],
-                lambda_away_defense=away["lambda_defense_blend"],
+                lambda_home_attack=home["lambda_attack_home_blend"],
+                lambda_away_attack=away["lambda_attack_away_blend"],
+                lambda_home_defense=home["lambda_defense_home_blend"],
+                lambda_away_defense=away["lambda_defense_away_blend"],
                 home_moneyline=row["home_moneyline"],
                 draw_moneyline=row["draw_moneyline"],
                 away_moneyline=row["away_moneyline"],
                 ou_line=row["over_under"],
                 over_odds=row["over_odds"],
                 under_odds=row["under_odds"],
-                baseline=home["baseline"],
+                baseline=avg_home,
+                home_advantage=1.0,
+                away_advantage=avg_home / avg_away,
             )
 
             add_soccer_model_prediction(

@@ -28,7 +28,9 @@ from datetime import date
 from statistics import mean, pstdev
 
 from core.sports_db import DATABASE_PATH, set_player_team_strength
-from core.poisson_model import get_team_ratings, get_league_averages
+from core.poisson_model import (
+    get_team_ratings, get_league_averages, MIN_MATCHES, SHRINKAGE_K, RECENT_N, _shrink,
+)
 
 # Same weights/rationale as compute_wc_team_strength.py (BUG-001/BUG-002 family):
 # forwards carry attack, defenders/keepers carry defense, midfield contributes to both.
@@ -75,7 +77,8 @@ def normalize_position(pos):
     return None
 
 
-def load_team_players(conn, team_ids, season, before_date=None):
+def load_team_players(conn, team_ids, season, before_date=None, attack_metric="xg",
+                      defense_metric="xga"):
     """Aggregate per-MATCH rows into one per-player-per-TEAM entry.
 
     before_date: optional ISO date string, restricting to matches strictly before it.
@@ -88,8 +91,28 @@ def load_team_players(conn, team_ids, season, before_date=None):
     averaging each match's own per-90 rate -- a single sub appearance of a few minutes
     would otherwise produce a wildly noisy per-match rate (e.g. 1 goal in 10 minutes =
     9.0/90) that a simple average wouldn't smooth out the way summing totals first
-    does. Real xG (summed across matches) is used when at least one match has it;
-    otherwise falls back to goals, matching compute_wc_team_strength.py's fallback.
+    does.
+
+    attack_metric: "xg" (default) uses real xG (summed across matches) when at least
+    one match has it, falling back to goals otherwise -- matching
+    compute_wc_team_strength.py's fallback. "goals" always uses actual goals scored,
+    never xG, for consistency with the team-level system (get_team_ratings/
+    estimate_lambdas), which is built entirely from actual match goals -- added
+    2026-08-02 as a debugging/comparison override after finding the xG preference
+    meant a real, sustained finishing overperformance (e.g. Atalanta's Retegui/Lookman
+    scoring well above their combined xG in 2024-25) never reached the player-level
+    signal at all, even though the team-level signal picked it up correctly from
+    actual results. Not the default; see FEATURE-011_BUILD_TRACKER.md for the
+    resulting bias comparison before changing the default.
+
+    defense_metric: "xga" (default, added 2026-08-02) uses club_xga_per90 -- the
+    OPPOSING team's total xG in that match, backfilled locally from already-imported
+    per-player xg (backfill_club_xga.py; the API itself has no expected-goals-against
+    field at all) -- for consistency with attack_metric's default xG preference; this
+    fixes what had been an unnoticed asymmetry (attack used expected values, defense
+    used actual). Falls back to club_ga_per90 (actual goals conceded) when a row has
+    no xga value. "actual" forces club_ga_per90 always, matching the pre-2026-08-02
+    behavior, for debugging/comparison.
 
     Each row is attributed to the team the player actually played for IN THAT MATCH
     (derived from venue + soccer_matches.home/away_team_id), NOT soccer_players.team_id
@@ -109,7 +132,8 @@ def load_team_players(conn, team_ids, season, before_date=None):
     """
     cur = conn.cursor()
     sql = """
-        SELECT s.player_id, p.position, s.minutes_played, s.goals, s.xg, s.club_ga_per90,
+        SELECT s.player_id, p.position, s.minutes_played, s.goals, s.xg,
+               s.club_ga_per90, s.club_xga_per90,
                s.venue, m.home_team_id, m.away_team_id
         FROM soccer_player_stats s
         JOIN soccer_players p ON p.player_id = s.player_id
@@ -124,7 +148,7 @@ def load_team_players(conn, team_ids, season, before_date=None):
 
     team_id_set = set(team_ids)
     agg = {}  # (player_id, match_team_id) -> accumulators
-    for player_id, position, minutes, goals, xg, club_ga90, venue, home_id, away_id in cur.fetchall():
+    for player_id, position, minutes, goals, xg, club_ga90, club_xga90, venue, home_id, away_id in cur.fetchall():
         match_team_id = home_id if venue == "home" else away_id
         if match_team_id not in team_id_set:
             continue
@@ -134,6 +158,7 @@ def load_team_players(conn, team_ids, season, before_date=None):
             "team_id": match_team_id, "pos": normalize_position(position),
             "minutes": 0, "goals": 0, "xg": 0.0, "has_xg": False,
             "ga_num": 0.0, "ga_den": 0.0,
+            "xga_num": 0.0, "xga_den": 0.0,
         })
         a["minutes"] += minutes
         a["goals"] += goals or 0
@@ -143,16 +168,24 @@ def load_team_players(conn, team_ids, season, before_date=None):
         if club_ga90 is not None and minutes:
             a["ga_num"] += minutes * club_ga90
             a["ga_den"] += minutes
+        if club_xga90 is not None and minutes:
+            a["xga_num"] += minutes * club_xga90
+            a["xga_den"] += minutes
 
     by_team = {tid: [] for tid in team_ids}
     for (player_id, team_id), a in agg.items():
         if a["minutes"] <= 0:
             continue
-        if a["has_xg"]:
+        if a["has_xg"] and attack_metric == "xg":
             attack_rate = a["xg"] / a["minutes"] * 90
         else:
             attack_rate = a["goals"] / a["minutes"] * 90
-        club_ga_per90 = (a["ga_num"] / a["ga_den"]) if a["ga_den"] > 0 else None
+        if a["xga_den"] > 0 and defense_metric == "xga":
+            club_ga_per90 = a["xga_num"] / a["xga_den"]
+        elif a["ga_den"] > 0:
+            club_ga_per90 = a["ga_num"] / a["ga_den"]
+        else:
+            club_ga_per90 = None
         by_team[team_id].append({
             "pos": a["pos"],
             "minutes": a["minutes"],
@@ -347,24 +380,117 @@ def resolve_blend_weight(conn, team_id, league, component, season, current_squad
     return 1.0 - player_trust_score(conn, team_id, season, current_squad_ids=current_squad_ids)
 
 
-def team_level_lambda(conn, team_id, league, before_date, n=25):
-    """Season-level intrinsic attack/defense for a team from the EXISTING team-level
-    system -- average of home_attack/away_attack (and home_defense/away_defense),
-    since player-level lambdas here are a single scalar with no home/away split
-    (Scenario 4 is out of scope for this prototype)."""
-    ratings = get_team_ratings(conn, team_id, before_date, n=n, league=league, decay=1.0)
-    attacks = [v for v in (ratings["home_attack"], ratings["away_attack"]) if v is not None]
-    defenses = [v for v in (ratings["home_defense"], ratings["away_defense"]) if v is not None]
-    attack = mean(attacks) if attacks else None
-    defense = mean(defenses) if defenses else None
-    return attack, defense
+def get_team_xg_ratings(conn, team_id, before_date, n=RECENT_N, league="Serie A"):
+    """xG-based counterpart to core.poisson_model.get_team_ratings -- same shape
+    (home/away_attack, home/away_defense, home/away_n), same last-N-matches/no-decay
+    convention, but derived from soccer_player_stats (this project's own xG/xGA data)
+    instead of soccer_matches' actual scores.
+
+    Comparison/debugging use only (2026-08-02) -- lives entirely in this file, not
+    core.poisson_model, so poisson_v3 and the rest of the team-level system are
+    completely untouched; this is an alternate data source for THIS file's own
+    team_level_lambda, nothing else. See FEATURE-011_BUILD_TRACKER.md before making
+    this (or anything derived from it) a real default anywhere.
+
+    A team's xG in a match = sum of that team's players' xg that match. A team's xGA
+    in a match = the opposing team's xG that match -- already stored per player row
+    as club_xga_per90 (backfill_club_xga.py), constant across a team's rows for a
+    given match, so MAX() is a safe way to pull one copy of it per (match, venue).
+
+    Coverage caveat: only reaches as far back as player-level stats exist (seasons
+    2023+ as of 2026-08-02) -- soccer_matches itself goes back to season 2022, so an
+    early-season match's N-game lookback can hit a real, silent gap before that.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.match_id, m.match_date, s.venue, m.home_team_id, m.away_team_id,
+               SUM(s.xg) AS team_xg, MAX(s.club_xga_per90) AS team_xga
+        FROM soccer_player_stats s
+        JOIN soccer_matches m ON m.match_id = s.match_id
+        WHERE m.league = ? AND s.venue IS NOT NULL AND m.match_date < ?
+        GROUP BY s.match_id, s.venue
+    """, (league, before_date))
+
+    home_rows, away_rows = [], []
+    for match_id, match_date, venue, home_id, away_id, team_xg, team_xga in cur.fetchall():
+        match_team_id = home_id if venue == "home" else away_id
+        if match_team_id != team_id:
+            continue
+        (home_rows if venue == "home" else away_rows).append((match_date, team_xg, team_xga))
+
+    home_rows.sort(key=lambda r: r[0], reverse=True)
+    away_rows.sort(key=lambda r: r[0], reverse=True)
+    home_rows, away_rows = home_rows[:n], away_rows[:n]
+
+    def avg(rows, idx):
+        vals = [r[idx] for r in rows if r[idx] is not None]
+        return (sum(vals) / len(vals)) if vals else None
+
+    return {
+        "home_attack":  avg(home_rows, 1), "home_defense": avg(home_rows, 2),
+        "away_attack":  avg(away_rows, 1), "away_defense": avg(away_rows, 2),
+        "home_n": len(home_rows), "away_n": len(away_rows),
+    }
+
+
+def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=RECENT_N,
+                      team_metric="xg"):
+    """Home/away-split intrinsic attack/defense for a team from the EXISTING team-level
+    system, mirroring estimate_lambdas()'s own fallback/shrink logic exactly
+    (MIN_MATCHES/SHRINKAGE_K, and now RECENT_N -- the old n=25 default here didn't match
+    analyse_match()'s actual n=RECENT_N=10 window, a real behavioral mismatch found
+    2026-08-01 while debugging the away-side bias, separate from the home/away-collapse
+    bug fixed earlier the same day) -- this RESTORES that mechanism rather than
+    approximating it, since it's what already correctly encodes home-field advantage
+    (2026-08-01: averaging home/away into one scalar here had silently dropped that,
+    independent of any player blending -- see FEATURE-011_BUILD_TRACKER.md task 5).
+
+    Defense values are measured in the OPPONENT's scoring units, same convention
+    estimate_lambdas() uses (home_defense shrinks toward avg_away, away_defense
+    toward avg_home) -- "goals conceded" is fundamentally the opponent's attack.
+
+    Returns (home_attack, away_attack, home_defense, away_defense) -- always defined
+    (falls back to the relevant league average, never None), same guarantee
+    estimate_lambdas() provides; callers no longer need a None/cold-start check.
+
+    team_metric: "xg" (default since 2026-08-02) uses get_team_xg_ratings above --
+    this file's own xG/xGA derivation, which cleared the Model Calibration success
+    criterion (FEATURE-011_BUILD_TRACKER.md task 5) after a goals-based team rating
+    could not, on the same last-N-matches window this function has always used --
+    a small sample of ACTUAL goals is noisy (see the Atalanta case in the tracker),
+    and xG smooths that out. "goals" uses core.poisson_model.get_team_ratings instead
+    -- actual match scores, exactly what poisson_v3 uses; this function never touches
+    that module either way, so poisson_v3 is unaffected by this default regardless."""
+    if team_metric == "xg":
+        ratings = get_team_xg_ratings(conn, team_id, before_date, n=n, league=league)
+    else:
+        ratings = get_team_ratings(conn, team_id, before_date, n=n, league=league, decay=1.0)
+
+    def resolved(value, n_matches, fallback_avg):
+        if value is not None and n_matches >= MIN_MATCHES:
+            return _shrink(value, fallback_avg, n_matches, SHRINKAGE_K)
+        return fallback_avg
+
+    home_attack  = resolved(ratings["home_attack"],  ratings["home_n"], avg_home)
+    away_attack  = resolved(ratings["away_attack"],  ratings["away_n"], avg_away)
+    home_defense = resolved(ratings["home_defense"], ratings["home_n"], avg_away)
+    away_defense = resolved(ratings["away_defense"], ratings["away_n"], avg_home)
+    return home_attack, away_attack, home_defense, away_defense
 
 
 def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defense=None,
-           current_squad_ids_by_team=None):
+           current_squad_ids_by_team=None, attack_metric="xg", defense_metric="xga",
+           team_metric="xg"):
     """w_attack/w_defense: force this weight for EVERY team, bypassing per-team
     resolution -- a manual debugging/comparison override, not the normal path. Leave
     as None (default) to use resolve_blend_weight() per team, per component.
+
+    attack_metric, defense_metric: passed through to load_team_players -- see that
+    function's docstring.
+
+    team_metric: passed through to team_level_lambda -- "xg" (default since
+    2026-08-02) or "goals" (matches poisson_v3 exactly), see that function's
+    docstring.
 
     current_squad_ids_by_team: optional {team_id: set(player_id)} override for the
     blend-weight "current squad" signal, passed through to resolve_blend_weight per
@@ -374,7 +500,8 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     PAST match's lambdas must only see data that existed before that match (live use,
     where before_date is always "now" or later than all data on hand, is unaffected
     either way)."""
-    by_team = load_team_players(conn, team_ids, season, before_date=before_date)
+    by_team = load_team_players(conn, team_ids, season, before_date=before_date,
+                                attack_metric=attack_metric, defense_metric=defense_metric)
     apply_shrinkage(by_team)
 
     raw = {}
@@ -382,44 +509,47 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         ra, aw, rd, dw = raw_team_strength(players)
         raw[tid] = {"ra": ra, "aw": aw, "rd": rd, "dw": dw}
 
-    avgs = get_league_averages(conn, league=league, seasons=[season], before_date=before_date)
-    baseline = (avgs["avg_home"] + avgs["avg_away"]) / 2
+    # No `seasons=` filter, matching estimate_lambdas()'s own call to this function --
+    # the 100-match rolling window (LEAGUE_AVG_WINDOW) is meant to smooth across a
+    # season boundary; restricting to the current season alone starves it early in a
+    # new season (2026-08-01: a single-match sample can even average to exactly 0.0
+    # goals, causing a ZeroDivisionError downstream once avg_home/avg_away are used
+    # as separate normalization baselines instead of one pooled number).
+    avgs = get_league_averages(conn, league=league, before_date=before_date)
+    avg_home, avg_away = avgs["avg_home"], avgs["avg_away"]
 
     attack_vals = [r["ra"] for r in raw.values() if r["ra"] is not None and r["aw"] >= MIN_ATTACK_WEIGHT]
     defense_vals = [r["rd"] for r in raw.values() if r["rd"] is not None and r["dw"] >= MIN_DEFENSE_WEIGHT]
     attack_mean = mean(attack_vals) if attack_vals else None
     attack_sd = pstdev(attack_vals) if len(attack_vals) > 1 else 0.0
-    defense_scale = (baseline / mean(defense_vals)) if defense_vals else None
+    defense_mean = mean(defense_vals) if defense_vals else None
 
     results = {}
     for tid, players in by_team.items():
         r = raw[tid]
         has_attack = r["ra"] is not None and r["aw"] >= MIN_ATTACK_WEIGHT and attack_mean is not None
-        has_defense = r["rd"] is not None and r["dw"] >= MIN_DEFENSE_WEIGHT and defense_scale is not None
+        has_defense = r["rd"] is not None and r["dw"] >= MIN_DEFENSE_WEIGHT and defense_mean is not None
 
         # No fixed target spread (unlike WC's ATTACK_LAMBDA_SD) -- the single-league
         # sample here is too small to set one responsibly. Just re-center to baseline
-        # and keep the raw sample spread.
-        la_player = (baseline + (r["ra"] - attack_mean)) if has_attack else None
-        ld_player = (r["rd"] * defense_scale) if has_defense else None
+        # and keep the raw sample spread. Player data still has no home/away split of
+        # its own (Scenario 4, deferred) -- the same recentered deviation is re-based
+        # onto the home and away league averages separately here, purely so it's
+        # dimensionally consistent with the team-level home/away split it's blended
+        # against below (same "opponent-scored units" convention for defense).
+        la_player_home = (avg_home + (r["ra"] - attack_mean)) if has_attack else None
+        la_player_away = (avg_away + (r["ra"] - attack_mean)) if has_attack else None
+        ld_player_home = (r["rd"] * (avg_away / defense_mean)) if has_defense else None
+        ld_player_away = (r["rd"] * (avg_home / defense_mean)) if has_defense else None
 
-        team_attack, team_defense = team_level_lambda(conn, tid, league, before_date)
-        # True cold start (a newly-promoted team's first few matches: zero team-level
-        # history AND player data too thin to clear MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT
-        # yet) -- fall back to the league baseline, same "assume average" philosophy
-        # estimate_lambdas() already uses for a team-level-only team with no history.
-        # Without this, blend() would return None (team_val) for a team with neither
-        # signal, crashing analyse_match_wc's lambda_H/lambda_A arithmetic downstream.
-        if team_attack is None:
-            team_attack = baseline
-        if team_defense is None:
-            team_defense = baseline
+        team_home_attack, team_away_attack, team_home_defense, team_away_defense = \
+            team_level_lambda(conn, tid, league, before_date, avg_home, avg_away, team_metric=team_metric)
 
         def blend(player_val, team_val, w):
+            # team_val is always defined now (team_level_lambda falls back to the
+            # league average itself), so the only real branch is missing player data.
             if player_val is None:
                 return team_val, 1.0
-            if team_val is None:
-                return player_val, 0.0
             return (1 - w) * player_val + w * team_val, w
 
         squad_ids = current_squad_ids_by_team.get(tid) if current_squad_ids_by_team is not None else None
@@ -427,8 +557,10 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
             conn, tid, league, "attack", season, current_squad_ids=squad_ids)
         w_def = w_defense if w_defense is not None else resolve_blend_weight(
             conn, tid, league, "defense", season, current_squad_ids=squad_ids)
-        la_blend, w_a_used = blend(la_player, team_attack, w_att)
-        ld_blend, w_d_used = blend(ld_player, team_defense, w_def)
+        attack_home_blend, w_a_used = blend(la_player_home, team_home_attack, w_att)
+        attack_away_blend, _ = blend(la_player_away, team_away_attack, w_att)
+        defense_home_blend, w_d_used = blend(ld_player_home, team_home_defense, w_def)
+        defense_away_blend, _ = blend(ld_player_away, team_away_defense, w_def)
 
         if w_a_used == 0.0 and w_d_used == 0.0:
             basis = "player"
@@ -438,11 +570,14 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
             basis = f"mix(w_att={w_a_used:g},w_def={w_d_used:g})"
 
         results[tid] = {
-            "lambda_attack_player": la_player, "lambda_defense_player": ld_player,
-            "lambda_attack_team": team_attack, "lambda_defense_team": team_defense,
-            "lambda_attack_blend": la_blend, "lambda_defense_blend": ld_blend,
+            "lambda_attack_player_home": la_player_home, "lambda_attack_player_away": la_player_away,
+            "lambda_defense_player_home": ld_player_home, "lambda_defense_player_away": ld_player_away,
+            "lambda_attack_team_home": team_home_attack, "lambda_attack_team_away": team_away_attack,
+            "lambda_defense_team_home": team_home_defense, "lambda_defense_team_away": team_away_defense,
+            "lambda_attack_home_blend": attack_home_blend, "lambda_attack_away_blend": attack_away_blend,
+            "lambda_defense_home_blend": defense_home_blend, "lambda_defense_away_blend": defense_away_blend,
             "weight_attack": w_a_used, "weight_defense": w_d_used, "basis": basis,
-            "baseline": baseline,
+            "avg_home": avg_home, "avg_away": avg_away,
         }
     return results
 
@@ -487,27 +622,30 @@ def main():
     results = compute(conn, team_ids, args.league, args.season, before_date,
                       args.weight_attack, args.weight_defense)
 
-    print(f"{'TEAM':<20} {'P-ATT':>7} {'P-DEF':>7}   {'T-ATT':>7} {'T-DEF':>7}   "
-          f"{'BLEND-ATT':>9} {'BLEND-DEF':>9}  BASIS")
+    print(f"{'TEAM':<20} {'BLEND-ATT(H/A)':>17} {'BLEND-DEF(H/A)':>17}  BASIS")
     for tid in team_ids:
         r = results[tid]
         def fmt(v):
-            return f"{v:7.3f}" if v is not None else f"{'--':>7}"
-        print(f"{names[tid]:<20} {fmt(r['lambda_attack_player'])} {fmt(r['lambda_defense_player'])}   "
-              f"{fmt(r['lambda_attack_team'])} {fmt(r['lambda_defense_team'])}   "
-              f"{fmt(r['lambda_attack_blend'])} {fmt(r['lambda_defense_blend'])}  {r['basis']}")
+            return f"{v:6.3f}" if v is not None else f"{'--':>6}"
+        print(f"{names[tid]:<20} "
+              f"{fmt(r['lambda_attack_home_blend'])}/{fmt(r['lambda_attack_away_blend'])}   "
+              f"{fmt(r['lambda_defense_home_blend'])}/{fmt(r['lambda_defense_away_blend'])}  {r['basis']}")
 
         if args.persist:
+            # soccer_player_team_strength doesn't have home/away-split columns yet
+            # (nothing downstream reads this table so far -- tasks 6/7, not built).
+            # Persisting the home-side values only, as a known simplification.
             set_player_team_strength(
                 tid, args.league,
-                lambda_attack_player=r["lambda_attack_player"],
-                lambda_defense_player=r["lambda_defense_player"],
-                lambda_attack_team=r["lambda_attack_team"],
-                lambda_defense_team=r["lambda_defense_team"],
-                lambda_attack_blend=r["lambda_attack_blend"],
-                lambda_defense_blend=r["lambda_defense_blend"],
+                lambda_attack_player=r["lambda_attack_player_home"],
+                lambda_defense_player=r["lambda_defense_player_home"],
+                lambda_attack_team=r["lambda_attack_team_home"],
+                lambda_defense_team=r["lambda_defense_team_home"],
+                lambda_attack_blend=r["lambda_attack_home_blend"],
+                lambda_defense_blend=r["lambda_defense_home_blend"],
                 weight_attack=r["weight_attack"], weight_defense=r["weight_defense"],
-                basis=r["basis"], notes="prototype v1", conn=conn,
+                basis=r["basis"], notes="prototype v1 (home-side only; see FEATURE-011_BUILD_TRACKER.md)",
+                conn=conn,
             )
     conn.close()
 

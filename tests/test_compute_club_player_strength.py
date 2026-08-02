@@ -128,7 +128,7 @@ def test_excludes_legacy_season_total_rows_without_match_id(tmp_path):
         CREATE TABLE soccer_player_stats (stat_id INTEGER PRIMARY KEY, player_id INTEGER,
                                           match_id INTEGER, season INTEGER, venue TEXT,
                                           minutes_played INTEGER, goals INTEGER,
-                                          xg REAL, club_ga_per90 REAL);
+                                          xg REAL, club_ga_per90 REAL, club_xga_per90 REAL);
     """)
     raw.execute("INSERT INTO soccer_players (player_id, team_id, position) VALUES (1, 10, 'M')")
     raw.execute("INSERT INTO soccer_matches (match_id, home_team_id, away_team_id) VALUES (501, 10, 99)")
@@ -410,17 +410,100 @@ def test_load_team_players_before_date_excludes_later_matches(db_path, conn):
 
 def test_compute_falls_back_to_baseline_for_true_cold_start_team(db_path, conn):
     """A newly-promoted team's very first match: zero team-level history (no prior
-    matches at all, so team_level_lambda returns None) AND zero player data (nothing
-    clears MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT). Real bug found running the actual
-    Success Criteria backtest: blend() returned None for both lambdas, crashing
-    analyse_match_wc's arithmetic downstream. Must fall back to the league baseline
-    instead -- same "assume average" philosophy estimate_lambdas() already uses for a
-    team-level-only team with no history."""
+    matches at all) AND zero player data (nothing clears MIN_ATTACK_WEIGHT/
+    MIN_DEFENSE_WEIGHT). team_level_lambda (2026-08-01 home/away-split rewrite) always
+    falls back to the relevant league average per component now, so this can no longer
+    crash analyse_match_wc's arithmetic downstream the way the pre-fix None value did --
+    same "assume average" philosophy estimate_lambdas() already uses for a team-level-
+    only team with no history, now applied per home/away side instead of one pooled
+    baseline."""
     team_id, opp_id, m1 = _seed_match(conn, "NewlyPromoted", "Opponent", date="2025-08-23")
 
     results = strength.compute(conn, [team_id], "Serie A", 2025, before_date="2025-08-23")
     r = results[team_id]
-    assert r["lambda_attack_blend"] is not None
-    assert r["lambda_defense_blend"] is not None
-    assert r["lambda_attack_blend"] == pytest.approx(r["baseline"])
-    assert r["lambda_defense_blend"] == pytest.approx(r["baseline"])
+    assert r["lambda_attack_home_blend"] == pytest.approx(r["avg_home"])
+    assert r["lambda_attack_away_blend"] == pytest.approx(r["avg_away"])
+    assert r["lambda_defense_home_blend"] == pytest.approx(r["avg_away"])
+    assert r["lambda_defense_away_blend"] == pytest.approx(r["avg_home"])
+
+
+# ── get_team_xg_ratings / team_level_lambda's team_metric switch ──────────────────
+# 2026-08-02: team-level ratings now default to xG/xGA instead of actual goals (see
+# FEATURE-011_BUILD_TRACKER.md task 5 -- this is what actually cleared the Model
+# Calibration success criterion, after a goals-based last-N-matches window proved too
+# noisy). No dedicated coverage existed for this before it became the default.
+
+def test_get_team_xg_ratings_home_attack_is_own_teams_summed_xg(db_path, conn):
+    """A team's home_attack (xG) is the sum of ITS OWN players' xg that match, not
+    the opponent's."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    p2 = sports_db.add_player(opp, "OppStriker", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.5, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="away", minutes_played=90, xg=0.8, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-02", n=10, league="Serie A")
+    assert ratings["home_attack"] == pytest.approx(1.5)
+    assert ratings["home_n"] == 1
+
+
+def test_get_team_xg_ratings_home_defense_is_opponents_summed_xg(db_path, conn):
+    """A team's home_defense (xGA) is the AWAY opponent's total xG that match --
+    already stored per-row as club_xga_per90 (backfill_club_xga.py), constant across
+    a team's own rows for that match."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Defender", position="D", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90,
+                                     xg=0.2, club_xga_per90=2.3, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-02", n=10, league="Serie A")
+    assert ratings["home_defense"] == pytest.approx(2.3)
+
+
+def test_get_team_xg_ratings_respects_before_date(db_path, conn):
+    """A match on/after before_date must not leak into the rating -- same no-lookahead
+    discipline as get_team_ratings (BUG-008)."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=5.0, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-01", n=10, league="Serie A")
+    assert ratings["home_n"] == 0
+    assert ratings["home_attack"] is None
+
+
+def test_get_team_xg_ratings_limits_to_last_n_matches(db_path, conn):
+    """Only the most recent n matches (by date) are averaged in, same window
+    convention as get_team_ratings."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.0, conn=conn)
+    sports_db.add_player_match_stats(p1, m2, season=2025, venue="home", minutes_played=90, xg=3.0, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-09", n=1, league="Serie A")
+    assert ratings["home_n"] == 1
+    assert ratings["home_attack"] == pytest.approx(3.0)  # only the more recent match
+
+
+def test_team_level_lambda_defaults_to_xg_not_goals(db_path, conn):
+    """team_metric defaults to 'xg' (2026-08-02) -- must reflect the xG-based number,
+    not the goals-based one, proving the default is really wired to
+    get_team_xg_ratings and not silently still using core.get_team_ratings. Uses a
+    deliberately large goals-vs-xg gap (5 actual goals a match vs 1.0 xg) so the two
+    paths can't coincidentally agree."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    _, _, m3 = _seed_match(conn, "TeamA", "OppC", date="2025-09-15")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    for mid in (m1, m2, m3):
+        sports_db.update_soccer_match_result(mid, 5, 0)
+        sports_db.add_player_match_stats(p1, mid, season=2025, venue="home", minutes_played=90, xg=1.0, conn=conn)
+
+    default_result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1)
+    xg_result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1, team_metric="xg")
+    goals_result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1, team_metric="goals")
+
+    assert default_result[0] == pytest.approx(xg_result[0]) == pytest.approx(1.0)
+    assert goals_result[0] == pytest.approx(5.0)
+    assert default_result[0] != pytest.approx(goals_result[0])

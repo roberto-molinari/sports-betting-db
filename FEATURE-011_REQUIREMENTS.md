@@ -357,16 +357,20 @@ Strength Estimation): a separate report, not part of this pick output.
 
 ## Success Criteria
 
-**Signed bias target:** same target and measurement approach as the team-level tuning
-(BUG-009) — signed bias vs. sharp-book closing lines within **±0.01-0.02** (not raw/absolute
-distance), using the existing no-mixing-within-a-season rule for book selection (Pinnacle-only
-or Betfair-only depending on a season's data completeness, never both within the same season).
+**Model Calibration:** home and away model probabilities vs. sharp-book implied probabilities
+from closing lines, compared separately. Each (home and away) within **±0.01-0.02** (not
+raw/absolute distance), using the existing no-mixing-within-a-season rule for book selection
+(Pinnacle-only or Betfair-only depending on a season's data completeness, never both within the
+same season). Never pooled into a single number — home/draw/away probabilities sum to 100%, so
+a pooled measure can't detect a bias where the two sides' errors offset each other, which is
+exactly the failure mode this project has a documented history of (BUG-009).
 
-**ROI:** positive ROI on full-season backtesting is a **hard requirement**, not just a
-directional/validation-only check — a harder bar than the team-level work cleared. (For
-context: after BUG-009's fix, ROI stayed net-negative across all three backtested seasons even
-though signed bias measurably improved — this is a materially higher bar than what's been hit
-so far.)
+**Model-generated ROI:** positive at EV>0%, EV>5%, and EV>10% — must not flip negative as the
+threshold rises. A harder bar than the team-level work cleared (for context: after BUG-009's
+fix, ROI stayed net-negative across all three backtested seasons even though signed bias
+measurably improved). EV is defined as the gap between model probability and soft-book
+(Bet365) implied probability — not sharp-book, since the goal is exploitable edge against a
+book that lags the sharp closing line, not disagreement with the sharp line itself.
 
 **Gating:** Serie A must clear both bars above before European-league work begins. Serie A is
 targeted to be built, validated, and cleared several days before August 15, so the European

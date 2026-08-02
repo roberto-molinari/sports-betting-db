@@ -149,6 +149,22 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
     home_id, away_id = match_row["home_team_id"], match_row["away_team_id"]
 
     stats_rows = client.get_data(f"matches/{api_match_id}/player-stats") or []
+
+    # Club xGA = the OPPOSING team's total xG in this match -- the API has no
+    # expected-goals-against field (checked 2026-08-02, no such field anywhere in the
+    # player-stats payload), so this is derived the same way club_ga_per90 already is:
+    # locally, from data already being pulled, not a separate API call. Needs a first
+    # pass over all rows (both teams) before any row can be written, since a player's
+    # xGA depends on their opponent's full-match total.
+    team_xg = {home_id: 0.0, away_id: 0.0}
+    for row in stats_rows:
+        team_id = team_api_id_reverse.get(row.get("team_id"))
+        if team_id in team_xg:
+            xg = (row.get("shooting") or {}).get("expected_goals")
+            if xg is not None:
+                team_xg[team_id] += xg
+    opponent_xg = {home_id: team_xg[away_id], away_id: team_xg[home_id]}
+
     n_stats = 0
     for row in stats_rows:
         api_team_id = row.get("team_id")
@@ -166,6 +182,7 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
             club_ga = match_row["home_score"]
         else:
             club_ga = None
+        club_xga = opponent_xg.get(team_id)
 
         if not dry_run:
             player_id = add_player(team_id, row["player_name"], position=row.get("position"),
@@ -180,6 +197,7 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
                 goals=shooting.get("goals"),
                 assists=(row.get("passing") or {}).get("assists"),
                 club_ga_per90=club_ga,
+                club_xga_per90=club_xga,
                 source="thestatsapi",
             )
         n_stats += 1
