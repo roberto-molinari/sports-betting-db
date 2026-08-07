@@ -110,6 +110,37 @@ def test_add_player_without_api_id_does_not_collide_across_teams(db_path, conn):
     assert a != b
 
 
+def test_add_player_set_team_id_false_does_not_overwrite_existing_team(db_path, conn):
+    """A historical/backfill import (e.g. a promoted team's PRIOR Serie B season,
+    imported after their current Serie A season already exists) must not stomp
+    team_id back to the old club -- that would corrupt the live
+    current_squad_player_ids() signal. set_team_id=False should still update
+    position/api_player_id, just not team_id, for an already-existing player."""
+    old_team = sports_db.ensure_soccer_team("Spezia", "Serie B")
+    new_team = sports_db.ensure_soccer_team("Cremonese", "Serie A")
+
+    current = sports_db.add_player(new_team, "Example Player", position="M",
+                                    api_player_id="pl_555", conn=conn)
+    backfilled = sports_db.add_player(old_team, "Example Player", position="M",
+                                      api_player_id="pl_555", conn=conn, set_team_id=False)
+
+    assert current == backfilled
+    cur = conn.cursor()
+    cur.execute("SELECT team_id FROM soccer_players WHERE player_id = ?", (current,))
+    assert cur.fetchone()[0] == new_team
+
+
+def test_add_player_set_team_id_false_still_sets_team_id_on_new_player(db_path, conn):
+    """set_team_id=False only protects an EXISTING row -- a brand-new player still
+    needs a team_id to be usable at all."""
+    team = sports_db.ensure_soccer_team("Sassuolo", "Serie B")
+    player = sports_db.add_player(team, "New Player", position="D",
+                                  api_player_id="pl_777", conn=conn, set_team_id=False)
+    cur = conn.cursor()
+    cur.execute("SELECT team_id FROM soccer_players WHERE player_id = ?", (player,))
+    assert cur.fetchone()[0] == team
+
+
 # ── add_player_match_stats ───────────────────────────────────────────────────────
 
 def test_add_player_match_stats_round_trip(db_path, conn):

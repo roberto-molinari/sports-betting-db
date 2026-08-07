@@ -1457,7 +1457,7 @@ def get_nhl_matches(season=None, status=None):
     return rows
 
 
-def add_player(team_id, name, position=None, api_player_id=None, conn=None):
+def add_player(team_id, name, position=None, api_player_id=None, conn=None, set_team_id=True):
     """Insert a club-league player if not already present; return player_id.
 
     Looks up by api_player_id FIRST when given -- it's the one globally stable
@@ -1467,6 +1467,21 @@ def add_player(team_id, name, position=None, api_player_id=None, conn=None):
     only when no api_player_id is available. team_id is treated as "most recently
     seen team", not history -- per-match team_id on soccer_player_stats /
     soccer_player_match_lineups is the source of truth for who played for whom when.
+
+    set_team_id: when False, an EXISTING player's team_id is left untouched (still
+    used, along with name/position, to create a brand-new player row). Pass False
+    from any historical/backfill call site (a past-season or lower-division import,
+    e.g. import_club_player_stats.py backfilling prior Serie B seasons) -- those
+    calls process matches out of real-world chronological order relative to data
+    already in the DB, so "most recently written wins" no longer means "most
+    recently played for". Without this, backfilling e.g. a promoted team's PRIOR
+    Serie B season after their current Serie A season is already imported would
+    silently stomp team_id back to the old club, corrupting the live
+    current_squad_player_ids() signal that resolve_blend_weight depends on for real
+    predictions (found 2026-08-03 while designing the cross-league player-history
+    ingestion, FEATURE-011). import_club_squads.py's live current-roster pull is the
+    one call site that should keep set_team_id=True (default) -- it's the sole
+    authority for "who's on the roster right now".
     """
     owns_connection = conn is None
     if owns_connection:
@@ -1487,14 +1502,23 @@ def add_player(team_id, name, position=None, api_player_id=None, conn=None):
             )
             existing = cur.fetchone()
         if existing:
-            cur.execute(
-                """UPDATE soccer_players
-                   SET team_id = ?,
-                       position = COALESCE(?, position),
-                       api_player_id = COALESCE(?, api_player_id)
-                   WHERE player_id = ?""",
-                (team_id, position, api_player_id, existing[0])
-            )
+            if set_team_id:
+                cur.execute(
+                    """UPDATE soccer_players
+                       SET team_id = ?,
+                           position = COALESCE(?, position),
+                           api_player_id = COALESCE(?, api_player_id)
+                       WHERE player_id = ?""",
+                    (team_id, position, api_player_id, existing[0])
+                )
+            else:
+                cur.execute(
+                    """UPDATE soccer_players
+                       SET position = COALESCE(?, position),
+                           api_player_id = COALESCE(?, api_player_id)
+                       WHERE player_id = ?""",
+                    (position, api_player_id, existing[0])
+                )
             conn.commit()
             return existing[0]
         cur.execute(

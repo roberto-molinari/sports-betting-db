@@ -185,8 +185,13 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
         club_xga = opponent_xg.get(team_id)
 
         if not dry_run:
+            # set_team_id=False: this is a per-match historical backfill, not the live
+            # roster authority (that's import_club_squads.py) -- see add_player's
+            # docstring. Matters once backfills stop running in real-world
+            # chronological order (e.g. a promoted team's prior Serie B season,
+            # imported after their current Serie A season already exists).
             player_id = add_player(team_id, row["player_name"], position=row.get("position"),
-                                   api_player_id=row["player_id"], conn=conn)
+                                   api_player_id=row["player_id"], conn=conn, set_team_id=False)
             shooting = row.get("shooting") or {}
             add_player_match_stats(
                 player_id, match_row["match_id"], season=season, venue=venue,
@@ -214,7 +219,7 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
                     for p in players:
                         if not dry_run:
                             player_id = add_player(team_id, p["name"], position=p.get("position"),
-                                                   api_player_id=p["id"], conn=conn)
+                                                   api_player_id=p["id"], conn=conn, set_team_id=False)
                             add_player_match_lineup(player_id, match_row["match_id"], team_id,
                                                     started, position=p.get("position"),
                                                     formation=formation, conn=conn)
