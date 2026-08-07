@@ -193,7 +193,7 @@ def test_estimate_lambdas_basic_formula():
 
 def test_estimate_lambdas_falls_back_to_league_avg_with_few_matches():
     league = {"avg_home": 1.5, "avg_away": 1.2}
-    # Below MIN_MATCHES -> ratings ignored, league averages used instead.
+    # Below TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE -> ratings ignored, league averages used instead.
     home = _ratings(5.0, 0.1, 5.0, 0.1, n=1)
     away = _ratings(5.0, 0.1, 5.0, 0.1, n=1)
     lam_h, lam_a = pm.estimate_lambdas(home, away, league)

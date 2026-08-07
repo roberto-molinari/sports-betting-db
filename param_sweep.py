@@ -1,5 +1,5 @@
 """
-Parameter sweep over SHRINKAGE_K and RECENCY_DECAY.
+Parameter sweep over TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES and TEAM_PAST_MATCH_WINDOW_DECAY.
 Runs the full backtest for each combination and prints a summary table sorted by ROI.
 """
 

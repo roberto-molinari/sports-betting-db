@@ -28,25 +28,25 @@ from core.sports_db import DATABASE_PATH
 
 # Number of recent completed matches to use per team for attack/defense ratings.
 # Only home matches are used for home_attack/home_defense; only away for away.
-RECENT_N = 10
+TEAM_PAST_MATCH_WINDOW_SIZE = 10
 
 # Scoreline grid cap.  Cells beyond this are dropped (tail probability is tiny).
 MAX_GOALS = 6
 
 # Minimum matches required to compute a rating; fall back to league average if fewer.
-MIN_MATCHES = 3
+TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
 
 # Recency decay factor.  Each game further back in time is multiplied by this weight.
 # e.g. 0.85 means the most recent game counts 1.0, the one before it 0.85,
 # the one before that 0.85^2 = 0.72, etc.
 # Set to 1.0 to disable (plain average).
-RECENCY_DECAY = 1.0
+TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
 
 # Shrinkage constant.  Blends each team rating toward the league average.
 # Higher k = more shrinkage toward league avg, less trust in team's own data.
 # rating_adj = (n * rating_team + k * league_avg) / (n + k)
 # Set to 0 to disable shrinkage.
-SHRINKAGE_K = 0
+TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
 
 # League-average window/decay (BUG-009): avg_home/avg_away are computed from
 # up to this many of the league's most recent matches (across all seasons on
@@ -60,8 +60,8 @@ SHRINKAGE_K = 0
 # simplicity. decay=1.0 (off): decay-weighting within the window tested
 # equivalent to the plain window average, not worth the added complexity.
 # window=None reverts to pre-BUG-009 behavior (all history, unwindowed).
-LEAGUE_AVG_WINDOW = 100
-LEAGUE_AVG_DECAY = 1.0
+LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
 
 # ── World Cup constants ──────────────────────────────────────────────────────
 # Baseline goals per team per international match.  Team strength lambdas are
@@ -118,8 +118,8 @@ def poisson_pmf(k: int, lam: float) -> float:
 
 def get_league_averages(conn, league: str = "Serie A", seasons: list = None,
                         before_date: str = None,
-                        window: int = LEAGUE_AVG_WINDOW,
-                        decay: float = LEAGUE_AVG_DECAY) -> dict:
+                        window: int = LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE,
+                        decay: float = LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY) -> dict:
     """
     Return league-wide average goals per match (home and away separately).
     Used as the scaling baseline for attack/defense ratings.
@@ -173,8 +173,8 @@ def get_league_averages(conn, league: str = "Serie A", seasons: list = None,
 
 
 def get_team_ratings(conn, team_id: int, before_date: str,
-                     n: int = RECENT_N, league: str = "Serie A",
-                     decay: float = RECENCY_DECAY) -> dict:
+                     n: int = TEAM_PAST_MATCH_WINDOW_SIZE, league: str = "Serie A",
+                     decay: float = TEAM_PAST_MATCH_WINDOW_DECAY) -> dict:
     """
     Compute attack and defense ratings for a team from their last N completed
     home matches (for home ratings) and last N away matches (for away ratings),
@@ -249,7 +249,7 @@ def get_team_ratings(conn, team_id: int, before_date: str,
 # Core model
 # ---------------------------------------------------------------------------
 
-def _shrink(rating: float, league_avg: float, n: int, k: float = SHRINKAGE_K) -> float:
+def _shrink(rating: float, league_avg: float, n: int, k: float = TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES) -> float:
     """
     Bayesian shrinkage: blend team rating toward league average.
     With k=5: after 5 games the weight is 50/50; after 10 games it's 67% team / 33% avg.
@@ -258,8 +258,8 @@ def _shrink(rating: float, league_avg: float, n: int, k: float = SHRINKAGE_K) ->
 
 
 def estimate_lambdas(home_ratings: dict, away_ratings: dict,
-                     league_avgs: dict, min_matches: int = MIN_MATCHES,
-                     shrinkage_k: float = SHRINKAGE_K) -> tuple[float, float]:
+                     league_avgs: dict, min_matches: int = TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE,
+                     shrinkage_k: float = TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES) -> tuple[float, float]:
     """
     Estimate expected goals (lambda) for each team.
 
@@ -416,10 +416,10 @@ def analyse_match(home_team_id: int, away_team_id: int,
                   away_moneyline: float = None,
                   league: str = "Serie A",
                   conn=None,
-                  shrinkage_k: float = SHRINKAGE_K,
-                  decay: float = RECENCY_DECAY,
-                  league_avg_window: int = LEAGUE_AVG_WINDOW,
-                  league_avg_decay: float = LEAGUE_AVG_DECAY) -> dict:
+                  shrinkage_k: float = TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES,
+                  decay: float = TEAM_PAST_MATCH_WINDOW_DECAY,
+                  league_avg_window: int = LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE,
+                  league_avg_decay: float = LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY) -> dict:
     """
     Full model pipeline for a single match. The single entry point for turning
     DB state into a prediction -- every caller that needs a match's model

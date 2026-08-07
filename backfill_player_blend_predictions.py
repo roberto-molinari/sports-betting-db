@@ -61,17 +61,28 @@ def main():
                              "bias regression comes from the blend pipeline itself rather than "
                              "from player data.")
     parser.add_argument("--weight-defense", type=float, default=None)
-    parser.add_argument("--attack-metric", choices=["xg", "goals"], default="xg",
+    parser.add_argument("--attack-metric", dest="attack_xg_v_goals_source",
+                        choices=["xg", "goals"], default="xg",
                         help="Player-level attack signal: xg (default) or goals. "
                              "Debugging/comparison only -- see compute_club_player_strength."
                              "load_team_players' docstring.")
-    parser.add_argument("--team-metric", choices=["xg", "goals"], default="xg",
-                        help="Team-level attack/defense signal: xg (default since "
-                             "2026-08-02, this file's own xG/xGA derivation -- cleared "
-                             "the Model Calibration success criterion) or goals (matches "
-                             "poisson_v3 exactly). Never changes poisson_v3 or "
-                             "core.poisson_model either way, see team_level_lambda's "
-                             "docstring.")
+    parser.add_argument("--team-xg-weight", dest="team_xg_v_goals_blend", type=float, default=1.0,
+                        help="Team-level attack/defense xG/goals blend: 1.0 (default) "
+                             "is pure xG, a no-op matching the 2026-08-02 fix that "
+                             "cleared the Model Calibration success criterion; 0.0 is "
+                             "pure goals (matches poisson_v3 exactly); values in "
+                             "between blend the two -- see BUG-009's mismatch-size-"
+                             "compression diagnosis and compute_club_player_strength."
+                             "team_level_lambda's docstring. Never changes poisson_v3 "
+                             "or core.poisson_model either way.")
+    parser.add_argument("--player-window-min-date", default=None,
+                        help="Comparison/validation only: an ISO date lower bound "
+                             "(e.g. a season start date) that stops the player-level "
+                             "rolling window from reaching further back than this, for "
+                             "A/B-checking the season-blind default (omit this flag) "
+                             "against a season-SCOPED window. See compute_club_player_"
+                             "strength.load_team_players' docstring "
+                             "(FEATURE-011 Follow-up B, 2026-08-06).")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DATABASE_PATH)
@@ -106,7 +117,8 @@ def main():
                              for tid in team_ids}
         results = strength.compute(conn, team_ids, args.league, args.season, match_date,
                                    w_attack=args.weight_attack, w_defense=args.weight_defense,
-                                   attack_metric=args.attack_metric, team_metric=args.team_metric,
+                                   attack_xg_v_goals_source=args.attack_xg_v_goals_source, team_xg_v_goals_blend=args.team_xg_v_goals_blend,
+                                   player_window_min_date=args.player_window_min_date,
                                    current_squad_ids_by_team=squad_ids_by_team)
 
         for row in date_rows:
