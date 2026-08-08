@@ -120,6 +120,28 @@ PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {
 # signatures. See team_level_lambda's docstring for the full derivation.
 TEAM_RATING_XG_V_GOALS_BLEND = 1.0
 
+# Spreads team-level xG ratings' cross-team dispersion back out, toward (but not all
+# the way to) actual-goals-level dispersion (2026-08-07, BUG-009's compression
+# finding continued: xG has LESS team-to-team spread than actual goals by
+# construction, which compresses win probabilities toward a coin flip specifically
+# on the biggest favorites/underdogs -- worst in matches like a bottom-table team
+# hosting a top-table one). For each of get_team_xg_ratings' four fields
+# (home/away attack/defense), recenters on that field's own league-wide mean at the
+# same before_date, then scales the deviation from that mean by this factor:
+#     stretched = league_mean + (raw - league_mean) * factor
+# 1.0 is an exact no-op (today's pre-2026-08-07 behavior). Swept 1.0/1.3/1.66/2.0
+# (ad hoc, both Serie A seasons): bottom6-vs-other probability gap shrinks
+# monotonically and ROI improves in BOTH seasons as the factor increases -- notably
+# different from every other compression fix tried (blend, this constant's sibling
+# above) which always showed one season winning while the other lost -- but pooled
+# away-side bias grows with the stretch and breaches the +/-0.01-0.02 Model
+# Calibration target at 1.66 in one season and at 2.0 in both. 1.3 is the largest
+# value tested that stays inside the target in both seasons, so it's the DEFAULT
+# here rather than 1.0 -- pass 1.0 to reproduce the exact pre-2026-08-07 shape for
+# comparison. See BUGS.md, BUG-009, 2026-08-07 addendum for the full sweep and the
+# combined-with-blend test (negative result -- don't combine the two).
+TEAM_RATING_XG_SPREAD_STRETCH = 1.3
+
 _MID_CODES = {"m", "mf", "cm", "dm", "am", "cdm", "cam", "rm", "lm", "mid"}
 _DEF_CODES = {"d", "df", "cb", "lb", "rb", "wb", "rwb", "lwb", "def"}
 _FWD_CODES = {"f", "fw", "fwd", "st", "cf", "ss", "rw", "lw"}
@@ -540,8 +562,29 @@ def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZ
     }
 
 
+def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_PAST_MATCH_WINDOW_SIZE):
+    """League-wide mean of each of get_team_xg_ratings' four fields across
+    team_ids, at the same (league, before_date, n) every team_ids member will
+    be rated at -- the recentering point TEAM_RATING_XG_SPREAD_STRETCH stretches
+    around. Depends only on (league, before_date, n), not on which team is
+    currently being rated, so compute() calls this ONCE per call and passes the
+    result to every team's team_level_lambda call, rather than each team
+    re-deriving the whole league's snapshot itself."""
+    fields = ("home_attack", "home_defense", "away_attack", "away_defense")
+    sums = {f: 0.0 for f in fields}
+    counts = {f: 0 for f in fields}
+    for tid in team_ids:
+        ratings = get_team_xg_ratings(conn, tid, before_date, n=n, league=league)
+        for f in fields:
+            if ratings[f] is not None:
+                sums[f] += ratings[f]
+                counts[f] += 1
+    return {f: (sums[f] / counts[f] if counts[f] else None) for f in fields}
+
+
 def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=TEAM_PAST_MATCH_WINDOW_SIZE,
-                      team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND):
+                      team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND,
+                      xg_spread_stretch=TEAM_RATING_XG_SPREAD_STRETCH, league_xg_means=None):
     """Home/away-split intrinsic attack/defense for a team from the EXISTING team-level
     system, mirroring estimate_lambdas()'s own fallback/shrink logic exactly
     (TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE/TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES, and now TEAM_PAST_MATCH_WINDOW_SIZE -- the old n=25 default here didn't match
@@ -587,11 +630,29 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
     slightly different coverage -- see get_team_xg_ratings' coverage caveat); for a
     genuine blend (0 < team_xg_v_goals_blend < 1) uses the MIN of the two sources' counts,
     a conservative choice (don't fully trust a blend unless BOTH sources have enough
-    matches)."""
+    matches).
+
+    xg_spread_stretch (DEFAULT TEAM_RATING_XG_SPREAD_STRETCH -- see that constant's
+    comment for the full derivation): re-spreads the RAW xG ratings around the
+    league's own mean before they enter the blend above. Only takes effect when
+    league_xg_means is also given (the per-field league averages needed to recenter
+    on) -- this function only rates ONE team, so it can't compute a league-wide mean
+    itself without an extra full-league query; compute() calculates it once per call
+    and passes it down to every team rather than paying that cost per team. Callers
+    that don't pass league_xg_means (e.g. this function's own unit tests) get the
+    exact pre-2026-08-07 behavior regardless of xg_spread_stretch's value -- it's a
+    silent no-op without its companion, by design, so isolated tests of the blend
+    lever don't also need to fake up a league snapshot."""
     goals_ratings = (get_team_ratings(conn, team_id, before_date, n=n, league=league, decay=1.0)
                      if team_xg_v_goals_blend < 1.0 else None)
     xg_ratings = (get_team_xg_ratings(conn, team_id, before_date, n=n, league=league)
                  if team_xg_v_goals_blend > 0.0 else None)
+    if xg_ratings is not None and xg_spread_stretch != 1.0 and league_xg_means is not None:
+        xg_ratings = dict(xg_ratings)
+        for field in ("home_attack", "home_defense", "away_attack", "away_defense"):
+            v, m = xg_ratings[field], league_xg_means.get(field)
+            if v is not None and m is not None:
+                xg_ratings[field] = m + (v - m) * xg_spread_stretch
 
     def blend(field, n_field):
         g = goals_ratings[field] if goals_ratings is not None else None
@@ -630,6 +691,7 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
 def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defense=None,
            current_squad_ids_by_team=None, attack_xg_v_goals_source="xg", defense_xg_v_goals_source="xga",
            team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND,
+           xg_spread_stretch=TEAM_RATING_XG_SPREAD_STRETCH,
            player_window_size=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
            player_window_decay=PLAYER_RATING_PAST_MATCH_WINDOW_DECAY,
            player_window_min_date=None):
@@ -644,6 +706,15 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     no-op (pure xG, today's shipped behavior since 2026-08-02); 0.0 is pure goals
     (matches poisson_v3 exactly); values in between blend the two -- see that
     function's docstring (BUG-009's mismatch-size-compression diagnosis).
+
+    xg_spread_stretch: passed through to team_level_lambda, along with a
+    league_xg_means snapshot computed ONCE per compute() call (via
+    league_xg_field_means) across all of team_ids -- see TEAM_RATING_XG_SPREAD_STRETCH's
+    comment for the full derivation. 1.3 (default) is the largest factor tested that
+    stays inside the Model Calibration bias target in both seasons; pass 1.0 to
+    reproduce the exact pre-2026-08-07 shape. Skipped entirely (no snapshot query) when
+    team_xg_v_goals_blend is exactly 0.0 -- xG never enters the rating at that boundary,
+    so there's nothing to stretch.
 
     player_window_size, player_window_decay: passed through to load_team_players --
     see that function's docstring. Not yet independently tuned (starting values match
@@ -670,6 +741,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                                 window_size=player_window_size, decay=player_window_decay,
                                 min_date=player_window_min_date)
     apply_shrinkage(by_team)
+
+    league_xg_means = (league_xg_field_means(conn, team_ids, before_date, league=league)
+                       if xg_spread_stretch != 1.0 and team_xg_v_goals_blend > 0.0 else None)
 
     raw = {}
     for tid, players in by_team.items():
@@ -716,7 +790,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         ld_player_away = (r["rd"] * (avg_home / defense_mean)) if has_defense else None
 
         team_home_attack, team_away_attack, team_home_defense, team_away_defense = \
-            team_level_lambda(conn, tid, league, before_date, avg_home, avg_away, team_xg_v_goals_blend=team_xg_v_goals_blend)
+            team_level_lambda(conn, tid, league, before_date, avg_home, avg_away,
+                              team_xg_v_goals_blend=team_xg_v_goals_blend,
+                              xg_spread_stretch=xg_spread_stretch, league_xg_means=league_xg_means)
 
         def blend(player_val, team_val, w):
             # team_val is always defined now (team_level_lambda falls back to the

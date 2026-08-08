@@ -1,0 +1,104 @@
+# Model snapshot -- poisson_v4_stretch130_blend050 / Serie A
+Generated: 2026-08-07T23:34:24.501880+00:00
+Seasons: [2024, 2025]
+Note: Step 2 core tuning: COMBINED xG spread stretch=1.3 + blend lever=0.5. Ad hoc via backfill_with_xg_stretch.py, not committed. Tests whether combining both levers beats either alone.
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON = 900.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+## Brier score (all games, not just bets -- lower is better; naive baseline ~0.667)
+  season 2024: Brier = 0.5983  (n=380)
+  season 2025: Brier = 0.6103  (n=380)
+  pooled: Brier = 0.6043  (n=760)
+
+## Compression-bucket table (model p_home - Betfair Exchange closing p_home, by market's own p_home)
+  season 2024:
+     0.00-0.15: +0.054  (n=23)
+     0.15-0.25: +0.056  (n=60)
+     0.25-0.35: +0.048  (n=61)
+     0.35-0.45: +0.011  (n=73)
+     0.45-0.55: -0.040  (n=69)
+     0.55-1.01: -0.095  (n=94)
+  season 2025:
+     0.00-0.15: +0.074  (n=35)
+     0.15-0.25: +0.056  (n=48)
+     0.25-0.35: +0.037  (n=66)
+     0.35-0.45: -0.022  (n=67)
+     0.45-0.55: -0.046  (n=49)
+     0.55-1.01: -0.107  (n=94)
+
+## Pooled signed bias vs Betfair Exchange closing (home/away split, target +/-0.01-0.02)
+  season 2024: home=-0.0088  away=+0.0199  draw=-0.0111  (n=380)
+  season 2025: home=-0.0168  away=+0.0205  draw=-0.0036  (n=359)
+
+## ROI vs Bet365 (ROI success criterion -- must be positive at EV>0/5/10%)
+
+poisson_v4_stretch130_blend050 | Serie A season 2024 | vs Bet365 | EV threshold +0.0% | 380 graded matches
+  Bets: 452  Wins: 113  Win rate: 25.0%
+  Total staked: $452.00  Profit: $-84.16  ROI: -18.6%
+
+  By side:
+     home  n=135  wins=36   profit=$  -45.29  ROI=-33.5%
+     draw  n=113  wins=24   profit=$  -14.12  ROI=-12.5%
+     away  n=204  wins=53   profit=$  -24.75  ROI=-12.1%
+
+poisson_v4_stretch130_blend050 | Serie A season 2024 | vs Bet365 | EV threshold +5.0% | 380 graded matches
+  Bets: 379  Wins: 88  Win rate: 23.2%
+  Total staked: $379.00  Profit: $-70.16  ROI: -18.5%
+
+  By side:
+     home  n=115  wins=27   profit=$  -41.42  ROI=-36.0%
+     draw  n=84   wins=17   profit=$   -8.52  ROI=-10.1%
+     away  n=180  wins=44   profit=$  -20.22  ROI=-11.2%
+
+poisson_v4_stretch130_blend050 | Serie A season 2024 | vs Bet365 | EV threshold +10.0% | 380 graded matches
+  Bets: 309  Wins: 63  Win rate: 20.4%
+  Total staked: $309.00  Profit: $-72.96  ROI: -23.6%
+
+  By side:
+     home  n=98   wins=20   profit=$  -39.99  ROI=-40.8%
+     draw  n=53   wins=9    profit=$  -11.57  ROI=-21.8%
+     away  n=158  wins=34   profit=$  -21.40  ROI=-13.5%
+
+poisson_v4_stretch130_blend050 | Serie A season 2025 | vs Bet365 | EV threshold +0.0% | 350 graded matches
+  Bets: 445  Wins: 110  Win rate: 24.7%
+  Total staked: $445.00  Profit: $-38.98  ROI: -8.8%
+
+  By side:
+     home  n=127  wins=36   profit=$  -20.10  ROI=-15.8%
+     draw  n=122  wins=27   profit=$   -7.56  ROI=-6.2%
+     away  n=196  wins=47   profit=$  -11.32  ROI=-5.8%
+
+poisson_v4_stretch130_blend050 | Serie A season 2025 | vs Bet365 | EV threshold +5.0% | 350 graded matches
+  Bets: 380  Wins: 90  Win rate: 23.7%
+  Total staked: $380.00  Profit: $-35.20  ROI: -9.3%
+
+  By side:
+     home  n=105  wins=28   profit=$  -17.81  ROI=-17.0%
+     draw  n=97   wins=20   profit=$  -12.24  ROI=-12.6%
+     away  n=178  wins=42   profit=$   -5.15  ROI=-2.9%
+
+poisson_v4_stretch130_blend050 | Serie A season 2025 | vs Bet365 | EV threshold +10.0% | 350 graded matches
+  Bets: 321  Wins: 71  Win rate: 22.1%
+  Total staked: $321.00  Profit: $-31.70  ROI: -9.9%
+
+  By side:
+     home  n=90   wins=23   profit=$  -12.59  ROI=-14.0%
+     draw  n=72   wins=14   profit=$  -11.74  ROI=-16.3%
+     away  n=159  wins=34   profit=$   -7.37  ROI=-4.6%

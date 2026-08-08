@@ -75,6 +75,12 @@ def main():
                              "compression diagnosis and compute_club_player_strength."
                              "team_level_lambda's docstring. Never changes poisson_v3 "
                              "or core.poisson_model either way.")
+    parser.add_argument("--xg-stretch", dest="xg_spread_stretch", type=float,
+                        default=strength.TEAM_RATING_XG_SPREAD_STRETCH,
+                        help="Team-level xG rating spread multiplier (default: the shipped "
+                             "TEAM_RATING_XG_SPREAD_STRETCH, currently 1.3). 1.0 reproduces "
+                             "the pre-2026-08-07 shape exactly -- see that constant's comment "
+                             "and BUG-009's 2026-08-07 addendum.")
     parser.add_argument("--player-window-min-date", default=None,
                         help="Comparison/validation only: an ISO date lower bound "
                              "(e.g. a season start date) that stops the player-level "
@@ -118,6 +124,7 @@ def main():
         results = strength.compute(conn, team_ids, args.league, args.season, match_date,
                                    w_attack=args.weight_attack, w_defense=args.weight_defense,
                                    attack_xg_v_goals_source=args.attack_xg_v_goals_source, team_xg_v_goals_blend=args.team_xg_v_goals_blend,
+                                   xg_spread_stretch=args.xg_spread_stretch,
                                    player_window_min_date=args.player_window_min_date,
                                    current_squad_ids_by_team=squad_ids_by_team)
 

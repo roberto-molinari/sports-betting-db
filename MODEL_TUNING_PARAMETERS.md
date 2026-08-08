@@ -141,6 +141,18 @@ Blends a team's rating between actual-goals-based and xG-based sources — one e
 pure actual goals, the other end is pure xG, with a genuine blend in between. *Docs:
 long docstring (added alongside this parameter).*
 
+### `TEAM_RATING_XG_SPREAD_STRETCH` (`team_level_lambda` / `compute()`)
+Spreads team-level xG ratings' cross-team dispersion back out toward (not all the way
+to) actual-goals-level dispersion, recentered on the league's own xG mean — xG has
+less team-to-team spread than actual goals by construction, which compresses win
+probabilities toward a coin flip on the biggest mismatches (BUG-009). 1.0 is a no-op;
+the shipped default (1.3) is the largest factor tested that stays inside the Model
+Calibration bias target in both seasons. Only takes effect when `compute()` calls it
+(it supplies the league-wide means via `league_xg_field_means`) — calling
+`team_level_lambda` directly without that snapshot is always a no-op regardless of
+this value. *Docs: long docstring on the constant itself plus `team_level_lambda`'s
+own docstring; see BUGS.md, BUG-009, 2026-08-07 addendum for the sweep.*
+
 ### `PLAYER_RATING_PAST_MATCH_WINDOW_SIZE`
 How many of a player's most recent appearances (for whichever team they were actually
 playing for at the time, ignoring season boundaries) count toward their current

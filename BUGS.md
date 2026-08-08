@@ -631,6 +631,231 @@ BUG-008's fix for why: this affects `analyse_match()` directly, the shared entry
 caller (live picks, backfills, `param_sweep.py`) now goes through, so whichever way this is
 decided should apply uniformly rather than as a caller-specific override.
 
+**2026-08-07: MD20-28's bottom6 ROI collapse traced back to THIS bug's compression finding,
+localized to team-level xG/xGA specifically -- and a candidate fix tested (not shipped) with
+better results than any prior compression fix.** Picked back up while digging into
+FEATURE-011 Follow-up B's post-implementation validation (below) -- the season-blind window
+didn't move MD20-28's bottom6 collapse at all (expected: roster staleness was already ruled
+out as the driver, 2026-08-05 above), so dug into WHY the collapse concentrates there.
+
+- **Not a pricing-window effect.** Checked whether sharp books or the model re-price
+  bottom6-vs-other matchups differently in MD20-28 specifically (four candidate mechanisms:
+  sharp lowering/raising odds more in-window, model doing the same) -- all four ruled out.
+  The model-vs-sharp gap on the bottom6 side is ~flat all season (+7.8pp MD1-9, +6.9pp
+  MD10-19, +7.4pp MD20-28, +5.2pp MD29-38, both seasons pooled, n=328 bottom6-vs-other
+  matches). MD20-28 isn't even the largest gap.
+- **What IS different: fixture composition + variance.** MD20-28 simply contains more
+  extreme lopsided bottom6-vs-strong-team fixtures than other windows -- 21.8% of its
+  bottom6 matchups are sharp-book sub-10% longshots, vs 14.5-15.5% in MD1-9/MD10-19. A
+  roughly constant ABSOLUTE probability-overrating bias does much more damage applied to a
+  5%-vs-12% mismatch than a 25%-vs-32% one (payout convexity near the tail), so the same
+  bias produces outsized EV numbers specifically where these fixtures cluster.
+- **Isolated to team-level, not player-level, and not a generic "model can't use xG"
+  issue.** Sweeping `team_xg_v_goals_blend` (team-level xG-vs-goals) 1.0->0.0 shrinks the
+  bottom6-vs-sharp gap by 44% (6.9pp->3.9pp), monotonically. Sweeping
+  `attack_xg_v_goals_source`/`defense_xg_v_goals_source` (player-level) the same way only
+  shrinks it 7% (6.9pp->6.4pp). Both fully de-xG'd together: 3.4pp remains -- so xG-reliance
+  (mostly team-level) explains roughly half the gap, not all of it.
+- **Confirmed this IS the already-known compression property (BUG-009 diagnosis #2 above),
+  not a new bug -- magnitude matches almost exactly.** Directly measured, on this specific
+  bottom6-vs-other match set (n=328, point-in-time correct): the opponent-minus-bottom6
+  ATTACK RATING gap is 45.3% smaller under xG than under goals (+0.483 goals/match vs
+  +0.264 xG/match) -- essentially the same size as the 44% probability-gap reduction found
+  above. No separate mechanism needed to explain the size of the effect.
+- **Code verified clean -- team-level xG/xGA really is just "sum of player xG," and the sum
+  is implemented correctly.** `get_team_xg_ratings`' SQL groups by `(match_id, venue)` (all
+  of one team's players in one match), and `backfill_club_xga.py`'s
+  `compute_match_team_xg` does the same for the opponent side, with the
+  home/away-opponent lookup verified correct (not swapped). Added test coverage that didn't
+  exist before: `tests/test_backfill_club_xga.py` (new file, 4 tests -- multi-player sum,
+  NULL-teammate handling, home/away tracked separately, end-to-end own-vs-opponent
+  assignment) and 2 new multi-player-sum tests in `tests/test_compute_club_player_strength.py`
+  (`test_get_team_xg_ratings_sums_all_of_a_teams_players_not_just_one`,
+  `test_get_team_xg_ratings_sum_ignores_teammates_with_no_xg_data`) -- all existing
+  `get_team_xg_ratings` tests only ever used one player per team per match, never actually
+  exercising the SUM. **Not yet committed.**
+- **Candidate fix tested (ad hoc script, not committed, not shipped): stretch team-level xG
+  ratings' spread back toward goals-level dispersion, instead of blending xG away.**
+  `stretched = league_xg_mean + (raw_xg - league_xg_mean) * factor`, applied to each of
+  `get_team_xg_ratings`' four fields before the existing shrink/blend pipeline (recenters on
+  the league's OWN xG mean per `before_date`, not the goals-based `avg_home`/`avg_away`).
+  Swept factor 1.0 (no-op) / 1.3 / 1.66 (the empirically-measured goals-stdev/xG-stdev
+  ratio) / 2.0, full pipeline, both seasons separately:
+
+  | Factor | bottom6 gap | 2024 ROI @0/5/10% | 2025 ROI @0/5/10% | 2024/2025 away bias |
+  |---|---|---|---|---|
+  | 1.0 (today) | +6.9pp | -13.4%/-14.8%/-23.9% | -8.1%/-6.1%/-4.4% | +0.0056/+0.0140 |
+  | 1.3 | +5.0pp | -9.2%/-12.6%/-19.9% | -9.8%/-6.6%/-8.5% | +0.0099/+0.0177 |
+  | 1.66 | +2.9pp | -8.0%/-8.4%/-13.1% | -9.3%/-5.9%/-4.9% | +0.0153/**+0.0229** |
+  | 2.0 | +1.2pp | -7.9%/-5.8%/-4.7% | -5.5%/-4.3%/-3.5% | **+0.0203**/**+0.0280** |
+
+  Bottom6 gap shrinks monotonically as designed. **ROI improves in BOTH seasons as the
+  factor increases -- notably different from every other compression fix tried in this
+  file (blend, additive->multiplicative below) which showed one season winning while the
+  other lost.** But away-side pooled bias grows with the stretch and **breaches the
+  +/-0.01-0.02 Model Calibration target at factor=1.66 in 2025 and at factor=2.0 in both
+  seasons** -- the literal "restore full goals-level spread" value (1.66) already
+  overcorrects, plausibly because goals-based ratings are noisier/wider partly from
+  small-sample variance, not purely truer signal (the original reason xG replaced goals as
+  the team-level default). factor~1.3 looks like the practical safe ceiling (inside target
+  both seasons, real if partial ROI gain); the true bias-breach boundary sits somewhere
+  between 1.3 and 1.66, not yet pinned down.
+
+**Next steps (not started):** (a) finer sweep between factor=1.3 and 1.66 to find the actual
+bias-breach boundary rather than the coarse grid above; (b) check whether combining a modest
+stretch with a partial `team_xg_v_goals_blend` reduction (rather than either lever alone)
+reaches a better bias/ROI tradeoff than either does by itself; (c) commit the two new test
+files/additions above (currently sitting uncommitted) once this thread is done, independent
+of whether the stretch fix itself ships; (d) if a safe factor is chosen, promote it from ad
+hoc script into a real, named, documented constant (`MODEL_TUNING_PARAMETERS.md` +
+`compute_club_player_strength.py`) with a temporary rollout toggle, same pattern as every
+other lever in this file -- not shipped as a silent default without that.
+
+**2026-08-07: combined stretch+blend tested -- negative result, dropped.** Ran
+factor=1.3 stretch together with `team_xg_v_goals_blend=0.5` (a 50/50 xG/goals blend),
+both seasons, via `backfill_with_xg_stretch.py`. Worse than stretch=1.3 alone on both
+bias and ROI in 2024, and roughly similar-to-worse in 2025 -- directly contradicts next
+step (b) above's premise that combining might reach a better tradeoff than either lever
+alone. Decision: drop the blend lever entirely, keep stretch=1.3 as the sole core-tuning
+candidate going forward.
+
+**2026-08-07: step 3 of the ROI-improvement plan (output recalibration) tested --
+negative result, not pursued further.** Built `recalibrate_output.py`: a post-hoc
+correction curve from bucketed (model's own p -> mean market-minus-model gap),
+linearly interpolated between 6 bucket midpoints, applied per side on top of the
+stretch=1.3 baseline. Fit/apply split three ways -- fit 2024/apply 2025, fit 2025/apply
+2024, and fit-both/apply-both (labeled optimistic, closest to circular):
+
+| Variant | Brier (pooled) | Bias home/away | ROI @0/5/10% |
+|---|---|---|---|
+| stretch=1.3 alone, 2024 | 0.5948 | -0.0048/+0.0099 | -9.2%/-12.6%/-19.9% |
+| stretch=1.3 alone, 2025 | 0.6169 | -0.0107/+0.0153 | -9.8%/-6.6%/-8.5% |
+| recal, in-sample, 2024 | 0.5964 | +0.0047/-0.0033 | -14.8%/-17.6%/-24.5% (worse) |
+| recal, in-sample, 2025 | 0.6158 | -0.0028/+0.0033 | -9.1%/-12.1%/-10.5% (worse) |
+| recal, fit 2024->apply 2025 | 0.6156 | -0.0080/+0.0087 | -7.4%/-10.6%/-10.7% (mixed) |
+| recal, fit 2025->apply 2024 | 0.6006 | **+0.0113** (sign flip) | **-20.3%/-23.0%/-23.7%** (much worse) |
+
+Two findings: (1) even the best-case in-sample fit tightens calibration (bias shrinks
+toward zero, Brier roughly flat) but makes ROI WORSE in both seasons at nearly every
+threshold -- pulling probabilities toward the sharp book's price shrinks the model's
+own apparent edge (EV is measured against a book that tracks the sharp price closely),
+so the correction filters out exactly the disagreements that were driving bets, and
+what's left over isn't good signal. (2) it doesn't generalize out-of-sample -- fit on
+2025/applied to 2024 flips the home-side bias sign and craters ROI to worse than doing
+nothing, because a 6-bucket curve fit on ~350-380 games is too noisy a residual
+correction to trust on held-out data. Same overfitting-with-2-seasons risk the user
+flagged (from a different angle) when considering a per-season stretch factor --
+confirmed here empirically rather than just as a hypothesis. **Conclusion: this
+specific mechanism (bucketed post-hoc correction toward market price) is a dead end,
+not just underpowered -- not pursued further without a fundamentally different design
+or much more data.**
+
+**2026-08-07: step 4, guardrails (BUG-003 pattern: `MIN_PICK_PROBABILITY` floor +
+`MAX_UNDERDOG_MARKET_DISAGREEMENT` cap) re-tested on top of stretch=1.3, rather than the
+2026-08-05 `poisson_v4_priorblend` baseline they were originally validated on.** Same
+methodology (floor/cap sweep, EV>0%, both seasons):
+
+| Guardrail | 2024 ROI @0% | 2025 ROI @0% |
+|---|---|---|
+| none (stretch=1.3 alone) | -9.2% | -9.8% |
+| floor=0.25 only | +1.6% | -9.6% |
+| floor=0.25 + cap=1.75 (2026-08-05's validated value) | +1.4% | -8.8% |
+| floor=0.25 + cap=2.00 | +0.4% | -7.7% |
+
+Floor=0.25 alone is still a large win in 2024 (-9.2% -> +1.6%) but is now close to
+**inert in 2025** (-9.8% -> -9.6%), a much weaker/less season-consistent effect than the
+2026-08-05 result on the pre-stretch baseline (which roughly halved the loss in BOTH
+seasons). The cap is now close to inert too -- sweeping it 1.25 through "none" barely
+moves 2025 (-7.7% to -12.8%, non-monotonic) and doesn't reproduce the clean
+both-seasons convergence found on `priorblend`. Reading: the guardrail and the
+xG-stretch fix are correcting overlapping symptoms (both target overconfident-longshot
+overpricing), so on top of stretch=1.3 there's measurably less left for the guardrail
+to catch -- most of its 2026-08-05 value has already been captured by the core-tuning
+fix. floor=0.35-0.50 alone reach both-seasons-positive ROI in this sweep, but sample
+sizes there shrink to 73-167 bets/season -- too small to trust over 2 seasons, flagged
+as a likely overfit rather than a real finding, not a candidate. **Not yet decided
+whether to ship floor=0.25 given its now-asymmetric benefit, tune further, or treat
+guardrails as lower-priority now that core tuning captured most of the value they were
+meant to add.**
+
+**2026-08-07: dug into WHY floor=0.25 fixes 2024 but not 2025 -- found a real, unexplained
+2025-specific anomaly, not a season-specific longshot mechanism.** The excluded (p<0.25)
+group itself explains most of the asymmetry: 2024's sub-0.25 picks won half as often as
+the model expected (11.2% win rate vs ~20% mean model p, n=134, ~2.5 sigma shortfall --
+a real deviation) while 2025's sub-0.25 picks (14.3% vs ~20%, n=98, ~1.4 sigma) were
+within normal variance. So 2024's longshots were unusually bad; 2025's weren't unusual
+at all -- floor=0.25 mostly "fixes" a bad 2024 longshot patch, not a general problem.
+
+The bigger finding is in the group the floor does NOT touch (p>=0.25 draw/away picks,
+mean p 0.30-0.45 -- not longshots): 2024 was solidly profitable there (draw +7.0%,
+away +16.5%) while 2025 was broadly weak across the board (draw -17.3%, away +1.7%).
+Checked two clean hypotheses against REALIZED results (not model/market prices) and
+ruled both out: (1) top6-at-home win rate was nearly identical both seasons (63.2% 2024
+vs 60.5% 2025), so it isn't "top6 teams got stronger"; (2) league-wide draw rate was
+also close (28.4% vs 26.1%), not a big enough shift to explain draw picks losing
+uniformly across every implied-probability bucket in 2025 (-21% to -24% in every
+bucket, vs 2024's uneven pattern where most buckets were strongly positive).
+
+Isolated one specific, real anomaly instead: **away picks made against a top6 home
+opponent** (n=40, mean model p=34.4%, market implied 23.0% -- a real, moderate edge in
+both years) won only 4 times in 2025 (10.0% win rate, -42.2% ROI) against a model
+expectation of ~13.8 wins -- a ~3.2 sigma shortfall, not just noise. The 2024 equivalent
+(n=32) landed almost exactly on the model's own expectation (10 wins vs 11.6 expected,
+well within variance). The pattern isn't concentrated in top6-vs-top6 matchups
+specifically (both that subset and top6-vs-weaker lose at a similar rate), isn't
+confined to one matchday window (spans MD1-MD34), and touches every one of 2025's top6
+clubs as the home side. **Root cause not identified** -- ruled out roster churn and a
+general home-record shift; open possibilities are (a) 2025's top6 sides got genuinely
+stronger in a way the model's rolling-window stats lag behind (a cold-start-style
+mechanism, but for established teams improving mid-tenure rather than promoted/departed
+players), or (b) a real but sample-limited (n=40) single-season anomaly that a 3rd
+season of data would clarify. **Logged as an open finding, not pursued further for
+now** -- flagged as a candidate thread once a 3rd season or additional leagues give more
+data to check it against, per the "sample size is the real constraint right now"
+read (2026-08-07).
+
+**2026-08-07: shipped -- xG-stretch=1.3 and the floor guardrail are now real, wired
+code, not ad hoc scripts.** Resolves next-steps (c) and (d) from the sweep above:
+
+- `TEAM_RATING_XG_SPREAD_STRETCH = 1.3` is a real constant in
+  `compute_club_player_strength.py` (`MODEL_TUNING_PARAMETERS.md`), wired through
+  `team_level_lambda`/`compute()` via a `league_xg_means` snapshot (new
+  `league_xg_field_means`, computed once per `compute()` call across all of
+  `team_ids`, not once per team). 1.0 reproduces the exact pre-2026-08-07 shape for
+  comparison; the blend lever (`TEAM_RATING_XG_V_GOALS_BLEND`) stays at its existing
+  default (1.0) per the combined-test negative result above -- stretch only, blend
+  untouched.
+- The BUG-003 floor/cap guardrail check was extracted from `generate_wc_card.py`
+  into a new shared, tested module, `core.pick_guardrails` (`guardrail_reasons`/
+  `guardrail_excess`, taking plain `(prob, implied, floor, cap)` rather than a
+  card-specific dict) -- a pure refactor of the WC tool (all 35 of its existing
+  tests still pass unchanged) so a floor/cap fix or re-tune can no longer silently
+  drift between the two systems, which is exactly how the club-league pipeline went
+  without ANY guardrail for weeks in the first place.
+- Discovered while wiring the live path: `generate_serie_a_card.py` (the actual
+  live pick generator) was never on the FEATURE-011 player-blend pipeline at all --
+  it called `core.poisson_model.analyse_match()` (the old, pure-goals, team-only
+  model), so nothing from FEATURE-011/BUG-009/BUG-010 had ever reached a live pick,
+  independent of anything found this week. Rather than patch that script, and given
+  the project is about to add more leagues (making a hardcoded Serie A-specific
+  tool the wrong shape anyway), it's replaced by `generate_club_league_card.py`
+  (`--league`-parameterized, defaults to Serie A since that's the only league with
+  data today) on the real `compute()`/`analyse_match_wc()` pipeline, applying
+  `CLUB_LEAGUE_MIN_PICK_PROBABILITY = 0.25` via the new shared guardrail module. No
+  cap shipped for club leagues -- the 2026-08-07 sweep above found it close to
+  inert on top of the stretch fix, so shipping one would add a knob with no
+  demonstrated value. `generate_wc_card.py` is untouched beyond the guardrail
+  extraction (WC and club leagues stay separate tools -- different markets, ADVANCE
+  and group/knockout structure vs. a season fixture list -- deliberately not
+  unified).
+- New/updated test coverage: `tests/test_pick_guardrails.py` (new, the shared
+  module in isolation), `tests/test_generate_club_league_card.py` (new, including
+  an end-to-end guardrail-exclusion case), plus `team_level_lambda`/`compute()`
+  stretch-wiring tests in `tests/test_compute_club_player_strength.py`. Full suite
+  green except the one pre-existing, deliberately-red `test_attack_recentering_
+  should_scale_by_ratio_to_league_average_like_defense_does` (unrelated, predates
+  this work).
+
 ---
 
 ## BUG-008 — `get_league_averages()` has no date cutoff: league-average baseline leaks future-season data into historical backfills — **FIXED 2026-07-26**

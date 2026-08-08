@@ -30,6 +30,7 @@ from core.poisson_model import (
 )
 from core.wc_host_advantage import host_advantage
 from core.wc_knockout_scale import knockout_goal_scale
+import core.pick_guardrails as guardrails
 from compute_wc_team_strength import compute_bench_indices
 
 # match_date is stored in UTC, but the tournament is hosted in North America and
@@ -196,14 +197,8 @@ def select_pick(priced):
     "value" | "prediction" | "fallback", and ``fallback`` = True in the fallback case.
     """
     for c in priced:
-        reasons = []
-        if c["prob"] < MIN_PICK_PROBABILITY:
-            reasons.append(
-                f"floor (model {c['prob']:.3f} < {MIN_PICK_PROBABILITY:g})")
-        if c["implied"] and c["prob"] >= MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"]:
-            reasons.append(
-                f"cap (model {c['prob']:.3f} >= {MAX_UNDERDOG_MARKET_DISAGREEMENT:g}x "
-                f"market {c['implied']:.3f})")
+        reasons = guardrails.guardrail_reasons(
+            c["prob"], c["implied"], MIN_PICK_PROBABILITY, MAX_UNDERDOG_MARKET_DISAGREEMENT)
         # advance-edge: ABSOLUTE-points cap for the to-advance market, where the ratio cap
         # above can't see the mirage (probs compress toward 0.5). Only an underdog ADVANCE
         # candidate (market implied < 0.5) can trip it — a favorite's model advance prob is
@@ -256,10 +251,10 @@ def guardrail_excess(c):
     if not c["excluded_by"]:
         return None
     excesses = []
-    if c["prob"] < MIN_PICK_PROBABILITY:
-        excesses.append(MIN_PICK_PROBABILITY - c["prob"])
-    if c["implied"] and c["prob"] >= MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"]:
-        excesses.append(c["prob"] - MAX_UNDERDOG_MARKET_DISAGREEMENT * c["implied"])
+    shared = guardrails.guardrail_excess(
+        c["prob"], c["implied"], MIN_PICK_PROBABILITY, MAX_UNDERDOG_MARKET_DISAGREEMENT)
+    if shared is not None:
+        excesses.append(shared)
     if ("ADVANCE" in c["side"] and c["implied"] and c["implied"] < 0.5
             and c["prob"] - c["implied"] >= MAX_ADVANCE_ABSOLUTE_DISAGREEMENT):
         excesses.append((c["prob"] - c["implied"]) - MAX_ADVANCE_ABSOLUTE_DISAGREEMENT)

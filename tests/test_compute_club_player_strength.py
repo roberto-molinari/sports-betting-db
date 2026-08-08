@@ -496,6 +496,38 @@ def test_get_team_xg_ratings_limits_to_last_n_matches(db_path, conn):
     assert ratings["home_attack"] == pytest.approx(3.0)  # only the more recent match
 
 
+def test_get_team_xg_ratings_sums_all_of_a_teams_players_not_just_one(db_path, conn):
+    """Team xG is the SUM across every one of the team's players who played that
+    match, not a single player's value -- the whole "team-level xG is just a sum"
+    question (raised digging into MD20-28's bottom6-vs-strong-team compression,
+    2026-08-07) hinges on this actually being a correct multi-player sum in the SQL
+    (GROUP BY match_id, venue), not silently picking one row."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    p2 = sports_db.add_player(team, "Winger", position="F", conn=conn)
+    p3 = sports_db.add_player(team, "Midfielder", position="M", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.2, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=90, xg=0.7, conn=conn)
+    sports_db.add_player_match_stats(p3, m1, season=2025, venue="home", minutes_played=90, xg=0.3, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-02", n=10, league="Serie A")
+    assert ratings["home_attack"] == pytest.approx(1.2 + 0.7 + 0.3)
+
+
+def test_get_team_xg_ratings_sum_ignores_teammates_with_no_xg_data(db_path, conn):
+    """A teammate with no recorded xg (e.g. a keeper/defender with no shots, xg=None)
+    must not zero out or otherwise corrupt the match's team total -- SQL SUM()
+    ignores NULLs, it doesn't propagate them like arithmetic + would."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    p2 = sports_db.add_player(team, "Keeper", position="G", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.4, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=90, xg=None, conn=conn)
+
+    ratings = strength.get_team_xg_ratings(conn, team, "2025-09-02", n=10, league="Serie A")
+    assert ratings["home_attack"] == pytest.approx(1.4)
+
+
 def test_team_level_lambda_defaults_to_xg_not_goals(db_path, conn):
     """team_xg_v_goals_blend defaults to 1.0 (pure xG, 2026-08-02) -- must reflect the
     xG-based number, not the goals-based one, proving the default is really wired to
@@ -566,6 +598,86 @@ def test_team_level_lambda_blend_requires_both_sources_to_clear_min_matches(db_p
 
     assert goals_only[0] == pytest.approx(5.0)   # goals alone clears TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE=3
     assert blended[0] == pytest.approx(1.3)      # blend falls back to avg_home (min(3,2)=2 < 3)
+
+
+# ── TEAM_RATING_XG_SPREAD_STRETCH (BUG-009, 2026-08-07 addendum) ─────────────────
+
+def test_team_level_lambda_stretch_noop_without_league_means(db_path, conn):
+    """xg_spread_stretch defaults to 1.3 (TEAM_RATING_XG_SPREAD_STRETCH), but
+    team_level_lambda can't recenter without a league-wide mean to stretch around --
+    calling it directly (as every other test in this file does) without
+    league_xg_means must be an EXACT no-op regardless of the stretch factor's value,
+    so isolated blend tests above don't need to also fake up a league snapshot."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    _, _, m3 = _seed_match(conn, "TeamA", "OppC", date="2025-09-15")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    for mid in (m1, m2, m3):
+        sports_db.add_player_match_stats(p1, mid, season=2025, venue="home", minutes_played=90, xg=2.0, conn=conn)
+
+    default_result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1)
+    no_stretch_result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16",
+                                                    avg_home=1.3, avg_away=1.1, xg_spread_stretch=1.0)
+    assert default_result[0] == pytest.approx(2.0) == pytest.approx(no_stretch_result[0])
+
+
+def test_team_level_lambda_stretch_recenters_on_league_mean(db_path, conn):
+    """With a league_xg_means snapshot supplied, xg_spread_stretch actually moves the
+    raw xG rating: stretched = league_mean + (raw - league_mean) * factor. Team's own
+    raw home_attack is 2.0 (3 matches clears TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE,
+    and TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES=0 makes the shrink-to-fallback step a no-op), so the result
+    should be exactly the stretched value, not the raw 2.0."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    _, _, m3 = _seed_match(conn, "TeamA", "OppC", date="2025-09-15")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    for mid in (m1, m2, m3):
+        sports_db.add_player_match_stats(p1, mid, season=2025, venue="home", minutes_played=90, xg=2.0, conn=conn)
+
+    league_means = {"home_attack": 1.0, "home_defense": 1.0, "away_attack": 1.0, "away_defense": 1.0}
+    result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1,
+                                        xg_spread_stretch=1.3, league_xg_means=league_means)
+    assert result[0] == pytest.approx(1.0 + (2.0 - 1.0) * 1.3)  # 2.3
+
+
+def test_league_xg_field_means_averages_across_team_ids(db_path, conn):
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    p1 = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    p2 = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.0, conn=conn)
+    sports_db.add_player_match_stats(p2, m2, season=2025, venue="home", minutes_played=90, xg=3.0, conn=conn)
+
+    means = strength.league_xg_field_means(conn, [team_a, team_b], "2025-09-02", league="Serie A")
+    assert means["home_attack"] == pytest.approx((1.0 + 3.0) / 2)
+
+
+def test_compute_wires_xg_spread_stretch_through_to_team_level_lambda(db_path, conn):
+    """End-to-end: compute()'s default xg_spread_stretch=1.3 must actually reach
+    team_level_lambda via a real league_xg_means snapshot built from team_ids -- not
+    just accepted as a parameter and silently dropped. Two teams with different raw
+    xG so the league mean isn't equal to either team's own raw value, making the
+    stretch's effect on the unblended team-level number unambiguous."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, ma2 = _seed_match(conn, "TeamA", "OppA2", date="2025-09-08")
+    _, _, ma3 = _seed_match(conn, "TeamA", "OppA3", date="2025-09-15")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    _, _, mb2 = _seed_match(conn, "TeamB", "OppB2", date="2025-09-08")
+    _, _, mb3 = _seed_match(conn, "TeamB", "OppB3", date="2025-09-15")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    for mid in (ma1, ma2, ma3):
+        sports_db.add_player_match_stats(pa, mid, season=2025, venue="home", minutes_played=90, xg=2.0, conn=conn)
+    for mid in (mb1, mb2, mb3):
+        sports_db.add_player_match_stats(pb, mid, season=2025, venue="home", minutes_played=90, xg=1.0, conn=conn)
+
+    stretched = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-16")
+    unstretched = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-16", xg_spread_stretch=1.0)
+
+    assert unstretched[team_a]["lambda_attack_team_home"] == pytest.approx(2.0)
+    league_mean = (2.0 + 1.0) / 2
+    assert stretched[team_a]["lambda_attack_team_home"] == pytest.approx(league_mean + (2.0 - league_mean) * 1.3)
+    assert stretched[team_a]["lambda_attack_team_home"] != pytest.approx(unstretched[team_a]["lambda_attack_team_home"])
 
 
 # ── load_team_players: rolling window (FEATURE-011 Follow-up B, 2026-08-06) ──────
