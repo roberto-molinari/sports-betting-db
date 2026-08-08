@@ -44,6 +44,23 @@ def load_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK
     return cur.fetchall()
 
 
+def load_totals_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK):
+    """Same shape as load_predictions but for the totals (over/under) market --
+    p_over/p_under and over_odds/under_odds, plus the line itself and actual total
+    goals (needed since 'over' only means something relative to o.over_under)."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT mp.p_over, mp.p_under, o.over_odds, o.under_odds, o.over_under,
+               m.home_score, m.away_score
+        FROM soccer_model_predictions mp
+        JOIN soccer_matches m ON m.match_id = mp.match_id
+        JOIN soccer_betting_odds o ON o.match_id = mp.match_id AND o.sportsbook = ?
+        WHERE mp.league = ? AND mp.method = ? AND m.season = ?
+              AND m.home_score IS NOT NULL AND o.over_under IS NOT NULL
+    """, (sportsbook, league, method, season))
+    return cur.fetchall()
+
+
 def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
     rows = load_predictions(conn, league, season, method, sportsbook=sportsbook)
     total_staked = total_profit = 0.0
@@ -89,6 +106,59 @@ def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOO
     return roi, bets
 
 
+def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+    """Totals (over/under) market ROI -- kept as a SEPARATE report/return value from
+    run()'s 1X2 numbers, not pooled together, since they're different markets and
+    every existing ROI reference point in BUGS.md/model_snapshot.py is 1X2-only.
+    2026-08-07: added alongside generate_club_league_card.py's over/under support
+    -- the model already computed p_over/p_under and it was already stored, but
+    nothing graded it, so there was no way to tell if those picks were any good."""
+    rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook)
+    total_staked = total_profit = 0.0
+    bets = wins = 0
+    by_side = {"over": [0, 0, 0.0], "under": [0, 0, 0.0]}
+
+    for (p_over, p_under, over_odds, under_odds, line, hs, as_) in rows:
+        total_goals = hs + as_
+        # A push (total == line) can't happen at a .5 line (every observed line is
+        # 2.5), but guard it anyway rather than assume -- a push is neither a win
+        # nor a loss and shouldn't be staked as either.
+        if total_goals == line:
+            continue
+        actual = "over" if total_goals > line else "under"
+        for side, p_model, odds in (("over", p_over, over_odds), ("under", p_under, under_odds)):
+            if p_model is None or odds is None:
+                continue
+            ev = compute_ev(p_model, odds)
+            if ev <= ev_threshold:
+                continue
+            stake = 1.0
+            won = (side == actual)
+            profit = stake * (american_to_decimal(odds) - 1) if won else -stake
+            total_staked += stake
+            total_profit += profit
+            bets += 1
+            by_side[side][0] += 1
+            by_side[side][2] += profit
+            if won:
+                wins += 1
+                by_side[side][1] += 1
+
+    roi = total_profit / total_staked if total_staked else 0.0
+    print(f"\n{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
+          f"EV threshold {ev_threshold:+.1%} | {len(rows)} graded matches")
+    if bets:
+        print(f"  Bets: {bets}  Wins: {wins}  Win rate: {wins/bets:.1%}")
+    else:
+        print("  No bets placed")
+    print(f"  Total staked: ${total_staked:.2f}  Profit: ${total_profit:+.2f}  ROI: {roi:+.1%}")
+    print("\n  By side:")
+    for side, (n, w, p) in by_side.items():
+        side_roi = p / n if n else 0.0
+        print(f"    {side:>5}  n={n:<4} wins={w:<4} profit=${p:>+8.2f}  ROI={side_roi:+.1%}")
+    return roi, bets
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--league", default="Serie A")
@@ -98,10 +168,17 @@ def main():
     parser.add_argument("--sportsbook", default=DEFAULT_SPORTSBOOK,
                         help=f"Stake against this soccer_betting_odds sportsbook only "
                              f"(default: {DEFAULT_SPORTSBOOK}).")
+    parser.add_argument("--market", choices=["1x2", "totals", "both"], default="1x2",
+                        help="Which market to grade (default: 1x2, unchanged from before "
+                             "totals support existed). 'both' prints two separate reports "
+                             "-- totals ROI is never pooled into the 1x2 numbers.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DATABASE_PATH)
-    run(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook)
+    if args.market in ("1x2", "both"):
+        run(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook)
+    if args.market in ("totals", "both"):
+        run_totals(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook)
     conn.close()
 
 

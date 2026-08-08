@@ -186,6 +186,44 @@ documents.
 
 ---
 
+**2026-08-07: over/under (totals) market backtesting added -- `backtest_from_
+predictions.py` could not grade totals bets at all until now.** The model already
+computed `p_over`/`p_under` (`analyse_match_wc`'s Poisson grid gives this for free)
+and `soccer_model_predictions` already stored them, but nothing checked whether
+those picks actually won -- so there was no way to validate the totals market the
+way 1X2 has been validated all along. Added `run_totals()` (same EV-threshold/ROI
+shape as the existing `run()`, but a SEPARATE report -- never pooled into the 1X2
+staked/profit numbers, since every existing ROI reference point in this file is
+1X2-only) plus a `--market {1x2,totals,both}` flag. `soccer_market_odds` (the
+sharp-book reference used for every bias check in this file) has no totals fields
+at all, and Bet365's `over_under` line is 100% 2.5 across both Serie A seasons
+(1490/1490 rows) -- no sharp-book totals bias check is possible with current data,
+and no multi-line complexity exists to handle either.
+
+First real numbers (vs Bet365, EV>0%, `poisson_v4_stretch130`):
+
+| Season | Totals ROI | 1X2 ROI (for contrast) |
+|---|---|---|
+| 2025 | **+8.2%** (n=273, 56.0% win rate) | -9.8% |
+| 2024 | +0.5% (n=318, 53.1% win rate) | -9.2% |
+
+Genuinely positive in 2025, roughly breakeven in 2024 -- both a clear improvement
+over 1X2's negative ROI in the same seasons, and directionally what the user
+predicted when proposing this work ("won't change the negative roi... but may add
+positive roi to offset that... even if a little"). 2 seasons is still a real
+sample-size caveat (same discipline as every other finding in this file) but this
+is a promising, mostly-unexplored market -- worth continuing to track as more
+seasons/leagues are added, per the session's broader shift toward more data
+(more markets, more leagues) over further squeezing the current 2-season 1X2
+dataset.
+
+`generate_club_league_card.py` already surfaces OVER/UNDER 2.5 candidates through
+the same floor guardrail as 1X2 (shipped in the same session, before this
+backtesting gap was noticed) -- this closes the loop so those live picks now have
+a real validation history behind them, not just an untested code path.
+
+---
+
 ## FEATURE-013 — Incorporate additional external factors (fatigue/rest days, coaching changes, weather) — analysis first
 
 - **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-07-27.
