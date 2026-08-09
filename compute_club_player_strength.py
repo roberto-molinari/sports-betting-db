@@ -448,7 +448,19 @@ def squad_as_of_date(conn, team_id, season, before_date):
     return set(team_roster_minutes(conn, team_id, season - 1).keys())
 
 
-def player_trust_score(conn, team_id, season, current_squad_ids=None):
+def _memoized(cache, key, fn):
+    """cache=None (default everywhere) is a plain passthrough -- fn() runs every call,
+    identical to pre-BUG-011 behavior. Pass a dict (created once by the caller, e.g. at
+    the top of a backfill loop, and reused across calls) to memoize fn()'s result under
+    key instead."""
+    if cache is None:
+        return fn()
+    if key not in cache:
+        cache[key] = fn()
+    return cache[key]
+
+
+def player_trust_score(conn, team_id, season, current_squad_ids=None, cache=None):
     """1.0 = fully trust the player-level lambda for this team; 0.0 = fully trust
     team-level. Two factors, BOTH required (product, not sum/average) -- a stable,
     well-tracked squad has nothing to gain from the player signal even with great
@@ -468,6 +480,14 @@ def player_trust_score(conn, team_id, season, current_squad_ids=None):
     season must pass a point-in-time squad instead (e.g. from squad_as_of_date), since
     the live default has no history.
 
+    cache: optional dict (BUG-011) memoizing team_roster_minutes(team_id, last_season)
+    and player_season_minutes(last_season) -- both fixed for an entire backfill run
+    (last season can't change while backtesting the current one), so a caller looping
+    over many matchdays/teams (e.g. a backfill script) can pass one dict created once
+    at the top of the loop and reused for the whole run, instead of re-running these
+    aggregates from scratch on every call. None (default) preserves the exact prior
+    behavior -- always recomputed, safe for one-off/live calls.
+
     NOTE: this is the INVERSE of the `w` convention used everywhere else in this file
     (blend(), soccer_player_team_strength.weight_attack/weight_defense -- there, 1.0
     means team-level). The inversion happens in exactly one place, resolve_blend_weight
@@ -476,12 +496,14 @@ def player_trust_score(conn, team_id, season, current_squad_ids=None):
     No last-season history for team_id at all (e.g. backfill not run yet) -> 0.0
     (caller falls back fully to team-level; not a crash)."""
     last_season = season - 1
-    team_minutes = team_roster_minutes(conn, team_id, last_season)
+    team_minutes = _memoized(cache, ("team_roster_minutes", team_id, last_season),
+                             lambda: team_roster_minutes(conn, team_id, last_season))
     team_total_minutes = sum(team_minutes.values())
     if team_total_minutes <= 0:
         return 0.0
 
-    all_minutes = player_season_minutes(conn, last_season)
+    all_minutes = _memoized(cache, ("player_season_minutes", last_season),
+                            lambda: player_season_minutes(conn, last_season))
     current_squad = current_squad_ids if current_squad_ids is not None else current_squad_player_ids(conn, team_id)
     last_season_roster = set(team_minutes.keys())
 
@@ -498,15 +520,16 @@ def player_trust_score(conn, team_id, season, current_squad_ids=None):
     return data_coverage_score * roster_change_score
 
 
-def resolve_blend_weight(conn, team_id, league, component, season, current_squad_ids=None):
+def resolve_blend_weight(conn, team_id, league, component, season, current_squad_ids=None, cache=None):
     """Default per-team weight (`w`; 0=pure player, 1=pure team), with a league-wide
     override taking precedence per component (FEATURE-011_REQUIREMENTS.md, Blend).
     current_squad_ids: see player_trust_score -- pass a point-in-time squad (e.g. from
-    squad_as_of_date) when backtesting a past season."""
+    squad_as_of_date) when backtesting a past season. cache: see player_trust_score
+    (BUG-011)."""
     override = PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE.get(league, {}).get(component)
     if override is not None:
         return override
-    return 1.0 - player_trust_score(conn, team_id, season, current_squad_ids=current_squad_ids)
+    return 1.0 - player_trust_score(conn, team_id, season, current_squad_ids=current_squad_ids, cache=cache)
 
 
 def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZE, league="Serie A"):
@@ -694,7 +717,7 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
            xg_spread_stretch=TEAM_RATING_XG_SPREAD_STRETCH,
            player_window_size=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
            player_window_decay=PLAYER_RATING_PAST_MATCH_WINDOW_DECAY,
-           player_window_min_date=None):
+           player_window_min_date=None, cache=None):
     """w_attack/w_defense: force this weight for EVERY team, bypassing per-team
     resolution -- a manual debugging/comparison override, not the normal path. Leave
     as None (default) to use resolve_blend_weight() per team, per component.
@@ -734,7 +757,14 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     load_team_players and get_league_averages too, for the same reason: computing a
     PAST match's lambdas must only see data that existed before that match (live use,
     where before_date is always "now" or later than all data on hand, is unaffected
-    either way)."""
+    either way).
+
+    cache: optional dict (BUG-011), passed through to resolve_blend_weight/
+    player_trust_score to memoize their last-season aggregates across repeated
+    compute() calls -- e.g. a backfill/backtest script looping over a season's
+    matchdays can create one dict before the loop and pass it every call, turning
+    ~12,700+ redundant aggregate recomputations per season into one per team. None
+    (default) is a no-op -- identical behavior to before BUG-011's fix."""
     by_team = load_team_players(conn, team_ids, before_date,
                                 attack_xg_v_goals_source=attack_xg_v_goals_source,
                                 defense_xg_v_goals_source=defense_xg_v_goals_source,
@@ -779,13 +809,18 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
 
         # No fixed target spread (unlike WC's ATTACK_LAMBDA_SD) -- the single-league
         # sample here is too small to set one responsibly. Just re-center to baseline
-        # and keep the raw sample spread. Player data still has no home/away split of
-        # its own (Scenario 4, deferred) -- the same recentered deviation is re-based
-        # onto the home and away league averages separately here, purely so it's
-        # dimensionally consistent with the team-level home/away split it's blended
-        # against below (same "opponent-scored units" convention for defense).
-        la_player_home = (avg_home + (r["ra"] - attack_mean)) if has_attack else None
-        la_player_away = (avg_away + (r["ra"] - attack_mean)) if has_attack else None
+        # and keep the raw sample's RATIO spread (BUG-009, 2026-08-09 fix -- previously
+        # additive, an unexplained asymmetry with defense's own multiplicative form
+        # below; see BUGS.md for why ratio is correct: it can't drive lambda negative
+        # the way a flat shift can, and it matches the "relative attacking strength"
+        # interpretation the team-level system already uses throughout,
+        # `lambda_H = h_att * (a_def / avg_h)`). Player data still has no home/away
+        # split of its own (Scenario 4, deferred) -- the same recentered ratio is
+        # re-based onto the home and away league averages separately here, purely so
+        # it's dimensionally consistent with the team-level home/away split it's
+        # blended against below (same "opponent-scored units" convention for defense).
+        la_player_home = (r["ra"] * (avg_home / attack_mean)) if has_attack else None
+        la_player_away = (r["ra"] * (avg_away / attack_mean)) if has_attack else None
         ld_player_home = (r["rd"] * (avg_away / defense_mean)) if has_defense else None
         ld_player_away = (r["rd"] * (avg_home / defense_mean)) if has_defense else None
 
@@ -803,9 +838,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
 
         squad_ids = current_squad_ids_by_team.get(tid) if current_squad_ids_by_team is not None else None
         w_att = w_attack if w_attack is not None else resolve_blend_weight(
-            conn, tid, league, "attack", season, current_squad_ids=squad_ids)
+            conn, tid, league, "attack", season, current_squad_ids=squad_ids, cache=cache)
         w_def = w_defense if w_defense is not None else resolve_blend_weight(
-            conn, tid, league, "defense", season, current_squad_ids=squad_ids)
+            conn, tid, league, "defense", season, current_squad_ids=squad_ids, cache=cache)
         attack_home_blend, w_a_used = blend(la_player_home, team_home_attack, w_att)
         attack_away_blend, _ = blend(la_player_away, team_away_attack, w_att)
         defense_home_blend, w_d_used = blend(ld_player_home, team_home_defense, w_def)

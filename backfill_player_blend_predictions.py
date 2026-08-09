@@ -116,6 +116,7 @@ def main():
 
     generated_at = datetime.now(timezone.utc).isoformat()
     inserted = 0
+    cache = {}  # BUG-011: memoizes last-season aggregates across this run's matchdays
 
     for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
         date_rows = list(date_rows)
@@ -126,7 +127,7 @@ def main():
                                    attack_xg_v_goals_source=args.attack_xg_v_goals_source, team_xg_v_goals_blend=args.team_xg_v_goals_blend,
                                    xg_spread_stretch=args.xg_spread_stretch,
                                    player_window_min_date=args.player_window_min_date,
-                                   current_squad_ids_by_team=squad_ids_by_team)
+                                   current_squad_ids_by_team=squad_ids_by_team, cache=cache)
 
         for row in date_rows:
             home = results[row["home_team_id"]]

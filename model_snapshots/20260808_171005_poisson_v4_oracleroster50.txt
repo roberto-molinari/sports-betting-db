@@ -1,0 +1,104 @@
+# Model snapshot -- poisson_v4_oracleroster50 / Serie A
+Generated: 2026-08-08T21:10:05.592185+00:00
+Seasons: [2024, 2025]
+Note: EXPERIMENTAL, not shipped -- oracle roster blend at blend_frac=0.5 (halfway toward perfect same-match player knowledge, via oracle_roster_blend_test.py monkeypatching load_team_players). CEILING estimate for FEATURE-011 Follow-up A's payoff, NOT a realistic implementation -- uses each match's own actual outcome as an input (hindsight). Compare against poisson_v4 baseline.
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON = 900.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+## Brier score (all games, not just bets -- lower is better; naive baseline ~0.667)
+  season 2024: Brier = 0.5825  (n=380)
+  season 2025: Brier = 0.6080  (n=380)
+  pooled: Brier = 0.5953  (n=760)
+
+## Compression-bucket table (model p_home - Betfair Exchange closing p_home, by market's own p_home)
+  season 2024:
+     0.00-0.15: +0.010  (n=23)
+     0.15-0.25: +0.008  (n=60)
+     0.25-0.35: +0.050  (n=61)
+     0.35-0.45: +0.028  (n=73)
+     0.45-0.55: -0.013  (n=69)
+     0.55-1.01: -0.022  (n=94)
+  season 2025:
+     0.00-0.15: +0.075  (n=35)
+     0.15-0.25: +0.067  (n=48)
+     0.25-0.35: +0.038  (n=66)
+     0.35-0.45: -0.013  (n=67)
+     0.45-0.55: -0.028  (n=49)
+     0.55-1.01: -0.092  (n=94)
+
+## Pooled signed bias vs Betfair Exchange closing (home/away split, target +/-0.01-0.02)
+  season 2024: home=+0.0076  away=-0.0020  draw=-0.0056  (n=380)
+  season 2025: home=-0.0070  away=+0.0153  draw=-0.0083  (n=359)
+
+## ROI vs Bet365 (ROI success criterion -- must be positive at EV>0/5/10%)
+
+poisson_v4_oracleroster50 | Serie A season 2024 | vs Bet365 | EV threshold +0.0% | 380 graded matches
+  Bets: 454  Wins: 155  Win rate: 34.1%
+  Total staked: $454.00  Profit: $-30.88  ROI: -6.8%
+
+  By side:
+     home  n=155  wins=63   profit=$  -17.36  ROI=-11.2%
+     draw  n=144  wins=42   profit=$   +9.53  ROI=+6.6%
+     away  n=155  wins=50   profit=$  -23.05  ROI=-14.9%
+
+poisson_v4_oracleroster50 | Serie A season 2024 | vs Bet365 | EV threshold +5.0% | 380 graded matches
+  Bets: 366  Wins: 127  Win rate: 34.7%
+  Total staked: $366.00  Profit: $-17.56  ROI: -4.8%
+
+  By side:
+     home  n=126  wins=52   profit=$  -13.05  ROI=-10.4%
+     draw  n=107  wins=32   profit=$  +12.08  ROI=+11.3%
+     away  n=133  wins=43   profit=$  -16.59  ROI=-12.5%
+
+poisson_v4_oracleroster50 | Serie A season 2024 | vs Bet365 | EV threshold +10.0% | 380 graded matches
+  Bets: 303  Wins: 102  Win rate: 33.7%
+  Total staked: $303.00  Profit: $-14.65  ROI: -4.8%
+
+  By side:
+     home  n=107  wins=43   profit=$  -13.50  ROI=-12.6%
+     draw  n=84   wins=26   profit=$  +13.28  ROI=+15.8%
+     away  n=112  wins=33   profit=$  -14.43  ROI=-12.9%
+
+poisson_v4_oracleroster50 | Serie A season 2025 | vs Bet365 | EV threshold +0.0% | 350 graded matches
+  Bets: 420  Wins: 105  Win rate: 25.0%
+  Total staked: $420.00  Profit: $-39.54  ROI: -9.4%
+
+  By side:
+     home  n=130  wins=37   profit=$  -21.96  ROI=-16.9%
+     draw  n=109  wins=24   profit=$   -6.46  ROI=-5.9%
+     away  n=181  wins=44   profit=$  -11.12  ROI=-6.1%
+
+poisson_v4_oracleroster50 | Serie A season 2025 | vs Bet365 | EV threshold +5.0% | 350 graded matches
+  Bets: 375  Wins: 93  Win rate: 24.8%
+  Total staked: $375.00  Profit: $-26.64  ROI: -7.1%
+
+  By side:
+     home  n=115  wins=30   profit=$  -25.71  ROI=-22.4%
+     draw  n=90   wins=23   profit=$   +9.54  ROI=+10.6%
+     away  n=170  wins=40   profit=$  -10.47  ROI=-6.2%
+
+poisson_v4_oracleroster50 | Serie A season 2025 | vs Bet365 | EV threshold +10.0% | 350 graded matches
+  Bets: 302  Wins: 74  Win rate: 24.5%
+  Total staked: $302.00  Profit: $-9.86  ROI: -3.3%
+
+  By side:
+     home  n=94   wins=24   profit=$  -19.12  ROI=-20.3%
+     draw  n=59   wins=16   profit=$  +13.78  ROI=+23.4%
+     away  n=149  wins=34   profit=$   -4.52  ROI=-3.0%

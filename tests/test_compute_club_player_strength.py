@@ -400,6 +400,40 @@ def test_player_trust_score_accepts_current_squad_ids_override(db_path, conn):
     assert overridden_trust == pytest.approx(1.0)
 
 
+def test_player_trust_score_cache_avoids_recomputing_last_season_aggregates(db_path, conn, monkeypatch):
+    """BUG-011: team_roster_minutes(team_id, last_season) and player_season_minutes
+    (last_season) are fixed for an entire backfill run (last season can't change while
+    backtesting the current one), so passing a shared cache dict across repeated calls
+    should hit the underlying SQL aggregates once each, not once per call -- this is
+    the actual fix, not just a threaded-through parameter."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    p1 = _transfer(conn, team_a, "P1", "ext_p1")
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+
+    calls = {"team_roster_minutes": 0, "player_season_minutes": 0}
+    orig_team_roster_minutes = strength.team_roster_minutes
+    orig_player_season_minutes = strength.player_season_minutes
+
+    def counting_team_roster_minutes(*args, **kwargs):
+        calls["team_roster_minutes"] += 1
+        return orig_team_roster_minutes(*args, **kwargs)
+
+    def counting_player_season_minutes(*args, **kwargs):
+        calls["player_season_minutes"] += 1
+        return orig_player_season_minutes(*args, **kwargs)
+
+    monkeypatch.setattr(strength, "team_roster_minutes", counting_team_roster_minutes)
+    monkeypatch.setattr(strength, "player_season_minutes", counting_player_season_minutes)
+
+    cache = {}
+    results = [strength.player_trust_score(conn, team_a, season=2026, cache=cache) for _ in range(3)]
+
+    assert calls["team_roster_minutes"] == 1
+    assert calls["player_season_minutes"] == 1
+    assert results[0] == results[1] == results[2]
+    assert results[0] == pytest.approx(strength.player_trust_score(conn, team_a, season=2026))
+
+
 def test_load_team_players_before_date_excludes_later_matches(db_path, conn):
     """Same no-lookahead guarantee as team_roster_minutes, for the function that
     actually feeds the player-level lambda computation."""
@@ -832,16 +866,20 @@ def test_apply_shrinkage_pulls_low_minutes_player_toward_position_prior(db_path,
     assert rates[p_high] == pytest.approx(2.0, abs=0.05)
 
 
-# ── compute(): attack vs. defense recentering symmetry (BUG-009, 2026-08-05) ──────
+# ── compute(): attack vs. defense recentering symmetry (BUG-009, found 2026-08-05,
+#    fixed 2026-08-09) ────────────────────────────────────────────────────────────
 #
 # compute() rescales each team's raw player-level attack/defense number onto the
-# league-average scale before blending it with the team-level number. Today the two
-# components do this two DIFFERENT ways:
+# league-average scale before blending it with the team-level number. Until
+# 2026-08-09, the two components did this two DIFFERENT ways:
 #   attack:  la_player_home = avg_home + (raw_attack - attack_mean)        additive
 #   defense: ld_player_home = raw_defense * (avg_away / defense_mean)      multiplicative
 # This asymmetry was found by hand while investigating spread compression, not by a
-# test -- these tests turn it into an explicit, executable contract so a future change
-# to either side is caught immediately instead of found by manual inspection again.
+# test -- these tests turned it into an explicit, executable contract so the fix (make
+# attack multiplicative too, matching defense and the team-level system's own
+# `lambda_H = h_att * (a_def / avg_h)` convention -- also fixes the additive form's
+# risk of driving lambda negative for a well-below-average team) was caught by a
+# normal test run instead of only found by manual inspection.
 #
 # Fixture shape: two teams (TeamA, TeamB), one MID player each (an arbitrary non-zero-
 # weight position -- with exactly one player, raw_team_strength's weighted average
@@ -896,41 +934,22 @@ def test_defense_recentering_scales_by_ratio_to_league_average(db_path, conn):
     assert r["lambda_defense_player_home"] == pytest.approx(expected_ld_home)
 
 
-def test_attack_recentering_currently_uses_flat_additive_shift(db_path, conn):
-    """Documents TODAY's actual attack formula: la_player_home = avg_home +
-    (raw_attack - attack_mean) -- a flat, additive shift, NOT the ratio-to-mean
-    rescale defense uses (previous test). This test PASSES today -- it pins down the
-    current, likely-unintended behavior so the next test's failure is legible as "this
-    diverges from what's actually shipped," not just "this fails." See BUGS.md
-    (BUG-009, 2026-08-05 entry) for why this asymmetry is suspicious."""
-    team_a = _seed_mirrored_team(conn, "TeamA", 2025, "2025-09-01", minutes=1200, rate=1.5)
-    team_b = _seed_mirrored_team(conn, "TeamB", 2025, "2025-09-02", minutes=1200, rate=1.0)
-
-    results = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-03")
-    r = results[team_a]
-
-    prior = (1200 * 1.5 + 1200 * 1.0) / (1200 + 1200)
-    ra_a = (1200 * 1.5 + PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE * prior) / (1200 + PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE)
-    ra_b = (1200 * 1.0 + PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE * prior) / (1200 + PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE)
-    attack_mean = (ra_a + ra_b) / 2
-
-    expected_la_home_additive = r["avg_home"] + (ra_a - attack_mean)
-    assert r["lambda_attack_player_home"] == pytest.approx(expected_la_home_additive)
-
-
-def test_attack_recentering_should_scale_by_ratio_to_league_average_like_defense_does(db_path, conn):
+def test_attack_recentering_scales_by_ratio_to_league_average(db_path, conn):
     """THE CONTRACT: attack and defense are structurally the same kind of quantity (a
     team's raw player-derived rate, rescaled onto the league-average baseline before
-    blending with the team-level number) and should be rescaled the SAME way. Defense
-    already does this by ratio (previous-previous test); this asserts attack does too.
+    blending with the team-level number) and are rescaled the SAME way -- defense does
+    this by ratio (previous test); this asserts attack does too.
 
-    This is EXPECTED TO FAIL as of 2026-08-05 -- attack is still additive (previous
-    test). That failure IS the deliverable: it turns a discrepancy that was previously
-    only found by manually reading the code into something a normal test run catches.
-    See BUGS.md (BUG-009) for the compression-bucket-table evidence that switching to
-    this form helps calibration but the ROI impact is season-inconsistent -- not yet
-    shipped, so this test is left red (not skipped/xfailed) as a visible TODO rather
-    than silently suppressed."""
+    Fixed 2026-08-09 (BUG-009) -- attack was previously a flat additive shift
+    (`avg_home + (raw_attack - attack_mean)`), an unexplained asymmetry with defense's
+    own multiplicative form found by hand, not by a test. Ad hoc testing (2026-08-05
+    entry, BUGS.md) showed multiplicative uniformly improves calibration (compression
+    bucket table, every bucket) with a season-inconsistent ROI signal too noisy at a
+    2-season sample size to weigh against that -- shipped anyway since the additive
+    form has no principled justification (it can even drive lambda negative for a
+    well-below-average team, which a rate parameter must never be) and multiplicative
+    matches the team-level system's own convention throughout
+    (`lambda_H = h_att * (a_def / avg_h)`)."""
     team_a = _seed_mirrored_team(conn, "TeamA", 2025, "2025-09-01", minutes=1200, rate=1.5)
     team_b = _seed_mirrored_team(conn, "TeamB", 2025, "2025-09-02", minutes=1200, rate=1.0)
 

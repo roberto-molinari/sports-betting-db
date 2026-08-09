@@ -138,13 +138,14 @@ def main():
             continue
 
         inserted = 0
+        cache = {}  # BUG-011: memoizes last-season aggregates across this season's matchdays
         for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
             date_rows = list(date_rows)
             squad_ids_by_team = {tid: strength.squad_as_of_date(conn, tid, season, match_date)
                                  for tid in team_ids}
             results = strength.compute(conn, team_ids, args.league, season, match_date,
                                        team_xg_v_goals_blend=args.team_xg_v_goals_blend,
-                                       current_squad_ids_by_team=squad_ids_by_team)
+                                       current_squad_ids_by_team=squad_ids_by_team, cache=cache)
 
             for row in date_rows:
                 home = results[row["home_team_id"]]

@@ -9,11 +9,11 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
-## BUG-011 — `compute_club_player_strength.compute()` redundantly recomputes last-season aggregates on every matchday during a backfill, making full-season backfills slow
+## BUG-011 — `compute_club_player_strength.compute()` redundantly recomputes last-season aggregates on every matchday during a backfill, making full-season backfills slow — **FIXED 2026-08-08**
 
 - **Type:** performance (no correctness impact) · **Severity:** low (cosmetic/rare —
   slows backfill/backtest runs, doesn't affect any stored prediction) · **Status:**
-  OPEN, not yet fixed. Logged 2026-08-07 while running FEATURE-011 Follow-up B's
+  FIXED 2026-08-08. Logged 2026-08-07 while running FEATURE-011 Follow-up B's
   post-implementation bias/ROI validation (see FEATURE-011 entry below).
 
 **Context.** `backfill_player_blend_predictions.py` processes a season one matchday
@@ -31,12 +31,26 @@ while backtesting the CURRENT season — so the same aggregate gets recomputed f
 scratch ~12,700+ times per season (318 matchdays x 40 calls) when it only needs
 computing once per team.
 
-**Fix (not yet done):** memoize `player_season_minutes(conn, last_season)` (one dict,
-reused for the whole run) and `team_roster_minutes(conn, team_id, last_season)`
-(one dict per team, reused for the whole run) at the top of a backfill/backtest loop,
-or add simple caching inside `player_trust_score`/`resolve_blend_weight` keyed on
-`(team_id, season)`. No behavior change expected — same queries, same results, just
-not re-run on every matchday.
+**Fix.** Added an optional `cache` dict threaded through `compute()` ->
+`resolve_blend_weight()` -> `player_trust_score()`, via a small `_memoized(cache, key,
+fn)` helper. `cache=None` (the default everywhere) is a plain passthrough — identical
+behavior to before this fix, safe for one-off/live calls. A caller looping over many
+matchdays (a backfill/backtest script) creates one `cache = {}` before the loop and
+passes it to every `compute()` call; `team_roster_minutes(team_id, last_season)` and
+`player_season_minutes(last_season)` then get computed once each and reused for the
+rest of the run instead of ~12,700+ times. Wired into the three scripts that loop over
+a full season: `backfill_player_blend_predictions.py`, `backfill_with_xg_stretch.py`,
+`oracle_roster_blend_test.py`. Not wired into `generate_club_league_card.py` (a live,
+single-card run — negligible benefit, not the target of this fix).
+
+**Verified.** New test
+(`test_player_trust_score_cache_avoids_recomputing_last_season_aggregates`) confirms
+the underlying aggregates are called exactly once per team across repeated calls
+sharing a cache, and that cached vs. uncached results are identical. Measured
+end-to-end on a real Serie A season backfill (380 matches, 2025): **625s -> 248s
+(~2.5x faster)**. Full `test_compute_club_player_strength.py` suite still 44 passed /
+1 pre-existing (unrelated, documented-as-expected-to-fail) failure, same as before
+this change — no behavior change for any existing caller.
 
 ---
 
@@ -151,6 +165,60 @@ come back to before calling model changes done for this feature.**
 Both are directly motivated by (not yet confirmed as the root cause of) the MD20-28
 ROI anomaly above -- a mid-season roster change is invisible to the player-level number
 under today's implementation of either dimension.
+
+**2026-08-08: Follow-up A payoff estimate -- worth a cheap fix, not worth a heavy one.
+Not started; come back to when a low-cost roster-signal source (transfers/injuries/
+suspensions) is convenient to wire in.**
+
+Before investing in a real roster-aware system, ran a coverage check plus a
+ceiling-payoff estimate to see whether the effort is justified at all. A hard
+dependency on confirmed starting lineups was ruled out up front (user: don't want the
+model gated on lineup availability), so the real-world version of this fix would have
+to come from lower-latency signals available well before kickoff (transfer/signing
+announcements, injury/suspension lists) -- not a same-day lineup feed.
+
+*Coverage check* (`load_team_players` vs actual match participants, minutes-weighted,
+10 matches / 20 team-checks): confirmed the roster-blindness is real, concentrated
+around transfer-window debuts and long-benched players suddenly starting (e.g. new
+signings contributing 0% to their team's rating in their debut match).
+
+*Ceiling estimate* (`oracle_roster_blend_test.py`, `poisson_v4_oracleroster50`,
+`blend_frac=0.5` -- **hindsight test**, blends each player's rate 50% of the way from
+today's trailing-window rate toward a rate computed from that exact match's own actual
+outcome; NOT a realistic implementation, and the blend is inconsistently applied
+between player categories -- previously-invisible players get their FULL oracle rate
+at half weight rather than a half-blended rate, so this run overstates a true "halfway"
+result, skewing toward the high end of "partial improvement." Treated as a generous
+ceiling, not a precise 50% figure):
+
+| metric | baseline (`poisson_v4`) | oracle-50 ceiling | Δ |
+|---|---|---|---|
+| Brier, 2024 | 0.5948 | 0.5825 | -0.0123 |
+| Brier, 2025 | 0.6169 | 0.6080 | -0.0089 |
+| Brier, pooled | 0.6058 | 0.5953 | **-0.0105 (~1.7% relative)** |
+| ROI vs Bet365, 2024 @EV+0% | -9.2% | -6.8% | +2.4pp |
+| ROI vs Bet365, 2024 @EV+5% | -12.6% | -4.8% | +7.8pp |
+| ROI vs Bet365, 2024 @EV+10% | -19.9% | -4.8% | +15.1pp |
+| ROI vs Bet365, 2025 @EV+0% | -9.8% | -9.4% | +0.4pp |
+| ROI vs Bet365, 2025 @EV+5% | -6.6% | -7.1% | -0.5pp |
+| ROI vs Bet365, 2025 @EV+10% | -8.5% | -3.3% | +5.2pp |
+
+Bias vs Betfair Exchange closing (home/away split) moved inconsistently -- 2024 away
+bias improved (+0.0099 -> -0.0020) but 2024 home bias flipped sign (-0.0048 ->
++0.0076) and 2025 draw bias worsened (-0.0046 -> -0.0083). No clean convergence toward
+zero the way Brier/ROI moved.
+
+**Conclusion.** Brier improves modestly and consistently across both seasons (~1.7%
+relative). ROI improves substantially in 2024 (especially at higher EV thresholds) but
+barely moves in 2025, and even at this generous ceiling **ROI never crosses into
+profitable territory in either season**. Roster awareness looks like a real, moderate
+contributor -- not a fix that alone would flip the model profitable, and not one that
+justifies a heavy build (a real lineup-prediction system) on this evidence alone. A
+cheap version scoped to the cases the coverage check actually found (transfer-window
+debuts, long-benched-then-starting players) via existing external signals -- not
+same-day lineups -- is worth doing when convenient; a heavier system is not justified
+by this ceiling. Worth revisiting once a low-cost data source for those signals is
+identified.
 
 ---
 
@@ -593,6 +661,52 @@ noisy single-season signal that does not reliably move with calibration improvem
 own isn't sufficient to justify shipping given the ROI picture is a coin flip across
 the two seasons available. Candidate for revisiting alongside `team_xg_weight` if/when
 a 3rd season of backtest data exists.
+
+**2026-08-09: shipped anyway, on correctness/consistency grounds rather than waiting
+for a 3rd ROI season.** Re-examined the additive-vs-multiplicative question on its own
+mathematical merits rather than purely by backtested ROI: the additive form has no
+principled justification and a real defect the ratio form doesn't share -- it can
+drive the recentered player-attack lambda **negative** for a team far enough below
+`attack_mean` when `avg_home`/`avg_away` is small (a Poisson rate parameter must never
+be negative), and it implicitly treats the raw player-rate scale as directly
+comparable in absolute units to the goals-per-game scale, an assumption nothing in the
+pipeline actually establishes. Multiplicative has neither problem, and matches both
+defense's own recentering and the team-level system's convention throughout
+(`lambda_H = h_att * (a_def / avg_h)`) -- attack was the one inconsistent piece, not a
+deliberately different design.
+
+Shipped: `compute_club_player_strength.compute()`'s attack recentering is now
+`r["ra"] * (avg_home / attack_mean)` (was `avg_home + (r["ra"] - attack_mean)`),
+matching defense's `r["rd"] * (avg_away / defense_mean)` exactly. The two tests
+documenting this asymmetry (`tests/test_compute_club_player_strength.py`) are updated
+-- the additive-behavior test is removed (no longer real behavior) and the
+multiplicative-contract test now passes instead of being deliberately left red.
+
+Regenerated `poisson_v4` (both seasons, current shipped constants -- NOT the 2025-26-
+only, pre-xG-stretch state the table above was measured under, so the two aren't
+directly comparable) to validate under the actual current pipeline:
+
+| | Brier 2024 | Brier 2025 | Brier pooled |
+|---|---|---|---|
+| additive (previous) | 0.5948 | 0.6169 | 0.6058 |
+| multiplicative (shipped) | 0.5906 | 0.6134 | **0.6020 (~0.6% better, both seasons)** |
+
+Compression bucket table improved in **every bucket, both seasons** (e.g. 2024
+biggest-underdog end +0.064->+0.050, biggest-favorite end -0.093->-0.073) --
+consistent with the 2026-08-05 finding. Pooled signed bias stayed in roughly the same
+(already-passing) range, home/draw/away all still within or near the +/-0.01-0.02
+target.
+
+ROI vs Bet365, however, **flipped direction from the 2026-08-05 reading** -- now worse
+in 2024 (@0/5/10% EV: -9.2%/-12.6%/-19.9% -> -11.0%/-16.4%/-19.1%, mixed but mostly
+worse) and better in 2025 (-9.8%/-6.6%/-8.5% -> -6.3%/-6.2%/-7.8%, better at all 3
+thresholds) -- the OPPOSITE season pattern from the earlier ad hoc test (which had
+2024 improving and 2025 worsening). This is strong direct evidence, not just an
+inference, that this fix's ROI sign is unstable across the model's own evolving
+constants and not a signal worth gating a correctness fix on -- the calibration
+evidence (Brier, compression bucket, both consistently positive in both seasons under
+both the old and new model states) is the trustworthy signal here, and it's what
+motivated shipping. Full snapshot: `model_snapshots/20260809_124219_poisson_v4.txt`.
 
 **2026-08-05: sanity-checked the ROI success criterion's own benchmark validity --
 does a sharp closing line actually beat Bet365, i.e. is chasing agreement with it a
