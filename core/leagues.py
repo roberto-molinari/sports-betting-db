@@ -5,7 +5,7 @@ reads from this dict instead of hardcoding per-league values.
 
 A plain Python dict, not a database table: this is static, developer-owned config,
 the same category as compute_club_player_strength.py's PLAYER_RATING_* constants,
-which also stay in code so model_snapshot.py can record their exact values per run.
+which also stay in code so model_metrics_report.py can record their exact values per run.
 
 Fields:
   country                     matches soccer_teams.country; used by

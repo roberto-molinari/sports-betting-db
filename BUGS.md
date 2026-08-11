@@ -9,6 +9,167 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-017 — All-up metrics report across every league/season/market; renamed model_snapshot.py — **SHIPPED 2026-08-11**
+
+- **Type:** enhancement · **Status:** SHIPPED 2026-08-11. Logged/built same day —
+  user asked "if i want to see all up... brier, roi, bias... across all leagues,
+  seasons and markets, how do i do that?" after FEATURE-015 shipped; the honest
+  answer at the time was "there isn't a command for that, run it per league and
+  combine by hand." Built as the new default report instead of staying a manual
+  step. Also folds in the user's separate ask to rename `model_snapshot.py` —
+  "an odd and not very useful name" — to `model_metrics_report.py`.
+
+**What shipped.** `model_metrics_report.py` (renamed from `model_snapshot.py`) now
+has two modes: the ORIGINAL single-league deep-dive report (compression-bucket
+table included) still available via `--league "X"`, unchanged in output; and a NEW
+default report (no `--league` needed) covering every league/season the model has
+real `soccer_model_predictions` rows for. Leagues and seasons are discovered live
+from the database (`discover_leagues()`/`discover_seasons()`), not a hardcoded
+list, so a newly-added league is picked up automatically without a code change.
+
+Three views, all built from the same pooling primitives so every number in the
+report is computed the same way regardless of scope:
+- **ALL-UP** — every league x every season x every MARKET, genuinely pooled into
+  three numbers (Brier, Bias, ROI) via `pooled_brier_across_markets()`/
+  `pooled_roi_across_markets()`.
+- **BY MARKET** — pooled across leagues, split by season, one market at a time
+  (`pooled_brier()`/`pooled_roi()` with `totals=True/False`).
+- **BY LEAGUE** — pooled across seasons, split by season, both markets shown
+  side by side, not blended.
+
+**Design correction, 2026-08-11 (same day): the first version of this feature kept
+1X2 and totals separate even in the ALL-UP section** — reasoning that this codebase
+has a repeatedly-stated "never pool across markets" rule (`run_totals()`'s own
+docstring). **User corrected this directly**, looking at the shipped output: "this
+section should have three numbers: brier, bias, roi -- across *all* leagues,
+markets, seasons." Rebuilt ALL-UP to actually blend markets for Brier and ROI:
+  - **Brier** is legitimately combinable: a 3-class (1X2) and 2-class (totals)
+    Brier score differ in their NAIVE baseline (~0.667 vs ~0.5) but land on the
+    SAME [0, 2] error scale regardless of class count, so an n-weighted average
+    across both answers a real question (mean squared probability error per
+    graded prediction, regardless of market).
+  - **ROI** is legitimately combinable: every bet stakes $1 regardless of market,
+    so summing profit/staked across both is an exact portfolio-level return, not
+    an approximation.
+  - **Bias** is the one metric that genuinely can't be pooled across markets --
+    totals has no sharp-book O/U data to blend WITH (FEATURE-015), so ALL-UP's
+    bias number is inherently 1X2-only; reported as such inline rather than
+    silently presented as if it covered both markets.
+The original "never pool across markets" rule still holds everywhere else in the
+report (BY MARKET and BY LEAGUE keep the two markets as separate numbers) --
+it was specifically the ALL-UP section's job to be the true single-number rollup,
+which the first version failed to actually deliver.
+
+**Pooling correctness, not just convenience:**
+- Brier: n-weighted sum of per-(league, season[, market]) scores -- exact, since
+  Brier is itself a mean of squared errors (associative with computing on raw
+  concatenated data).
+- Bias: concatenates raw model-vs-market pairs across every (league, season) and
+  calls `compare_model_vs_market_odds.summarize()` ONCE, rather than averaging
+  pre-computed per-group summaries -- averaging would be wrong for `summarize()`'s
+  non-linear stats (`max_abs_diff`, `favored_agree_rate`); only the mean happens to
+  come out right that way, so this avoids a subtle latent bug rather than just
+  being tidier.
+- ROI: `backtest_from_predictions.py` refactored to extract `grade_1x2()`/
+  `grade_totals()` -- the same core grading logic `run()`/`run_totals()` already
+  had, just returning the full stats dict (staked, profit, bets, wins, by_side)
+  instead of only printing it and returning `(roi, bets)`. `run()`/`run_totals()`
+  themselves are now thin wrappers (print + return the same 2-tuple as before,
+  verified byte-identical output pre/post-refactor) -- true pooled ROI is sum of
+  profit / sum of staked across every group (leagues, seasons, and for ALL-UP,
+  markets too), not an average of pre-computed ratios (which would be wrong
+  whenever stakes differ across groups).
+
+**A real finding the tool surfaced immediately:** pooling totals ROI across all 5
+leagues flips it negative (-6.8% at EV>0%) despite Serie A alone being positive at
+every threshold (the highlighted result from FEATURE-015/`docs/STATUS-08-08-2026.md`)
+-- Bundesliga's totals ROI is deeply negative (-19% to -20%) and dominates the
+pooled number. Exactly the kind of masking this file has warned about since
+BUG-009 (a pooled-only number hiding a real per-group effect) -- now visible at a
+glance because the BY LEAGUE breakdown sits right below the ALL-UP number instead
+of requiring 5 separate manual runs to notice.
+
+**Tests:** `tests/test_model_metrics_report.py` (renamed from
+`test_model_snapshot.py`) gained 8 new tests covering `discover_leagues()`/
+`discover_seasons()` (including method/league scoping), `pooled_brier()`/
+`pooled_roi()` (real end-to-end checks against `backtest_from_predictions`,
+confirming true dollar-pooling rather than ratio-averaging), and
+`pooled_brier_across_markets()`/`pooled_roi_across_markets()` (one match seeded
+with a perfect 1X2 call and a worst-case totals call, confirming the blended
+number is the genuine average of both, not either market silently shadowing the
+other). Verified live: the default (no-args except `--note`) report runs cleanly
+across all 5 leagues, and every number cross-checks exactly against
+FEATURE-014/015's previously-recorded values (e.g. ALL-UP ROI @ EV>0% staked/
+profit sums exactly match 1X2's + totals' previously-recorded figures). Full
+suite: 380 passed, 0 failures.
+
+**2026-08-11 addendum: console-only preview mode, no persistence.** While
+discussing whether these persisted files have real ongoing utility (see FEATURE-018
+below), user asked for a quick-look path that doesn't add to the permanent record:
+running `model_metrics_report.py` with LITERALLY ZERO arguments (not even `--note`)
+prints the all-up report and returns without writing anything under
+`model_snapshots/`. Passing any flag at all, even `--note` by itself, falls through
+to the normal persisted behavior unchanged -- the trigger is strictly `len(sys.argv)
+== 1`, not "was --note omitted." 2 new tests (`test_no_args_prints_a_report_and_
+writes_no_file`, `test_note_only_still_persists_a_file`) confirm both the no-file
+guarantee and that the persisted path isn't accidentally weakened. 15 tests total
+in `tests/test_model_metrics_report.py` now; full suite still 380 passed.
+
+---
+
+## FEATURE-018 — Metrics history belongs in a database table, not flat files in `model_snapshots/`
+
+- **Type:** enhancement / tech debt · **Status:** PROPOSED, not started. Logged
+  2026-08-11 — user, looking at the growing `model_snapshots/` directory: "i am
+  skeptical about the utility [of committing these files]. if there is utility, it
+  feels like the data belongs in a database and not these individual files."
+
+**Why a snapshot mechanism exists at all (confirmed, not assumed):**
+`clear_soccer_model_predictions()` (`core/sports_db.py`) DELETES and re-inserts
+every `soccer_model_predictions` row for a given (league, season, method) on every
+backfill re-run -- so a method name like `poisson_v4` gets its underlying
+predictions destructively overwritten in place the next time anyone re-backfills
+after a model tweak. There is currently no other way to recover what the OLD
+numbers were once that happens; the committed text files under `model_snapshots/`
+are the only record. This is a real, load-bearing reason to persist SOMETHING --
+the open question is only the storage form.
+
+**Contrast with `roi_history.py`** (the World Cup side): it computes ROI history
+on the fly, directly from `soccer_wc_picks`, with no separate snapshot storage at
+all. That works there specifically because WC picks are effectively append-only
+once graded -- it would NOT work for club-league metrics, where the source data
+(`soccer_model_predictions`) is itself mutated in place per the paragraph above.
+
+**Problem with the current file-based approach:**
+- Unbounded growth -- every run adds a file, nothing is ever removed (16 files
+  already committed before this session; 6 more from this session alone). Now
+  that the all-up report needs zero flags to run, generating one is even easier,
+  which will likely accelerate growth.
+- Every file repeats the full 17-line "Committed model constants" dump verbatim,
+  pure duplication across files that could be one shared row/blob per run instead.
+- Not queryable -- "how has Serie A's ROI at EV>0% moved across the last 10
+  `poisson_v4` runs" currently means manually opening and diffing several text
+  files; a database table makes it one SQL query.
+- No policy yet for what's worth keeping -- in practice this session has already
+  been informally curating (deleting scratch/smoke-test runs before each commit,
+  keeping only ones tied to a real BUGS.md finding), which isn't written down
+  anywhere and relies on remembering to do it every time.
+
+**Proposed shape (not built, not fully scoped):** a new `model_metrics_history`
+table -- one row per persisted report run: timestamp, method, scope (league/
+season/market, or "all-up"), the free-text note, the committed constants
+(serialized, e.g. JSON), and the actual Brier/bias/ROI numbers. Still strictly
+append-only, same historical-record property the files have today, just
+structured instead of flat text. The 16+ already-committed files would stay as
+legacy/orphaned history rather than get migrated into the new table.
+
+**Deliberately not started:** user said "leave [the files] for now" -- this is
+tracked so the idea isn't lost, not scoped as next-up work. The console-only
+preview mode above (2026-08-11) already reduces file growth for casual/exploratory
+runs without waiting on this larger change.
+
+---
+
 ## FEATURE-014 — Multi-league expansion: Premier League, Bundesliga, La Liga, Ligue 1 — **SHIPPED 2026-08-10**
 
 - **Type:** enhancement (major) · **Status:** SHIPPED 2026-08-10. Logged/built same
@@ -116,39 +277,41 @@ new-league buildout — user's explicit call.
 
 ---
 
-## FEATURE-015 — `model_snapshot.py` only reports the 1X2 market; wire in totals (over/under)
+## FEATURE-015 — `model_snapshot.py` only reports the 1X2 market; wire in totals (over/under) — **Brier + ROI SHIPPED 2026-08-11, bias explicitly deferred**
 
-- **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-08-10 while
-  generating FEATURE-014's 5-league validation snapshots — user asked whether those
-  bias/ROI numbers covered every market the model supports; they didn't, and the gap
-  wasn't previously written down anywhere. **User's call: fine to leave until after
-  this session's multi-league-expansion code is committed/reviewed (2026-08-11),
-  build this after.**
+- **Type:** enhancement · **Status:** Brier and ROI done; bias still has no data
+  source to check against (see below) — not a wiring gap, a real data gap, tracked
+  separately below rather than left implicit. Logged 2026-08-10 while generating
+  FEATURE-014's 5-league validation snapshots (user asked whether those bias/ROI
+  numbers covered every market the model supports; they didn't). Built 2026-08-11
+  per the user's own follow-up ("I want to do FEATURE-015 next").
 
-**Problem.** `model_snapshot.py`'s three sections are all 1X2-only today:
-- **Brier score** — scored from `p_home`/`p_draw`/`p_away` vs. the actual result only.
-- **Bias** (compression-bucket table + pooled signed bias vs. the sharp book) —
-  compares against `soccer_market_odds`, which structurally has no O/U columns at all
-  (`home_odds`/`draw_odds`/`away_odds`/`p_*_fair` only) — no sharp-book totals odds are
-  ingested anywhere in this codebase, so there is currently no way to bias-check the
-  totals market against a sharp line, not just a wiring gap.
-- **ROI** — calls `backtest_from_predictions.run()` (the 1X2 function) only, never
-  `run_totals()` (the O/U ROI function added in the immediately-prior commit,
-  `3270493 Add over/under (totals) market backtesting`) — that capability already
-  exists and already works (spot-checked live: `--league "Premier League" --season
-  2024 --method poisson_v4 --market totals --ev-threshold 0` -> +0.5% ROI, 345 bets,
-  n=380 graded), it's just not part of the automated snapshot report.
+**What shipped.** `model_snapshot.py` now has two new sections alongside the
+existing 1X2 ones: `totals_brier_score()` (same sum-of-squared-errors shape as the
+1X2 Brier function, scored on `p_over`/`p_under` vs. actual total-goals-over/under
+the line stored on the prediction row itself; pushes and rows with no totals
+prediction are excluded, matching `run_totals()`'s own push handling) and a totals
+ROI section that calls the already-existing `backtest_from_predictions.run_totals()`
+per season/EV-threshold. Both are printed as their own sections, never pooled with
+the 1X2 numbers (matching `run_totals()`'s own documented convention). A third
+section, `## Bias, TOTALS/over-under: not available`, makes the gap explicit in
+every snapshot's output instead of silently omitting it — `soccer_market_odds` (the
+sharp-book reference every existing bias check runs against) has no O/U columns at
+all, so there's currently no sharp-book totals line to compare against; adding one
+is out of scope here, tracked as its own open question, not assumed away.
 
-The model already generates and stores `p_over`/`p_under` for every prediction
-(`backfill_player_blend_predictions.py`), so the ROI half of this is close — it needs
-`model_snapshot.py` to also call `run_totals()` per season/EV-threshold and print it
-as its own section (kept separate from the 1X2 ROI number, matching `run_totals()`'s
-own docstring: "never pooled together, since they're different markets"). The Brier
-and bias halves need real design thought first: Brier is a small addition (score
-`p_over`/`p_under` against actual total-goals-over/under the line, same shape as the
-1X2 version); bias has no data source to compare against yet at all, so scope needs to
-cover whether to start ingesting a sharp-book O/U odds source before a totals bias
-check is even possible.
+New test file `tests/test_model_snapshot.py` (5 tests) covers `totals_brier_score()`
+directly: perfect/worst-case scoring, push exclusion, missing-prediction exclusion,
+pooling across matches. Verified live across all 5 leagues (`model_snapshots/
+20260811_115505_*_poisson_v4.txt` + Ligue 1's `_115506_`) — totals Brier lands close
+to the ~0.5 naive baseline for every league (0.506-0.518 pooled), no outliers; totals
+ROI is genuinely positive at every EV threshold for Serie A (+5.5/+9.4/+19.0% at
+EV>0/5/10%, 2025), matching the pattern already flagged in `docs/STATUS-08-08-2026.md`
+as "the one place in the whole model where [ROI] is monotonically positive."
+
+**Open, not scoped further:** whether to start ingesting a sharp-book totals odds
+source (so a real bias check becomes possible), and if so, which one and at what
+cost/effort — deliberately left as a future decision, not defaulted into this pass.
 
 ---
 

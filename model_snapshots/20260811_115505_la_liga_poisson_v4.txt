@@ -1,0 +1,164 @@
+# Model snapshot -- poisson_v4 / La Liga
+Generated: 2026-08-11T15:55:05.953804+00:00
+Seasons: [2024, 2025]
+Note: FEATURE-015: totals (over/under) Brier + ROI wired into the automated snapshot report; totals bias explicitly not-available (no sharp-book O/U data ingested)
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON = 900.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663, 'Premier League': 1.0, 'Bundesliga': 1.0, 'La Liga': 1.0, 'Ligue 1': 1.0}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+## Brier score (all games, not just bets -- lower is better; naive baseline ~0.667)
+  season 2024: Brier = 0.6249  (n=380)
+  season 2025: Brier = 0.5887  (n=380)
+  pooled: Brier = 0.6068  (n=760)
+
+## Brier score, TOTALS/over-under (lower is better; naive baseline ~0.5 -- 2-class scale, not directly comparable to 1X2's 3-class number above)
+  season 2024: Brier = 0.5082  (n=380)
+  season 2025: Brier = 0.5066  (n=380)
+  pooled: Brier = 0.5074  (n=760)
+
+## Compression-bucket table (model p_home - Betfair Exchange closing p_home, by market's own p_home)
+  season 2024:
+     0.00-0.15: +0.083  (n=16)
+     0.15-0.25: +0.046  (n=46)
+     0.25-0.35: +0.024  (n=62)
+     0.35-0.45: +0.003  (n=78)
+     0.45-0.55: +0.006  (n=68)
+     0.55-1.01: -0.008  (n=110)
+  season 2025:
+     0.00-0.15: +0.145  (n=11)
+     0.15-0.25: +0.084  (n=30)
+     0.25-0.35: +0.040  (n=58)
+     0.35-0.45: +0.006  (n=92)
+     0.45-0.55: -0.027  (n=72)
+     0.55-1.01: -0.059  (n=86)
+
+## Pooled signed bias vs Betfair Exchange closing (home/away split, target +/-0.01-0.02)
+  season 2024: home=+0.0122  away=-0.0009  draw=-0.0115  (n=380)
+  season 2025: home=-0.0002  away=+0.0186  draw=-0.0185  (n=349)
+
+## Bias, TOTALS/over-under: not available
+  No sharp-book totals odds are ingested anywhere in this codebase (soccer_market_odds
+  has no O/U columns at all), so there's no line to bias-check the totals market
+  against yet -- not a wiring gap, a real data gap. See FEATURE-015, BUGS.md.
+
+## ROI vs Bet365 (ROI success criterion -- must be positive at EV>0/5/10%)
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | EV threshold +0.0% | 380 graded matches
+  Bets: 445  Wins: 145  Win rate: 32.6%
+  Total staked: $445.00  Profit: $-55.28  ROI: -12.4%
+
+  By side:
+     home  n=186  wins=76   profit=$  -32.35  ROI=-17.4%
+     draw  n=122  wins=31   profit=$   -5.32  ROI=-4.4%
+     away  n=137  wins=38   profit=$  -17.61  ROI=-12.9%
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | EV threshold +5.0% | 380 graded matches
+  Bets: 375  Wins: 120  Win rate: 32.0%
+  Total staked: $375.00  Profit: $-49.24  ROI: -13.1%
+
+  By side:
+     home  n=163  wins=65   profit=$  -28.94  ROI=-17.8%
+     draw  n=87   wins=22   profit=$   -3.32  ROI=-3.8%
+     away  n=125  wins=33   profit=$  -16.98  ROI=-13.6%
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | EV threshold +10.0% | 380 graded matches
+  Bets: 321  Wins: 94  Win rate: 29.3%
+  Total staked: $321.00  Profit: $-59.08  ROI: -18.4%
+
+  By side:
+     home  n=135  wins=49   profit=$  -32.61  ROI=-24.2%
+     draw  n=71   wins=17   profit=$   -6.45  ROI=-9.1%
+     away  n=115  wins=28   profit=$  -20.02  ROI=-17.4%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | EV threshold +0.0% | 380 graded matches
+  Bets: 419  Wins: 120  Win rate: 28.6%
+  Total staked: $419.00  Profit: $-43.07  ROI: -10.3%
+
+  By side:
+     home  n=157  wins=59   profit=$  -18.42  ROI=-11.7%
+     draw  n=71   wins=14   profit=$  -11.72  ROI=-16.5%
+     away  n=191  wins=47   profit=$  -12.93  ROI=-6.8%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | EV threshold +5.0% | 380 graded matches
+  Bets: 336  Wins: 89  Win rate: 26.5%
+  Total staked: $336.00  Profit: $-50.59  ROI: -15.1%
+
+  By side:
+     home  n=119  wins=43   profit=$  -16.44  ROI=-13.8%
+     draw  n=46   wins=8    profit=$   -8.97  ROI=-19.5%
+     away  n=171  wins=38   profit=$  -25.18  ROI=-14.7%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | EV threshold +10.0% | 380 graded matches
+  Bets: 286  Wins: 75  Win rate: 26.2%
+  Total staked: $286.00  Profit: $-39.21  ROI: -13.7%
+
+  By side:
+     home  n=104  wins=36   profit=$  -14.84  ROI=-14.3%
+     draw  n=36   wins=7    profit=$   -2.47  ROI=-6.9%
+     away  n=146  wins=32   profit=$  -21.90  ROI=-15.0%
+
+## ROI vs Bet365, TOTALS/over-under (never pooled with 1X2 ROI -- different markets)
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | TOTALS | EV threshold +0.0% | 380 graded matches
+  Bets: 337  Wins: 177  Win rate: 52.5%
+  Total staked: $337.00  Profit: $-4.89  ROI: -1.5%
+
+  By side:
+     over  n=107  wins=54   profit=$   +5.89  ROI=+5.5%
+    under  n=230  wins=123  profit=$  -10.78  ROI=-4.7%
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | TOTALS | EV threshold +5.0% | 380 graded matches
+  Bets: 273  Wins: 143  Win rate: 52.4%
+  Total staked: $273.00  Profit: $-3.04  ROI: -1.1%
+
+  By side:
+     over  n=83   wins=37   profit=$   -2.90  ROI=-3.5%
+    under  n=190  wins=106  profit=$   -0.14  ROI=-0.1%
+
+poisson_v4 | La Liga season 2024 | vs Bet365 | TOTALS | EV threshold +10.0% | 380 graded matches
+  Bets: 237  Wins: 126  Win rate: 53.2%
+  Total staked: $237.00  Profit: $+4.58  ROI: +1.9%
+
+  By side:
+     over  n=72   wins=34   profit=$   +3.32  ROI=+4.6%
+    under  n=165  wins=92   profit=$   +1.26  ROI=+0.8%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | TOTALS | EV threshold +0.0% | 380 graded matches
+  Bets: 293  Wins: 127  Win rate: 43.3%
+  Total staked: $293.00  Profit: $-34.31  ROI: -11.7%
+
+  By side:
+     over  n=135  wins=56   profit=$  -22.66  ROI=-16.8%
+    under  n=158  wins=71   profit=$  -11.65  ROI=-7.4%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | TOTALS | EV threshold +5.0% | 380 graded matches
+  Bets: 221  Wins: 98  Win rate: 44.3%
+  Total staked: $221.00  Profit: $-17.74  ROI: -8.0%
+
+  By side:
+     over  n=101  wins=41   profit=$  -17.26  ROI=-17.1%
+    under  n=120  wins=57   profit=$   -0.48  ROI=-0.4%
+
+poisson_v4 | La Liga season 2025 | vs Bet365 | TOTALS | EV threshold +10.0% | 380 graded matches
+  Bets: 147  Wins: 65  Win rate: 44.2%
+  Total staked: $147.00  Profit: $-8.42  ROI: -5.7%
+
+  By side:
+     over  n=67   wins=27   profit=$  -12.40  ROI=-18.5%
+    under  n=80   wins=38   profit=$   +3.98  ROI=+5.0%

@@ -61,7 +61,13 @@ def load_totals_predictions(conn, league, season, method, sportsbook=DEFAULT_SPO
     return cur.fetchall()
 
 
-def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+    """Core 1X2 grading logic, returning the full stats dict (not just roi/bets) --
+    factored out of run() so a caller pooling across many leagues/seasons (e.g.
+    model_metrics_report.py's all-up view) can sum true staked/profit dollars
+    directly instead of reconstructing them from a printed ROI ratio. run() itself
+    is now a thin wrapper: print + return (roi, bets), unchanged for existing
+    callers."""
     rows = load_predictions(conn, league, season, method, sportsbook=sportsbook)
     total_staked = total_profit = 0.0
     bets = wins = 0
@@ -91,28 +97,36 @@ def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOO
                 wins += 1
                 by_side[side][1] += 1
 
-    roi = total_profit / total_staked if total_staked else 0.0
-    print(f"\n{method} | {league} season {season} | vs {sportsbook} | "
-          f"EV threshold {ev_threshold:+.1%} | {len(rows)} graded matches")
-    if bets:
-        print(f"  Bets: {bets}  Wins: {wins}  Win rate: {wins/bets:.1%}")
+    return {"n_graded": len(rows), "staked": total_staked, "profit": total_profit,
+            "bets": bets, "wins": wins, "by_side": by_side}
+
+
+def print_grading_report(stats, label):
+    roi = stats["profit"] / stats["staked"] if stats["staked"] else 0.0
+    print(f"\n{label}")
+    if stats["bets"]:
+        print(f"  Bets: {stats['bets']}  Wins: {stats['wins']}  Win rate: {stats['wins']/stats['bets']:.1%}")
     else:
         print("  No bets placed")
-    print(f"  Total staked: ${total_staked:.2f}  Profit: ${total_profit:+.2f}  ROI: {roi:+.1%}")
+    print(f"  Total staked: ${stats['staked']:.2f}  Profit: ${stats['profit']:+.2f}  ROI: {roi:+.1%}")
     print("\n  By side:")
-    for side, (n, w, p) in by_side.items():
+    for side, (n, w, p) in stats["by_side"].items():
         side_roi = p / n if n else 0.0
         print(f"    {side:>5}  n={n:<4} wins={w:<4} profit=${p:>+8.2f}  ROI={side_roi:+.1%}")
-    return roi, bets
 
 
-def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
-    """Totals (over/under) market ROI -- kept as a SEPARATE report/return value from
-    run()'s 1X2 numbers, not pooled together, since they're different markets and
-    every existing ROI reference point in BUGS.md/model_snapshot.py is 1X2-only.
-    2026-08-07: added alongside generate_club_league_card.py's over/under support
-    -- the model already computed p_over/p_under and it was already stored, but
-    nothing graded it, so there was no way to tell if those picks were any good."""
+def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+    stats = grade_1x2(conn, league, season, method, ev_threshold, sportsbook=sportsbook)
+    label = (f"{method} | {league} season {season} | vs {sportsbook} | "
+             f"EV threshold {ev_threshold:+.1%} | {stats['n_graded']} graded matches")
+    print_grading_report(stats, label)
+    roi = stats["profit"] / stats["staked"] if stats["staked"] else 0.0
+    return roi, stats["bets"]
+
+
+def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+    """Core totals (over/under) grading logic -- same role as grade_1x2() for the
+    O/U market, factored out of run_totals() for the same pooling reason."""
     rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook)
     total_staked = total_profit = 0.0
     bets = wins = 0
@@ -144,19 +158,23 @@ def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SP
                 wins += 1
                 by_side[side][1] += 1
 
-    roi = total_profit / total_staked if total_staked else 0.0
-    print(f"\n{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
-          f"EV threshold {ev_threshold:+.1%} | {len(rows)} graded matches")
-    if bets:
-        print(f"  Bets: {bets}  Wins: {wins}  Win rate: {wins/bets:.1%}")
-    else:
-        print("  No bets placed")
-    print(f"  Total staked: ${total_staked:.2f}  Profit: ${total_profit:+.2f}  ROI: {roi:+.1%}")
-    print("\n  By side:")
-    for side, (n, w, p) in by_side.items():
-        side_roi = p / n if n else 0.0
-        print(f"    {side:>5}  n={n:<4} wins={w:<4} profit=${p:>+8.2f}  ROI={side_roi:+.1%}")
-    return roi, bets
+    return {"n_graded": len(rows), "staked": total_staked, "profit": total_profit,
+            "bets": bets, "wins": wins, "by_side": by_side}
+
+
+def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+    """Totals (over/under) market ROI -- kept as a SEPARATE report/return value from
+    run()'s 1X2 numbers, not pooled together, since they're different markets and
+    every existing ROI reference point in BUGS.md/model_metrics_report.py is 1X2-only.
+    2026-08-07: added alongside generate_club_league_card.py's over/under support
+    -- the model already computed p_over/p_under and it was already stored, but
+    nothing graded it, so there was no way to tell if those picks were any good."""
+    stats = grade_totals(conn, league, season, method, ev_threshold, sportsbook=sportsbook)
+    label = (f"{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
+             f"EV threshold {ev_threshold:+.1%} | {stats['n_graded']} graded matches")
+    print_grading_report(stats, label)
+    roi = stats["profit"] / stats["staked"] if stats["staked"] else 0.0
+    return roi, stats["bets"]
 
 
 def main():
