@@ -10,8 +10,11 @@ guardrails are each meant to be checked against the SAME baseline snapshot, both
 seasons separately (a pooled-only number has repeatedly hidden a real
 season-inconsistent effect in this investigation).
 
-Every run writes a NEW timestamped file under model_snapshots/ -- it never
-overwrites a previous run -- so the whole before/after sequence stays on record.
+Every run writes a NEW file under model_snapshots/, named {timestamp}_{league}_
+{method}.txt -- it never overwrites a previous run -- so the whole before/after
+sequence stays on record. (2026-08-10: league added to the filename -- multi-league
+runs of the same method issued in the same second, e.g. a shell loop over leagues,
+previously collided on timestamp+method alone and silently clobbered each other.)
 --note is required: a free-text description of what's different about THIS run
 (e.g. "baseline, shipped defaults" or "ad hoc xG stretch=1.3 on top of shipped
 defaults, not committed"). The snapshot also auto-records the actual value of every
@@ -90,8 +93,8 @@ def brier_score(conn, league, season, method):
     return (total / n if n else float("nan")), n
 
 
-def compression_bucket_table(conn, season, method, source):
-    pairs = cmvmo.fetch_pairs(conn, season, source, line_type="closing", method=method)
+def compression_bucket_table(conn, league, season, method, source):
+    pairs = cmvmo.fetch_pairs(conn, league, season, source, line_type="closing", method=method)
     by_bucket = {b: [] for b in BUCKETS}
     for p_h, p_d, p_a, m_h, m_d, m_a in pairs:
         for lo, hi in BUCKETS:
@@ -127,7 +130,7 @@ def build_report(conn, league, seasons, method, sharp_source, note):
     lines.append(f"## Compression-bucket table (model p_home - {sharp_source} closing p_home, by market's own p_home)")
     for season in seasons:
         lines.append(f"  season {season}:")
-        table = compression_bucket_table(conn, season, method, sharp_source)
+        table = compression_bucket_table(conn, league, season, method, sharp_source)
         for (lo, hi), (val, n) in table.items():
             label = f"{lo:.2f}-{hi:.2f}"
             lines.append(f"    {label:>10}: n=0" if val is None else f"    {label:>10}: {val:+.3f}  (n={n})")
@@ -135,7 +138,7 @@ def build_report(conn, league, seasons, method, sharp_source, note):
 
     lines.append(f"## Pooled signed bias vs {sharp_source} closing (home/away split, target +/-0.01-0.02)")
     for season in seasons:
-        pairs = cmvmo.fetch_pairs(conn, season, sharp_source, line_type="closing", method=method)
+        pairs = cmvmo.fetch_pairs(conn, league, season, sharp_source, line_type="closing", method=method)
         if not pairs:
             lines.append(f"  season {season}: no data")
             continue
@@ -174,8 +177,9 @@ def main():
     report = build_report(conn, args.league, seasons, args.method, args.sharp_source, args.note)
     conn.close()
 
+    league_slug = "".join(c if c.isalnum() else "_" for c in args.league.lower()).strip("_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = SNAPSHOT_DIR / f"{timestamp}_{args.method}.txt"
+    out_path = SNAPSHOT_DIR / f"{timestamp}_{league_slug}_{args.method}.txt"
     out_path.write_text(report)
 
     print(report)

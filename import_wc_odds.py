@@ -36,7 +36,7 @@ import sys
 from datetime import datetime, timezone
 
 from core.sports_db import DATABASE_PATH, upsert_wc_odds
-from import_serie_a_odds import decimal_to_american
+from import_league_betting_odds import decimal_to_american
 
 
 # Map common alternate spellings to the canonical soccer_wc_teams.name.

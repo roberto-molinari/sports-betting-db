@@ -60,7 +60,7 @@ def test_match_by_team_pairing_ignores_date():
     fixture-congested March-April window -- not a timezone issue, see
     FEATURE-011_PROTOTYPE_LOG.md). Matching must succeed regardless."""
     db_matches = [{"match_id": 101, "home_team_id": 1, "away_team_id": 2,
-                  "match_date": "2026-03-08T00:00:00Z", "api_match_id": None}]
+                  "match_date": "2026-03-08T00:00:00Z", "thestatsapi_match_id": None}]
     team_api_id = {1: "tm_cagliari", 2: "tm_como"}
     api_matches = [{"id": "mt_555", "home_team": {"id": "tm_cagliari"},
                    "away_team": {"id": "tm_como"}, "utc_date": "2026-03-07T14:00:00.000Z"}]
@@ -72,7 +72,7 @@ def test_match_by_team_pairing_distinguishes_home_and_away():
     """(home, away) is an ORDERED pair -- the return fixture (teams reversed) must
     not accidentally match, since a double round-robin plays it separately."""
     db_matches = [{"match_id": 1, "home_team_id": 1, "away_team_id": 2,
-                  "match_date": "2026-01-01T00:00:00Z", "api_match_id": None}]
+                  "match_date": "2026-01-01T00:00:00Z", "thestatsapi_match_id": None}]
     team_api_id = {1: "tm_a", 2: "tm_b"}
     api_matches = [
         {"id": "mt_reverse", "home_team": {"id": "tm_b"}, "away_team": {"id": "tm_a"},
@@ -86,7 +86,7 @@ def test_match_by_team_pairing_skips_matches_with_unresolved_team():
     """A DB team with no api_team_id mapping (e.g. a name that failed to match) must
     be skipped, not raise or match spuriously."""
     db_matches = [{"match_id": 1, "home_team_id": 1, "away_team_id": 999,
-                  "match_date": "2026-01-01T00:00:00Z", "api_match_id": None}]
+                  "match_date": "2026-01-01T00:00:00Z", "thestatsapi_match_id": None}]
     team_api_id = {1: "tm_a"}   # team 999 unresolved
     api_matches = [{"id": "mt_x", "home_team": {"id": "tm_a"}, "away_team": {"id": "tm_b"},
                    "utc_date": "2026-01-01T00:00:00.000Z"}]
@@ -119,9 +119,9 @@ def test_pick_season_id_does_not_default_to_current_season():
 def test_match_by_team_pairing_only_returns_resolvable_matches():
     db_matches = [
         {"match_id": 1, "home_team_id": 1, "away_team_id": 2,
-         "match_date": "2026-01-01T00:00:00Z", "api_match_id": None},
+         "match_date": "2026-01-01T00:00:00Z", "thestatsapi_match_id": None},
         {"match_id": 2, "home_team_id": 2, "away_team_id": 1,
-         "match_date": "2026-05-01T00:00:00Z", "api_match_id": None},
+         "match_date": "2026-05-01T00:00:00Z", "thestatsapi_match_id": None},
     ]
     team_api_id = {1: "tm_a", 2: "tm_b"}
     api_matches = [

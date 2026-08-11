@@ -25,7 +25,7 @@ Usage:
 import argparse
 import sqlite3
 from datetime import date
-from statistics import mean, pstdev
+from statistics import mean
 
 from core.sports_db import DATABASE_PATH, set_player_team_strength
 from core.poisson_model import (
@@ -105,9 +105,25 @@ PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
 # scoring from club form) -- close agreement, a reasonable sanity check though not
 # the same question. A league with NO entry here is excluded from the prior-season
 # blend entirely, never assumed equal to Serie A (see player_prior_season_attack_rate).
+#
+# 2026-08-10 (multi-league expansion): Premier League/Bundesliga/La Liga/Ligue 1
+# added at 1.0 -- an ASSUMPTION (peer top-5 leagues, same default as Serie A's own
+# entry), not an empirical derivation like Serie B's 0.663 above. Flagged in BUGS.md
+# as a claim to validate once enough players have tracked minutes in more than one
+# of these leagues to run the same "compare a player to themselves across leagues"
+# methodology. Their feeder divisions (Championship, 2. Bundesliga, LaLiga 2,
+# Ligue 2) deliberately have NO entry yet, same as any league with no entry here --
+# a promoted player's time in one of those divisions is excluded from the attack
+# blend, not assumed equal to its top-flight, until a real Serie-B-style measurement
+# exists for each (needs the player-stats backfill for those divisions to finish
+# first -- also tracked in BUGS.md).
 PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {
     "Serie A": 1.0,
     "Serie B": 0.663,
+    "Premier League": 1.0,
+    "Bundesliga": 1.0,
+    "La Liga": 1.0,
+    "Ligue 1": 1.0,
 }
 
 # Team-level attack/defense blend between actual-goals-based and xG-based sources
@@ -794,7 +810,6 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     defense_vals = [r["rd"] for r in raw.values() if r["rd"] is not None
                      and r["dw"] >= PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE]
     attack_mean = mean(attack_vals) if attack_vals else None
-    attack_sd = pstdev(attack_vals) if len(attack_vals) > 1 else 0.0
     defense_mean = mean(defense_vals) if defense_vals else None
 
     results = {}

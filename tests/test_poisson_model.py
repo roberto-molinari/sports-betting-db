@@ -243,6 +243,23 @@ def test_get_league_averages_before_date_cutoff(conn):
     assert avgs_all["avg_away"] == pytest.approx((0 + 1 + 5) / 3)
 
 
+def test_get_league_averages_falls_back_when_window_averages_to_exact_zero(conn):
+    """2026-08-10 (multi-league expansion): a thin window early in a league's
+    first-ever tracked season can average to exactly 0.0 on one side -- hit for
+    real backfilling Premier League 2024, where the second match_date processed had
+    only a single 1-0 prior match in its window, making avg_away=0.0 and crashing
+    downstream (avg_home/avg_away is used as a normalization ratio). Must fall back
+    to the same default as the empty-db case rather than return a zero."""
+    a = sports_db.ensure_soccer_team("Team A", "Premier League")
+    b = sports_db.ensure_soccer_team("Team B", "Premier League")
+
+    m1 = sports_db.add_soccer_match("Premier League", 2024, a, b, "2024-08-16")
+    sports_db.update_soccer_match_result(m1, 1, 0)
+
+    avgs = pm.get_league_averages(conn, league="Premier League", before_date="2024-08-17")
+    assert avgs == {"avg_home": 1.3, "avg_away": 1.1}
+
+
 def test_get_league_averages_window_limits_to_recent_matches(conn):
     """BUG-009: window caps the average to the N most recent qualifying matches,
     excluding an older extreme result that would otherwise skew it."""
@@ -295,11 +312,11 @@ def test_get_league_averages_decay_weights_recent_matches_more(conn):
     b = sports_db.ensure_soccer_team("Team B", "Serie A")
 
     m1 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-01")
-    sports_db.update_soccer_match_result(m1, 0, 0)
+    sports_db.update_soccer_match_result(m1, 0, 1)
     m2 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-08")
     sports_db.update_soccer_match_result(m2, 2, 0)
     m3 = sports_db.add_soccer_match("Serie A", 2025, a, b, "2025-01-15")
-    sports_db.update_soccer_match_result(m3, 4, 0)   # most recent
+    sports_db.update_soccer_match_result(m3, 4, 2)   # most recent
 
     plain = pm.get_league_averages(conn, league="Serie A", decay=1.0)
     assert plain["avg_home"] == pytest.approx((0 + 2 + 4) / 3)

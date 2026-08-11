@@ -11,7 +11,7 @@ goals-against comes from our own soccer_matches, not the API.
 Steps per league/season:
   1. Resolve the competition, match our DB teams to API teams (import_club_squads).
   2. Match our soccer_matches rows to the API's match ids by (home team, away team,
-     date) -- stored on soccer_matches.api_match_id so re-runs don't re-resolve.
+     date) -- stored on soccer_matches.thestatsapi_match_id so re-runs don't re-resolve.
   3. For each match in scope: call matches/{id}/player-stats AND matches/{id}/lineups.
      Players not already in soccer_players are added on the fly (a historical match
      can reference a player who has since transferred off the current roster).
@@ -38,7 +38,7 @@ from core.sports_db import (
     add_player,
     add_player_match_stats,
     add_player_match_lineup,
-    set_match_api_id,
+    set_thestatsapi_match_id,
 )
 from core.thestatsapi import Client, TheStatsAPIError
 from import_club_squads import resolve_competition, resolve_season_id, match_teams_to_api, load_db_teams
@@ -63,11 +63,11 @@ def parse_args():
 
 
 def load_db_matches(league, season, team_name=None):
-    """Return rows for league/season matches, including any already-resolved api_match_id."""
+    """Return rows for league/season matches, including any already-resolved thestatsapi_match_id."""
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    sql = """SELECT m.match_id, m.home_team_id, m.away_team_id, m.match_date, m.api_match_id,
+    sql = """SELECT m.match_id, m.home_team_id, m.away_team_id, m.match_date, m.thestatsapi_match_id,
                     m.home_score, m.away_score,
                     ht.name AS home_name, at.name AS away_name
              FROM soccer_matches m
@@ -86,7 +86,7 @@ def load_db_matches(league, season, team_name=None):
 
 
 def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, conn, dry_run=False):
-    """Fill in api_match_id for any db_matches row missing it, by (home team, away
+    """Fill in thestatsapi_match_id for any db_matches row missing it, by (home team, away
     team) against the API's match list -- NOT date. A mismatch was found between our
     soccer_matches dates and TheStatsAPI's utc_date for ~13% of Serie A 2025 matches
     (e.g. Cagliari-Como is 2026-03-07 in the API, 2026-03-08 in our DB); checked
@@ -99,13 +99,13 @@ def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, c
     with a date anyway. Returns (n_resolved, n_unresolved).
 
     dry_run=True still computes and returns the resolution (for an honest preview) but
-    does NOT call set_match_api_id -- this used to write regardless of --dry-run, a
+    does NOT call set_thestatsapi_match_id -- this used to write regardless of --dry-run, a
     real bug caught when a season_id resolution mistake (see resolve_season_id) got
     persisted by a "dry" run before the mistake was noticed. Returns
-    (n_resolved, n_unresolved, resolution) -- resolution is {match_id: api_match_id}
+    (n_resolved, n_unresolved, resolution) -- resolution is {match_id: thestatsapi_match_id}
     for everything resolved THIS call (whether or not persisted), so a caller can
     preview the full downstream pipeline without a second API call or DB round trip."""
-    needing = [m for m in db_matches if not m["api_match_id"]]
+    needing = [m for m in db_matches if not m["thestatsapi_match_id"]]
     if not needing:
         return 0, 0, {}
 
@@ -114,7 +114,7 @@ def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, c
 
     if not dry_run:
         for match_id, api_id in resolution.items():
-            set_match_api_id(match_id, api_id, conn=conn)
+            set_thestatsapi_match_id(match_id, api_id, conn=conn)
 
     return len(resolution), len(needing) - len(resolution), resolution
 
@@ -122,7 +122,7 @@ def resolve_match_api_ids(client, comp_id, season_id, db_matches, team_api_id, c
 def match_db_matches_to_api_by_team_pairing(db_matches, team_api_id, api_matches):
     """Pure matching logic behind resolve_match_api_ids, split out for testing without
     a live client: given DB match rows, a {db_team_id: api_team_id} map, and an
-    already-fetched API match list, return {match_id: api_match_id} for every DB match
+    already-fetched API match list, return {match_id: thestatsapi_match_id} for every DB match
     whose (home, away) team pairing resolves to exactly one API match. A DB match
     whose teams don't both have a known api_team_id, or whose pairing isn't found in
     api_matches, is simply absent from the result (not an error)."""
@@ -142,13 +142,13 @@ def match_db_matches_to_api_by_team_pairing(db_matches, team_api_id, api_matches
     return result
 
 
-def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
+def import_match(client, match_row, thestatsapi_match_id, team_api_id_reverse, season,
                  skip_lineups, dry_run, conn):
     """Pull + store player-stats (always) and lineups (unless skipped) for one match.
     Returns (n_stats_rows, n_lineup_rows)."""
     home_id, away_id = match_row["home_team_id"], match_row["away_team_id"]
 
-    stats_rows = client.get_data(f"matches/{api_match_id}/player-stats") or []
+    stats_rows = client.get_data(f"matches/{thestatsapi_match_id}/player-stats") or []
 
     # Club xGA = the OPPOSING team's total xG in this match -- the API has no
     # expected-goals-against field (checked 2026-08-02, no such field anywhere in the
@@ -209,7 +209,7 @@ def import_match(client, match_row, api_match_id, team_api_id_reverse, season,
 
     n_lineups = 0
     if not skip_lineups:
-        lineup_data = client.get_data(f"matches/{api_match_id}/lineups")
+        lineup_data = client.get_data(f"matches/{thestatsapi_match_id}/lineups")
         if lineup_data:
             for side, team_id in (("home", home_id), ("away", away_id)):
                 side_data = lineup_data.get(side) or {}
@@ -260,19 +260,19 @@ def main():
             client, comp_id, season_id, db_matches, team_api_id, conn, dry_run=args.dry_run)
         print(f"Match-id mapping: {resolved} newly resolved, {unresolved} unresolved this run")
 
-        # Merge already-persisted api_match_id with this run's resolution in memory --
+        # Merge already-persisted thestatsapi_match_id with this run's resolution in memory --
         # works identically for a real run (both sources agree) and a dry run (nothing
         # was persisted, so this is the only place the new resolution is visible).
-        matches = [dict(m, api_match_id=m["api_match_id"] or new_resolution.get(m["match_id"]))
+        matches = [dict(m, thestatsapi_match_id=m["thestatsapi_match_id"] or new_resolution.get(m["match_id"]))
                    for m in db_matches]
-        matches = [m for m in matches if m["api_match_id"]]
+        matches = [m for m in matches if m["thestatsapi_match_id"]]
         if args.limit_matches:
             matches = matches[:args.limit_matches]
         print(f"Matches to process: {len(matches)}\n")
 
         total_stats = total_lineups = 0
         for i, m in enumerate(matches, 1):
-            n_stats, n_lineups = import_match(client, m, m["api_match_id"], team_api_id_reverse,
+            n_stats, n_lineups = import_match(client, m, m["thestatsapi_match_id"], team_api_id_reverse,
                                               args.season, args.skip_lineups, args.dry_run, conn)
             total_stats += n_stats
             total_lineups += n_lineups

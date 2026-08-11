@@ -50,7 +50,10 @@ def init_database():
             -- Kept LAST to match the migrated column order (see soccer_wc_matches note
             -- on this same pattern). FEATURE-011: TheStatsAPI's match id, resolved by
             -- team+date matching, so per-match player-stats/lineups calls can be made.
-            api_match_id        TEXT,
+            -- Named for the specific source (renamed from api_match_id 2026-08-10,
+            -- multi-league expansion) now that a second source (football-data.co.uk)
+            -- is also in play for these same tables.
+            thestatsapi_match_id TEXT,
             FOREIGN KEY (home_team_id) REFERENCES soccer_teams(team_id),
             FOREIGN KEY (away_team_id) REFERENCES soccer_teams(team_id)
         );
@@ -460,6 +463,7 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_market_odds_type   ON soccer_market_odds(line_type);
         CREATE INDEX IF NOT EXISTS idx_players_team          ON soccer_players(team_id);
         CREATE INDEX IF NOT EXISTS idx_player_stats_player    ON soccer_player_stats(player_id);
+        CREATE INDEX IF NOT EXISTS idx_player_stats_season    ON soccer_player_stats(season);
         CREATE INDEX IF NOT EXISTS idx_player_team_strength_team ON soccer_player_team_strength(team_id);
         CREATE INDEX IF NOT EXISTS idx_player_team_strength_league ON soccer_player_team_strength(league);
         CREATE INDEX IF NOT EXISTS idx_player_lineups_player  ON soccer_player_match_lineups(player_id);
@@ -567,8 +571,8 @@ def ensure_soccer_betting_odds_schema(conn=None):
 
 
 def ensure_player_stats_match_schema(conn=None):
-    """Add match_id/venue to soccer_player_stats and api_match_id to soccer_matches on
-    older databases (FEATURE-011's move from per-season to per-match player stats).
+    """Add match_id/venue to soccer_player_stats and thestatsapi_match_id to
+    soccer_matches on databases created before per-match player stats existed.
 
     Existing rows from the season-total prototype are left in place with match_id/venue
     NULL -- they predate this schema and are superseded by re-running the per-match
@@ -588,14 +592,21 @@ def ensure_player_stats_match_schema(conn=None):
 
         cur.execute("PRAGMA table_info(soccer_matches)")
         existing = {row[1] for row in cur.fetchall()}
-        if "api_match_id" not in existing:
-            cur.execute("ALTER TABLE soccer_matches ADD COLUMN api_match_id TEXT")
+        if "thestatsapi_match_id" not in existing:
+            if "api_match_id" in existing:
+                # 2026-08-10 rename (multi-league expansion) -- preserve already-
+                # populated values (e.g. Serie B's TheStatsAPI-sourced matches)
+                # instead of adding a second, empty column.
+                cur.execute("ALTER TABLE soccer_matches RENAME COLUMN api_match_id TO thestatsapi_match_id")
+            else:
+                cur.execute("ALTER TABLE soccer_matches ADD COLUMN thestatsapi_match_id TEXT")
 
         # Created here, not in the main executescript, because on a migrated (not
         # freshly-created) database the match_id column doesn't exist until the ALTER
         # TABLE above runs.
         cur.execute("CREATE INDEX IF NOT EXISTS idx_player_stats_match ON soccer_player_stats(match_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_api_match_id ON soccer_matches(api_match_id)")
+        cur.execute("DROP INDEX IF EXISTS idx_matches_api_match_id")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_thestatsapi_match_id ON soccer_matches(thestatsapi_match_id)")
 
         conn.commit()
     finally:
@@ -616,7 +627,14 @@ def get_soccer_team_id(team_name):
 
 
 def ensure_soccer_team(name, league, country=None):
-    """Insert a soccer team if it doesn't exist; return its team_id."""
+    """Insert a soccer team if it doesn't exist; return its team_id.
+
+    `name` alone is the unique key (not `name`+`league`) -- deliberate, so a
+    promoted team (e.g. Cremonese, Serie B -> Serie A) keeps the SAME team_id
+    across a division change, which cross-league player history (BUG-010) depends
+    on. Raises if `country` conflicts with an existing same-named team's country --
+    that's two different clubs sharing a name, not one club changing division, so
+    this refuses to silently merge them."""
     conn = sqlite3.connect(DATABASE_PATH)
     cur = conn.cursor()
     try:
@@ -627,8 +645,21 @@ def ensure_soccer_team(name, league, country=None):
         conn.commit()
         return cur.lastrowid
     except sqlite3.IntegrityError:
-        cur.execute("SELECT team_id FROM soccer_teams WHERE name = ?", (name,))
-        return cur.fetchone()[0]
+        cur.execute("SELECT team_id, country FROM soccer_teams WHERE name = ?", (name,))
+        existing_id, existing_country = cur.fetchone()
+        # Both sides must be known to raise -- if either is None there's nothing to
+        # compare, so this falls through and reuses the row (the old, pre-check
+        # behavior) rather than raising on incomplete information. Keeps any caller
+        # that doesn't pass country working unchanged; the tradeoff is a real
+        # cross-country collision on a None-country row would still silently merge.
+        if country is not None and existing_country is not None and country != existing_country:
+            raise ValueError(
+                f"ensure_soccer_team: {name!r} already exists as team_id={existing_id} "
+                f"with country={existing_country!r}, but this call passed country={country!r} "
+                f"-- looks like two different clubs sharing a name, not the same club "
+                f"changing division. Not silently merging; resolve the name collision explicitly."
+            )
+        return existing_id
     finally:
         conn.close()
 
@@ -1626,7 +1657,7 @@ def add_player_match_lineup(player_id, match_id, team_id, started, position=None
             conn.close()
 
 
-def set_match_api_id(match_id, api_match_id, conn=None):
+def set_thestatsapi_match_id(match_id, thestatsapi_match_id, conn=None):
     """Store TheStatsAPI's match id for one of our soccer_matches rows, resolved by
     team+date matching (see the club-league import scripts)."""
     owns_connection = conn is None
@@ -1634,8 +1665,8 @@ def set_match_api_id(match_id, api_match_id, conn=None):
         conn = sqlite3.connect(DATABASE_PATH)
     try:
         conn.execute(
-            "UPDATE soccer_matches SET api_match_id = ? WHERE match_id = ?",
-            (api_match_id, match_id)
+            "UPDATE soccer_matches SET thestatsapi_match_id = ? WHERE match_id = ?",
+            (thestatsapi_match_id, match_id)
         )
         conn.commit()
     finally:

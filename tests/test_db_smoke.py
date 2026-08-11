@@ -69,6 +69,32 @@ def test_ensure_soccer_team_is_idempotent(db_path):
     assert sports_db.get_soccer_team_id("Nonexistent") is None
 
 
+def test_ensure_soccer_team_reuses_row_across_a_same_country_division_change(db_path):
+    """The load-bearing case (BUG-010): a promoted/relegated team keeps the SAME
+    team_id when it reappears in a different league within the same country."""
+    serie_b_id = sports_db.ensure_soccer_team("Cremonese", "Serie B", country="Italy")
+    serie_a_id = sports_db.ensure_soccer_team("Cremonese", "Serie A", country="Italy")
+    assert serie_b_id == serie_a_id
+
+
+def test_ensure_soccer_team_raises_on_cross_country_name_collision(db_path):
+    """2026-08-10 (multi-league expansion): a genuine name collision between two
+    DIFFERENT clubs in two different countries must raise, not silently merge them
+    under one team_id."""
+    sports_db.ensure_soccer_team("Real Example", "La Liga", country="Spain")
+    with pytest.raises(ValueError):
+        sports_db.ensure_soccer_team("Real Example", "Ligue 1", country="France")
+
+
+def test_ensure_soccer_team_allows_collision_when_country_unknown_on_either_side(db_path):
+    """No country passed on either the existing row or this call -> nothing to
+    compare, so the pre-existing (name-only) behavior is preserved -- common for
+    legacy rows created without a country."""
+    first = sports_db.ensure_soccer_team("Legacy Team", "Serie A")
+    second = sports_db.ensure_soccer_team("Legacy Team", "Serie A")
+    assert first == second
+
+
 def test_get_soccer_matches_filters_by_status(db_path):
     home = sports_db.ensure_soccer_team("Roma", "Serie A")
     away = sports_db.ensure_soccer_team("Lazio", "Serie A")

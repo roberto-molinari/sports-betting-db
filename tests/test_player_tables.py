@@ -1,7 +1,7 @@
 """
 Tests for FEATURE-011's player-level tables and helpers in core.sports_db:
 soccer_players, soccer_player_stats (per-match), soccer_player_match_lineups,
-soccer_player_team_strength, and the api_match_id column on soccer_matches.
+soccer_player_team_strength, and the thestatsapi_match_id column on soccer_matches.
 """
 
 import sqlite3
@@ -31,18 +31,19 @@ def test_soccer_player_stats_has_per_match_columns(db_path, conn):
     assert {"match_id", "venue"} <= cols
 
 
-def test_soccer_matches_has_api_match_id_column(db_path, conn):
+def test_soccer_matches_has_thestatsapi_match_id_column(db_path, conn):
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(soccer_matches)")
     cols = {row[1] for row in cur.fetchall()}
-    assert "api_match_id" in cols
+    assert "thestatsapi_match_id" in cols
 
 
 def test_ensure_player_stats_match_schema_migrates_older_db(tmp_path):
     """Simulate a database that predates the per-match rework (no match_id/venue on
-    soccer_player_stats, no api_match_id on soccer_matches) and confirm the migration
-    adds them without erroring. This is the actual migration PATH, distinct from the
-    fresh-create path exercised by every other test via the db_path fixture."""
+    soccer_player_stats, no thestatsapi_match_id on soccer_matches) and confirm the
+    migration adds them without erroring. This is the actual migration PATH, distinct
+    from the fresh-create path exercised by every other test via the db_path
+    fixture."""
     path = tmp_path / "old_shaped.db"
     conn = sqlite3.connect(path)
     conn.executescript("""
@@ -63,9 +64,44 @@ def test_ensure_player_stats_match_schema_migrates_older_db(tmp_path):
     cur.execute("PRAGMA table_info(soccer_player_stats)")
     assert {"match_id", "venue"} <= {row[1] for row in cur.fetchall()}
     cur.execute("PRAGMA table_info(soccer_matches)")
-    assert "api_match_id" in {row[1] for row in cur.fetchall()}
+    assert "thestatsapi_match_id" in {row[1] for row in cur.fetchall()}
     # Re-running must not error (idempotent).
     sports_db.ensure_player_stats_match_schema(conn)
+    conn.close()
+
+
+def test_ensure_player_stats_match_schema_renames_existing_api_match_id_column(tmp_path):
+    """2026-08-10 rename (multi-league expansion): a database created before the
+    rename has a populated `api_match_id` column (not `thestatsapi_match_id`) -- the
+    migration must RENAME it in place, preserving already-stored values (e.g. Serie
+    B's TheStatsAPI-sourced matches), not add a second, empty column alongside it."""
+    path = tmp_path / "pre_rename.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE soccer_matches (
+            match_id INTEGER PRIMARY KEY, league TEXT, season INTEGER,
+            home_team_id INTEGER, away_team_id INTEGER, match_date TIMESTAMP,
+            api_match_id TEXT
+        );
+        CREATE TABLE soccer_player_stats (
+            stat_id INTEGER PRIMARY KEY, player_id INTEGER, season INTEGER,
+            minutes_played INTEGER, match_id INTEGER, venue TEXT
+        );
+        INSERT INTO soccer_matches (match_id, league, season, home_team_id, away_team_id, match_date, api_match_id)
+        VALUES (1, 'Serie B', 2024, 10, 20, '2024-09-14T13:00:00Z', 'mt_361107246');
+    """)
+    conn.commit()
+
+    sports_db.ensure_player_stats_match_schema(conn)
+
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(soccer_matches)")
+    cols = {row[1] for row in cur.fetchall()}
+    assert "thestatsapi_match_id" in cols
+    assert "api_match_id" not in cols
+
+    cur.execute("SELECT thestatsapi_match_id FROM soccer_matches WHERE match_id = 1")
+    assert cur.fetchone()[0] == "mt_361107246"
     conn.close()
 
 
@@ -220,15 +256,15 @@ def test_add_player_match_lineup_round_trip_and_idempotent(db_path, conn):
     assert row[2] == "4-2-3-1"     # preserved
 
 
-# ── set_match_api_id ─────────────────────────────────────────────────────────────
+# ── set_thestatsapi_match_id ─────────────────────────────────────────────────────
 
-def test_set_match_api_id_round_trip(db_path, conn):
+def test_set_thestatsapi_match_id_round_trip(db_path, conn):
     home = sports_db.ensure_soccer_team("Verona", "Serie A")
     away = sports_db.ensure_soccer_team("Parma", "Serie A")
     match_id = sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-10-01")
-    sports_db.set_match_api_id(match_id, "mt_12345", conn=conn)
+    sports_db.set_thestatsapi_match_id(match_id, "mt_12345", conn=conn)
     cur = conn.cursor()
-    cur.execute("SELECT api_match_id FROM soccer_matches WHERE match_id = ?", (match_id,))
+    cur.execute("SELECT thestatsapi_match_id FROM soccer_matches WHERE match_id = ?", (match_id,))
     assert cur.fetchone()[0] == "mt_12345"
 
 

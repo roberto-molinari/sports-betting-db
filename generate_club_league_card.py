@@ -32,7 +32,7 @@ from datetime import datetime, timezone, timedelta
 from itertools import groupby
 
 from core.sports_db import DATABASE_PATH
-from core.poisson_model import analyse_match_wc, compute_ev, american_to_implied_prob
+from core.poisson_model import analyse_match_wc, american_to_implied_prob
 from core.pick_guardrails import guardrail_reasons
 import compute_club_player_strength as strength
 

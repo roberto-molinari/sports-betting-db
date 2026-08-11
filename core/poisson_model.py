@@ -63,6 +63,13 @@ TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
 LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
 LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
 
+# Fallback league-wide goals/game when there's no real data to average (a brand new
+# league/season with no completed matches yet) or the available window's average is
+# degenerate (see get_league_averages' zero-guard, 2026-08-10) -- a typical top-flight
+# scoreline split, not derived from any specific league's data.
+DEFAULT_LEAGUE_AVG_GOALS_HOME = 1.3
+DEFAULT_LEAGUE_AVG_GOALS_AWAY = 1.1
+
 # ── World Cup constants ──────────────────────────────────────────────────────
 # Baseline goals per team per international match.  Team strength lambdas are
 # normalized around this, and it scales the attack/defense combination in
@@ -160,7 +167,7 @@ def get_league_averages(conn, league: str = "Serie A", seasons: list = None,
     rows = cur.fetchall()
 
     if not rows:
-        return {"avg_home": 1.3, "avg_away": 1.1}
+        return {"avg_home": DEFAULT_LEAGUE_AVG_GOALS_HOME, "avg_away": DEFAULT_LEAGUE_AVG_GOALS_AWAY}
 
     total_w = total_h = total_a = 0.0
     for k, (h, a) in enumerate(rows):
@@ -169,7 +176,18 @@ def get_league_averages(conn, league: str = "Serie A", seasons: list = None,
         total_h += w * h
         total_a += w * a
 
-    return {"avg_home": total_h / total_w, "avg_away": total_a / total_w}
+    avg_home, avg_away = total_h / total_w, total_a / total_w
+    if avg_home <= 0 or avg_away <= 0:
+        # A thin window (early in a league's first-ever tracked season, before
+        # `window` matches of history exist) can average to exactly 0.0 on one side
+        # by chance -- e.g. this function returning avg_away=0.0 after a single 1-0
+        # prior match (found 2026-08-10 backfilling Premier League 2024, the first
+        # match_date with any history at all). Callers use avg_home/avg_away as
+        # separate normalization baselines and divide by both, so a zero here is a
+        # ZeroDivisionError, not just a noisy estimate -- fall back to the same
+        # default used when there's no data at all rather than trust it.
+        return {"avg_home": DEFAULT_LEAGUE_AVG_GOALS_HOME, "avg_away": DEFAULT_LEAGUE_AVG_GOALS_AWAY}
+    return {"avg_home": avg_home, "avg_away": avg_away}
 
 
 def get_team_ratings(conn, team_id: int, before_date: str,

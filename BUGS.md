@@ -9,6 +9,180 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## FEATURE-014 — Multi-league expansion: Premier League, Bundesliga, La Liga, Ligue 1 — **SHIPPED 2026-08-10**
+
+- **Type:** enhancement (major) · **Status:** SHIPPED 2026-08-10. Logged/built same
+  session — the "next big item" after FEATURE-011/BUG-009/BUG-011, since sample-size
+  breadth (only Serie A had real data) was repeatedly the limiting factor behind
+  several open questions above (e.g. BUG-009's 2-season ROI signal too noisy to trust
+  either way).
+
+**What shipped.** All 4 leagues built together (not staged), on `core/leagues.py` — a
+new central registry (10 leagues incl. feeder divisions Championship/2. Bundesliga/
+LaLiga 2/Ligue 2, needed for BUG-010's promotion/call-up cross-league continuity)
+replacing scattered per-script constants. Teams/matches for the 4 new leagues come
+from TheStatsAPI (`import_league_matches.py`, generalized+renamed from
+`import_lower_division_matches.py`) — Serie A stays on football-data.org for now, see
+fast-follow below. Odds come from the same two sources Serie A already used
+(football-data.co.uk for historical, The Odds API for live), via
+`import_league_betting_odds.py`/`import_league_market_odds.py` (generalized+renamed
+from the `import_serie_a_*` scripts) plus a new `core/team_name_maps.py` (one
+football-data.co.uk-name -> canonical-name map per league, ~76 teams). All three
+ingestion paths are conflict-safe (compare fetched vs. stored, log real differences,
+require `--allow-overwrite` to apply — never silent overwrite). Also: renamed
+`api_match_id` -> `thestatsapi_match_id` (`soccer_matches` column, now that a second
+source is in play for the same tables); added `idx_player_stats_season` (missing
+index directly on BUG-011's hot path, found while scale-checking this expansion);
+fixed `ensure_soccer_team`'s cross-country name-collision gap (the `soccer_teams.name`
+global-uniqueness that BUG-010 depends on was never checked against a DIFFERENT
+country's same-named club — newly plausible going from 1 country to 5). Full design
+discussion/decisions: see the approved plan this was built from (referenced in
+session; not persisted as a repo file). Data backfilled: teams+matches+squads+player-
+stats for all 4 new top-flight leagues plus their feeder divisions, 2024+2025 seasons
+(~2,860 matches, ~1,860 with odds); `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT` given
+a `1.0` entry for each new league (peer top-5 leagues, matching Serie A's own default
+— **an assumption, not empirically derived** like Serie B's real `0.663`; flagged for
+later validation, not proven-correct).
+
+**Two real bugs found and fixed while validating (not present before this session,
+both only exposed by having a genuinely NEW league's first tracked season):**
+1. `core.poisson_model.get_league_averages()` — a thin match-history window early in
+   a brand-new league's first season can average to exactly `0.0` goals on one side by
+   chance (hit for real backfilling Premier League 2024: the 2nd distinct kickoff time
+   processed had exactly one prior completed match, 1-0, making `avg_away=0.0`).
+   Downstream code divides by both `avg_home` and `avg_away` as separate baselines, so
+   this was a `ZeroDivisionError`, not just a noisy estimate — Serie A never hit this
+   because it always has 100+ matches of history (the function's own window size) by
+   the time any backfill runs. Fixed: fall back to the same default used for a fully
+   empty window (`{"avg_home": 1.3, "avg_away": 1.1}`) whenever the computed average is
+   `<= 0` on either side, instead of trusting a degenerate small sample. New regression
+   test (`test_get_league_averages_falls_back_when_window_averages_to_exact_zero`);
+   one pre-existing test's synthetic fixture happened to also hit this exact edge case
+   (all 3 of its matches had `away_score=0`) and needed its scores adjusted to keep
+   testing what it actually meant to test (decay weighting, not the zero-guard).
+2. `model_snapshot.py`'s `compression_bucket_table()` and pooled-bias section both
+   called `compare_model_vs_market_odds.fetch_pairs()` without the new `league`
+   positional argument — a call site missed when that function was generalized (this
+   session) from a hardcoded-Serie-A signature to `--league`-driven. Caught immediately
+   (`TypeError` on the first new-league snapshot run) since every league now exercises
+   this path; fixed by threading `league` through both call sites. No behavior change
+   for Serie A (verified via a regression snapshot run before/after).
+3. `model_snapshot.py` named its output file `{timestamp}_{method}.txt` -- no league
+   in the filename, since every prior run had always been Serie A. Looping over the 4
+   new leagues (same method, same second) produced 4 identical filenames; each
+   overwrote the last, silently destroying 3 of the 4 result files on disk (only
+   Ligue 1's survived -- the console output was still correct, just not what got
+   persisted). Found while generating the table below for a second, clean pass across
+   all 5 leagues. Fixed: filename is now `{timestamp}_{league}_{method}.txt`.
+
+**Validation results (`poisson_v4`, both seasons, vs. Betfair Exchange closing /
+Bet365) — full snapshots in `model_snapshots/20260810_193101_{league}_poisson_v4.txt`
+(one file per league; regenerated cleanly after bug 3 above was found+fixed):**
+
+| League | Brier (2024/2025) | Bias home/away 2024 | Bias home/away 2025 | ROI EV0/5/10% 2024 | ROI EV0/5/10% 2025 |
+|---|---|---|---|---|---|
+| Serie A | 0.591 / 0.613 | -0.004 / +0.012 | -0.012 / +0.017 | -11.0/-16.4/-19.1% | -5.3/-4.4/-7.3% |
+| Premier League | 0.596 / 0.634 | -0.024 / +0.025 | -0.011 / +0.011 | +8.2/+13.0/+14.4% | -6.3/-6.3/-5.4% |
+| Bundesliga | 0.661 / 0.594 | -0.003 / +0.007 | -0.012 / +0.018 | -9.7/-12.9/-12.1% | -22.4/-30.3/-37.4% |
+| La Liga | 0.625 / 0.589 | +0.012 / -0.001 | -0.000 / +0.019 | -12.4/-13.1/-18.4% | -10.3/-15.1/-13.7% |
+| Ligue 1 | 0.620 / 0.602 | -0.010 / +0.036 | +0.016 / -0.005 | +3.7/+1.3/+3.7% | -16.1/-12.2/-13.9% |
+
+Serie A row included for reference (its own fresh run, same batch, same shipped code
+-- confirms nothing regressed for the original league while generalizing). Brier
+scores all comfortably beat the ~0.667 naive baseline and sit in the same range across
+all 5 leagues — no sign of a league-specific data problem (a bad team-name mapping or
+a missing cross-league adjustment would show up as an outlier here, and none of the 4
+new leagues does, relative to Serie A's own baseline). Bias is mostly inside or near
+the documented +/-0.01-0.02 target, Ligue 1 2024's away-side +0.036 the one clear
+outlier worth a second look once more seasons exist. **ROI is negative at most
+thresholds for most leagues/seasons, Serie A included** (Bundesliga and La Liga
+worst) — this matches BUG-010's already-documented, already-
+open finding that `poisson_v4` has negative ROI at every threshold despite clearing
+the bias bar, **not a new problem introduced by this expansion**. Net read: the
+pipeline generalized correctly (no new distinct failure mode per league), and the 4
+new leagues inherit the exact same known, already-tracked model weakness Serie A has
+(BUG-010) rather than surfacing a fresh one.
+
+**Fast-follow, explicitly tracked, not yet started:** migrate Serie A onto the same
+TheStatsAPI-sourced ingestion pipeline as the 4 new leagues (`import_league_matches.py`
+instead of `update_serie_a_results.py`), so all 5 leagues share one data source for
+teams/matches instead of Serie A being the odd one out on football-data.org. Requires
+a one-time reconciliation: match Serie A's existing `soccer_matches` rows (no
+`thestatsapi_match_id` today) against TheStatsAPI's own matches for the same league/
+season by date+team name, stamp the id on, validate via dry-run diff before committing
+anything, then retire `update_serie_a_results.py`. Deferred out of this session's scope
+specifically to avoid risking already-in-production Serie A data on the same pass as
+new-league buildout — user's explicit call.
+
+---
+
+## FEATURE-015 — `model_snapshot.py` only reports the 1X2 market; wire in totals (over/under)
+
+- **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-08-10 while
+  generating FEATURE-014's 5-league validation snapshots — user asked whether those
+  bias/ROI numbers covered every market the model supports; they didn't, and the gap
+  wasn't previously written down anywhere. **User's call: fine to leave until after
+  this session's multi-league-expansion code is committed/reviewed (2026-08-11),
+  build this after.**
+
+**Problem.** `model_snapshot.py`'s three sections are all 1X2-only today:
+- **Brier score** — scored from `p_home`/`p_draw`/`p_away` vs. the actual result only.
+- **Bias** (compression-bucket table + pooled signed bias vs. the sharp book) —
+  compares against `soccer_market_odds`, which structurally has no O/U columns at all
+  (`home_odds`/`draw_odds`/`away_odds`/`p_*_fair` only) — no sharp-book totals odds are
+  ingested anywhere in this codebase, so there is currently no way to bias-check the
+  totals market against a sharp line, not just a wiring gap.
+- **ROI** — calls `backtest_from_predictions.run()` (the 1X2 function) only, never
+  `run_totals()` (the O/U ROI function added in the immediately-prior commit,
+  `3270493 Add over/under (totals) market backtesting`) — that capability already
+  exists and already works (spot-checked live: `--league "Premier League" --season
+  2024 --method poisson_v4 --market totals --ev-threshold 0` -> +0.5% ROI, 345 bets,
+  n=380 graded), it's just not part of the automated snapshot report.
+
+The model already generates and stores `p_over`/`p_under` for every prediction
+(`backfill_player_blend_predictions.py`), so the ROI half of this is close — it needs
+`model_snapshot.py` to also call `run_totals()` per season/EV-threshold and print it
+as its own section (kept separate from the 1X2 ROI number, matching `run_totals()`'s
+own docstring: "never pooled together, since they're different markets"). The Brier
+and bias halves need real design thought first: Brier is a small addition (score
+`p_over`/`p_under` against actual total-goals-over/under the line, same shape as the
+1X2 version); bias has no data source to compare against yet at all, so scope needs to
+cover whether to start ingesting a sharp-book O/U odds source before a totals bias
+check is even possible.
+
+---
+
+## FEATURE-016 — `generate_club_league_card.py` doesn't persist its picks anywhere, so they can't be scored later
+
+- **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-08-10 —
+  noticed while answering a question about what `generate_club_league_card.py` writes
+  to the database (answer: nothing at all, confirmed by reading the script).
+
+**Problem.** `generate_club_league_card.py` reads matches/odds, computes picks
+(`compute()` + `analyse_match_wc()` + guardrails), and prints the card straight to
+stdout — no `INSERT`, no `conn.commit()`, nothing. Once the terminal output is gone,
+there's no record of what the model actually picked for a given matchday, so there's
+no way to later check whether those specific picks won or lost.
+
+**Contrast.** `generate_wc_card.py` already solves exactly this for the World Cup
+side: its own docstring says it "stores the pick in `soccer_wc_picks` for later
+scoring" (and has a `--no-store`-style flag to print without storing, implying
+storing is the default). `soccer_wc_picks` (`core/sports_db.py`) is a small table —
+`match_id`, `generated_at`, `side`, `odds`, `model_prob`, `ev`, `stars`, `result`,
+`selection_mode` — that this club-league side has no equivalent of. This is also the
+literal problem FEATURE-012 (pick/probability lineage) is scoped to help with
+generally, so this could plausibly be built together with, or as groundwork for,
+FEATURE-012 rather than as a one-off table.
+
+**Not urgent, but not new either** — flagged now, but per the user: the project
+already has a running "add this later" list, this file's own PROPOSED/not-started
+entries (FEATURE-012, FEATURE-013, FEATURE-015 above, and this one), plus
+`docs/STATUS-08-08-2026.md`'s Feature Backlog section (more markets, line shopping,
+Kelly staking) which explicitly defers to this file as the canonical source. This is
+another item for that same list, not something scoped to build immediately.
+
+---
+
 ## BUG-011 — `compute_club_player_strength.compute()` redundantly recomputes last-season aggregates on every matchday during a backfill, making full-season backfills slow — **FIXED 2026-08-08**
 
 - **Type:** performance (no correctness impact) · **Severity:** low (cosmetic/rare —

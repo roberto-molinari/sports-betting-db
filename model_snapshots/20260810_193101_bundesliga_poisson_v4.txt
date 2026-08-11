@@ -1,0 +1,104 @@
+# Model snapshot -- poisson_v4 / Bundesliga
+Generated: 2026-08-10T23:31:01.768835+00:00
+Seasons: [2024, 2025]
+Note: Full 5-league success-metrics pass (2026-08-10): current shipped poisson_v4, post multi-league-expansion fixes (get_league_averages zero-window fallback, model_snapshot fetch_pairs league-arg, snapshot filename now includes league)
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON = 900.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663, 'Premier League': 1.0, 'Bundesliga': 1.0, 'La Liga': 1.0, 'Ligue 1': 1.0}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+## Brier score (all games, not just bets -- lower is better; naive baseline ~0.667)
+  season 2024: Brier = 0.6614  (n=306)
+  season 2025: Brier = 0.5942  (n=306)
+  pooled: Brier = 0.6278  (n=612)
+
+## Compression-bucket table (model p_home - Betfair Exchange closing p_home, by market's own p_home)
+  season 2024:
+     0.00-0.15: +0.045  (n=17)
+     0.15-0.25: +0.097  (n=25)
+     0.25-0.35: +0.050  (n=51)
+     0.35-0.45: -0.008  (n=65)
+     0.45-0.55: +0.000  (n=55)
+     0.55-1.01: -0.064  (n=93)
+  season 2025:
+     0.00-0.15: +0.039  (n=10)
+     0.15-0.25: +0.036  (n=26)
+     0.25-0.35: +0.017  (n=44)
+     0.35-0.45: +0.009  (n=77)
+     0.45-0.55: -0.042  (n=56)
+     0.55-1.01: -0.050  (n=75)
+
+## Pooled signed bias vs Betfair Exchange closing (home/away split, target +/-0.01-0.02)
+  season 2024: home=-0.0026  away=+0.0071  draw=-0.0050  (n=306)
+  season 2025: home=-0.0116  away=+0.0176  draw=-0.0060  (n=288)
+
+## ROI vs Bet365 (ROI success criterion -- must be positive at EV>0/5/10%)
+
+poisson_v4 | Bundesliga season 2024 | vs Bet365 | EV threshold +0.0% | 306 graded matches
+  Bets: 372  Wins: 112  Win rate: 30.1%
+  Total staked: $372.00  Profit: $-35.91  ROI: -9.7%
+
+  By side:
+     home  n=127  wins=44   profit=$  -39.44  ROI=-31.1%
+     draw  n=118  wins=27   profit=$   -0.51  ROI=-0.4%
+     away  n=127  wins=41   profit=$   +4.04  ROI=+3.2%
+
+poisson_v4 | Bundesliga season 2024 | vs Bet365 | EV threshold +5.0% | 306 graded matches
+  Bets: 318  Wins: 91  Win rate: 28.6%
+  Total staked: $318.00  Profit: $-41.12  ROI: -12.9%
+
+  By side:
+     home  n=109  wins=36   profit=$  -33.54  ROI=-30.8%
+     draw  n=90   wins=19   profit=$   -3.24  ROI=-3.6%
+     away  n=119  wins=36   profit=$   -4.34  ROI=-3.6%
+
+poisson_v4 | Bundesliga season 2024 | vs Bet365 | EV threshold +10.0% | 306 graded matches
+  Bets: 268  Wins: 75  Win rate: 28.0%
+  Total staked: $268.00  Profit: $-32.50  ROI: -12.1%
+
+  By side:
+     home  n=91   wins=30   profit=$  -24.26  ROI=-26.7%
+     draw  n=67   wins=14   profit=$   -0.97  ROI=-1.4%
+     away  n=110  wins=31   profit=$   -7.27  ROI=-6.6%
+
+poisson_v4 | Bundesliga season 2025 | vs Bet365 | EV threshold +0.0% | 306 graded matches
+  Bets: 340  Wins: 88  Win rate: 25.9%
+  Total staked: $340.00  Profit: $-76.25  ROI: -22.4%
+
+  By side:
+     home  n=111  wins=38   profit=$  -28.89  ROI=-26.0%
+     draw  n=88   wins=15   profit=$   -8.36  ROI=-9.5%
+     away  n=141  wins=35   profit=$  -39.00  ROI=-27.7%
+
+poisson_v4 | Bundesliga season 2025 | vs Bet365 | EV threshold +5.0% | 306 graded matches
+  Bets: 257  Wins: 56  Win rate: 21.8%
+  Total staked: $257.00  Profit: $-77.97  ROI: -30.3%
+
+  By side:
+     home  n=80   wins=23   profit=$  -30.25  ROI=-37.8%
+     draw  n=58   wins=11   profit=$   +5.71  ROI=+9.8%
+     away  n=119  wins=22   profit=$  -53.43  ROI=-44.9%
+
+poisson_v4 | Bundesliga season 2025 | vs Bet365 | EV threshold +10.0% | 306 graded matches
+  Bets: 207  Wins: 39  Win rate: 18.8%
+  Total staked: $207.00  Profit: $-77.34  ROI: -37.4%
+
+  By side:
+     home  n=65   wins=17   profit=$  -26.57  ROI=-40.9%
+     draw  n=38   wins=5    profit=$   -2.42  ROI=-6.4%
+     away  n=104  wins=17   profit=$  -48.35  ROI=-46.5%
