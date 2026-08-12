@@ -86,7 +86,7 @@ KNOB_NAMES = [
     ("compute_club_player_strength", "PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE"),
     ("compute_club_player_strength", "PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING"),
     ("compute_club_player_strength", "PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE"),
-    ("compute_club_player_strength", "PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON"),
+    ("compute_club_player_strength", "PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW"),
     ("compute_club_player_strength", "PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT"),
     ("compute_club_player_strength", "PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE"),
 ]

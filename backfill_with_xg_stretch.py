@@ -4,12 +4,16 @@ factor, to test values other than the shipped default. See BUGS.md, BUG-009,
 2026-08-07 addendum for the investigation this supported.
 
 2026-08-07: factor=1.3 (this script's own finding) is now the REAL shipped default
-(TEAM_RATING_XG_SPREAD_STRETCH, compute_club_player_strength.py) -- for that value,
-prefer backfill_player_blend_predictions.py (the production backfill script, which
-now applies it automatically). This script still monkeypatches get_team_xg_ratings
-for the duration of the run (compute_club_player_strength.py itself is untouched by
-running it) -- kept around specifically for sweeping OTHER factor values (or
---team-xg-weight combinations) that the production script doesn't expose as a flag.
+(TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE, compute_club_player_strength.py --
+split into separate attack/defense constants 2026-08-12, both still 1.3) -- for
+that value, prefer backfill_player_blend_predictions.py (the production backfill
+script, which now applies it automatically, and natively supports sweeping attack
+and defense separately via --xg-stretch-attack/--xg-stretch-defense/
+--player-stretch-attack/--player-stretch-defense -- this standalone tool's
+single-shared-factor monkeypatch is now largely superseded for that use case).
+This script still monkeypatches get_team_xg_ratings for the duration of the run
+(compute_club_player_strength.py itself is untouched by running it) -- kept
+around for sweeps the production script's real flags don't cover.
 Mirrors backfill_player_blend_predictions.py's loop closely (point-in-time correct,
 one compute() call per unique match_date).
 
@@ -141,11 +145,11 @@ def main():
         cache = {}  # BUG-011: memoizes last-season aggregates across this season's matchdays
         for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
             date_rows = list(date_rows)
-            squad_ids_by_team = {tid: strength.squad_as_of_date(conn, tid, season, match_date)
+            roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, season, match_date)
                                  for tid in team_ids}
             results = strength.compute(conn, team_ids, args.league, season, match_date,
                                        team_xg_v_goals_blend=args.team_xg_v_goals_blend,
-                                       current_squad_ids_by_team=squad_ids_by_team, cache=cache)
+                                       current_roster_ids_by_team=roster_ids_by_team, cache=cache)
 
             for row in date_rows:
                 home = results[row["home_team_id"]]

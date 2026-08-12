@@ -1,0 +1,269 @@
+# Model metrics report -- ALL-UP -- poisson_v4
+Generated: 2026-08-12T00:29:10.093552+00:00
+Leagues (5): Bundesliga, La Liga, Ligue 1, Premier League, Serie A
+Seasons (2): [2024, 2025]
+Note: BUG-010 fix validation: season-blind trust score (non-overlapping windows), recalibrated coverage threshold (900->300), plus the 2023 backfill for all 4 new leagues. Compare against FEATURE-014/017's earlier numbers.
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW = 300.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663, 'Premier League': 1.0, 'Bundesliga': 1.0, 'La Liga': 1.0, 'Ligue 1': 1.0}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+Brier and ROI in the ALL-UP section below are pooled across BOTH markets into one
+number each (legitimate for these two -- see pooled_brier_across_markets()/
+pooled_roi_across_markets()'s docstrings for why). Everywhere else in this report,
+1X2 and totals are kept as separate numbers, never blended -- different markets,
+matching backtest_from_predictions.run_totals()'s own documented convention.
+
+==============================================================================
+ALL-UP  (every league x every season x every market)
+==============================================================================
+  Brier: 0.5487  (n=7066, 1X2 + totals pooled)
+  Bias vs Betfair Exchange: home=-0.0060  away=+0.0140  draw=-0.0080  (n=3423, 1X2 only -- totals has no sharp-book data, FEATURE-015)
+  ROI @ EV>0%: -7.5%  (1X2 + totals pooled; bets=6844, staked=$6844.00, profit=$-516.24)
+  ROI @ EV>5%: -8.2%  (1X2 + totals pooled; bets=5394, staked=$5394.00, profit=$-444.06)
+  ROI @ EV>10%: -6.7%  (1X2 + totals pooled; bets=4205, staked=$4205.00, profit=$-281.23)
+
+==============================================================================
+BY MARKET  (pooled across every league)
+==============================================================================
+
+-- 1X2, across seasons --
+  Brier: 0.6016  (n=3533)
+  Bias vs Betfair Exchange: home=-0.0060  away=+0.0140  draw=-0.0080  (n=3423)
+  ROI @ EV>0%: -9.4%  (bets=4162, staked=$4162.00, profit=$-391.73)
+  ROI @ EV>5%: -9.8%  (bets=3444, staked=$3444.00, profit=$-338.15)
+  ROI @ EV>10%: -7.8%  (bets=2859, staked=$2859.00, profit=$-223.24)
+
+-- 1X2, season 2024 --
+  Brier: 0.5964  (n=1752)
+  Bias vs Betfair Exchange: home=-0.0110  away=+0.0188  draw=-0.0078  (n=1752)
+  ROI @ EV>0%: -8.3%  (bets=2070, staked=$2070.00, profit=$-172.46)
+  ROI @ EV>5%: -8.3%  (bets=1710, staked=$1710.00, profit=$-142.21)
+  ROI @ EV>10%: -5.8%  (bets=1414, staked=$1414.00, profit=$-81.57)
+
+-- 1X2, season 2025 --
+  Brier: 0.6068  (n=1781)
+  Bias vs Betfair Exchange: home=-0.0008  away=+0.0090  draw=-0.0083  (n=1671)
+  ROI @ EV>0%: -10.5%  (bets=2092, staked=$2092.00, profit=$-219.27)
+  ROI @ EV>5%: -11.3%  (bets=1734, staked=$1734.00, profit=$-195.94)
+  ROI @ EV>10%: -9.8%  (bets=1445, staked=$1445.00, profit=$-141.67)
+
+-- TOTALS/over-under, across seasons --
+  Brier: 0.4957  (n=3533)
+  Bias:  not available (no sharp-book O/U data ingested -- FEATURE-015)
+  ROI @ EV>0%: -4.6%  (bets=2682, staked=$2682.00, profit=$-124.51)
+  ROI @ EV>5%: -5.4%  (bets=1950, staked=$1950.00, profit=$-105.91)
+  ROI @ EV>10%: -4.3%  (bets=1346, staked=$1346.00, profit=$-57.99)
+
+-- TOTALS/over-under, season 2024 --
+  Brier: 0.4912  (n=1752)
+  Bias:  not available (no sharp-book O/U data ingested -- FEATURE-015)
+  ROI @ EV>0%: -4.3%  (bets=1359, staked=$1359.00, profit=$-58.11)
+  ROI @ EV>5%: -6.2%  (bets=1002, staked=$1002.00, profit=$-61.95)
+  ROI @ EV>10%: -6.3%  (bets=708, staked=$708.00, profit=$-44.58)
+
+-- TOTALS/over-under, season 2025 --
+  Brier: 0.5001  (n=1781)
+  Bias:  not available (no sharp-book O/U data ingested -- FEATURE-015)
+  ROI @ EV>0%: -5.0%  (bets=1323, staked=$1323.00, profit=$-66.40)
+  ROI @ EV>5%: -4.6%  (bets=948, staked=$948.00, profit=$-43.96)
+  ROI @ EV>10%: -2.1%  (bets=638, staked=$638.00, profit=$-13.41)
+
+==============================================================================
+BY LEAGUE  (both markets; pooled across seasons, then by season)
+==============================================================================
+
+-- Bundesliga, across seasons --
+  1X2 Brier:      0.6012  (n=612)
+  Totals Brier:   0.4858  (n=612)
+  1X2 Bias vs Betfair Exchange: home=-0.0139  away=+0.0201  draw=-0.0062  (n=594)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -16.6%  (bets=678, staked=$678.00, profit=$-112.46)
+  1X2 ROI    @ EV>5%: -18.0%  (bets=548, staked=$548.00, profit=$-98.45)
+  1X2 ROI    @ EV>10%: -15.2%  (bets=440, staked=$440.00, profit=$-66.98)
+  Totals ROI @ EV>0%: -20.0%  (bets=453, staked=$453.00, profit=$-90.46)
+  Totals ROI @ EV>5%: -22.6%  (bets=339, staked=$339.00, profit=$-76.64)
+  Totals ROI @ EV>10%: -22.9%  (bets=241, staked=$241.00, profit=$-55.19)
+
+-- Bundesliga, season 2024 --
+  1X2 Brier:      0.6093  (n=306)
+  Totals Brier:   0.4769  (n=306)
+  1X2 Bias vs Betfair Exchange: home=-0.0164  away=+0.0199  draw=-0.0035  (n=306)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -9.9%  (bets=349, staked=$349.00, profit=$-34.59)
+  1X2 ROI    @ EV>5%: -7.0%  (bets=289, staked=$289.00, profit=$-20.10)
+  1X2 ROI    @ EV>10%: -2.6%  (bets=233, staked=$233.00, profit=$-6.04)
+  Totals ROI @ EV>0%: -10.4%  (bets=237, staked=$237.00, profit=$-24.60)
+  Totals ROI @ EV>5%: -10.4%  (bets=174, staked=$174.00, profit=$-18.03)
+  Totals ROI @ EV>10%: -13.1%  (bets=130, staked=$130.00, profit=$-17.01)
+
+-- Bundesliga, season 2025 --
+  1X2 Brier:      0.5931  (n=306)
+  Totals Brier:   0.4947  (n=306)
+  1X2 Bias vs Betfair Exchange: home=-0.0113  away=+0.0203  draw=-0.0091  (n=288)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -23.7%  (bets=329, staked=$329.00, profit=$-77.87)
+  1X2 ROI    @ EV>5%: -30.3%  (bets=259, staked=$259.00, profit=$-78.35)
+  1X2 ROI    @ EV>10%: -29.4%  (bets=207, staked=$207.00, profit=$-60.94)
+  Totals ROI @ EV>0%: -30.5%  (bets=216, staked=$216.00, profit=$-65.86)
+  Totals ROI @ EV>5%: -35.5%  (bets=165, staked=$165.00, profit=$-58.61)
+  Totals ROI @ EV>10%: -34.4%  (bets=111, staked=$111.00, profit=$-38.18)
+
+-- La Liga, across seasons --
+  1X2 Brier:      0.5899  (n=760)
+  Totals Brier:   0.4926  (n=760)
+  1X2 Bias vs Betfair Exchange: home=+0.0022  away=+0.0102  draw=-0.0124  (n=729)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -11.0%  (bets=877, staked=$877.00, profit=$-96.51)
+  1X2 ROI    @ EV>5%: -10.2%  (bets=706, staked=$706.00, profit=$-71.88)
+  1X2 ROI    @ EV>10%: -7.5%  (bets=593, staked=$593.00, profit=$-44.30)
+  Totals ROI @ EV>0%: -5.6%  (bets=574, staked=$574.00, profit=$-32.12)
+  Totals ROI @ EV>5%: -6.7%  (bets=418, staked=$418.00, profit=$-27.93)
+  Totals ROI @ EV>10%: +0.8%  (bets=284, staked=$284.00, profit=$+2.23)
+
+-- La Liga, season 2024 --
+  1X2 Brier:      0.5969  (n=380)
+  Totals Brier:   0.4873  (n=380)
+  1X2 Bias vs Betfair Exchange: home=-0.0051  away=+0.0132  draw=-0.0081  (n=380)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -10.9%  (bets=466, staked=$466.00, profit=$-50.80)
+  1X2 ROI    @ EV>5%: -11.8%  (bets=373, staked=$373.00, profit=$-44.05)
+  1X2 ROI    @ EV>10%: -8.2%  (bets=319, staked=$319.00, profit=$-26.25)
+  Totals ROI @ EV>0%: -1.8%  (bets=298, staked=$298.00, profit=$-5.38)
+  Totals ROI @ EV>5%: -6.7%  (bets=229, staked=$229.00, profit=$-15.40)
+  Totals ROI @ EV>10%: -0.0%  (bets=166, staked=$166.00, profit=$-0.02)
+
+-- La Liga, season 2025 --
+  1X2 Brier:      0.5828  (n=380)
+  Totals Brier:   0.4978  (n=380)
+  1X2 Bias vs Betfair Exchange: home=+0.0101  away=+0.0069  draw=-0.0170  (n=349)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -11.1%  (bets=411, staked=$411.00, profit=$-45.71)
+  1X2 ROI    @ EV>5%: -8.4%  (bets=333, staked=$333.00, profit=$-27.83)
+  1X2 ROI    @ EV>10%: -6.6%  (bets=274, staked=$274.00, profit=$-18.05)
+  Totals ROI @ EV>0%: -9.7%  (bets=276, staked=$276.00, profit=$-26.74)
+  Totals ROI @ EV>5%: -6.6%  (bets=189, staked=$189.00, profit=$-12.53)
+  Totals ROI @ EV>10%: +1.9%  (bets=118, staked=$118.00, profit=$+2.25)
+
+-- Ligue 1, across seasons --
+  1X2 Brier:      0.5972  (n=611)
+  Totals Brier:   0.4901  (n=611)
+  1X2 Bias vs Betfair Exchange: home=+0.0034  away=+0.0087  draw=-0.0122  (n=593)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -10.8%  (bets=695, staked=$695.00, profit=$-75.02)
+  1X2 ROI    @ EV>5%: -9.4%  (bets=577, staked=$577.00, profit=$-54.00)
+  1X2 ROI    @ EV>10%: -6.0%  (bets=478, staked=$478.00, profit=$-28.64)
+  Totals ROI @ EV>0%: -5.3%  (bets=460, staked=$460.00, profit=$-24.61)
+  Totals ROI @ EV>5%: -10.8%  (bets=312, staked=$312.00, profit=$-33.61)
+  Totals ROI @ EV>10%: -5.5%  (bets=209, staked=$209.00, profit=$-11.44)
+
+-- Ligue 1, season 2024 --
+  1X2 Brier:      0.5908  (n=306)
+  Totals Brier:   0.4873  (n=306)
+  1X2 Bias vs Betfair Exchange: home=-0.0116  away=+0.0229  draw=-0.0114  (n=306)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -8.5%  (bets=350, staked=$350.00, profit=$-29.78)
+  1X2 ROI    @ EV>5%: -4.1%  (bets=292, staked=$292.00, profit=$-12.09)
+  1X2 ROI    @ EV>10%: +0.8%  (bets=233, staked=$233.00, profit=$+1.97)
+  Totals ROI @ EV>0%: -3.7%  (bets=240, staked=$240.00, profit=$-8.84)
+  Totals ROI @ EV>5%: -9.7%  (bets=175, staked=$175.00, profit=$-17.04)
+  Totals ROI @ EV>10%: -3.7%  (bets=120, staked=$120.00, profit=$-4.43)
+
+-- Ligue 1, season 2025 --
+  1X2 Brier:      0.6036  (n=305)
+  Totals Brier:   0.4929  (n=305)
+  1X2 Bias vs Betfair Exchange: home=+0.0193  away=-0.0064  draw=-0.0130  (n=287)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -13.1%  (bets=345, staked=$345.00, profit=$-45.24)
+  1X2 ROI    @ EV>5%: -14.7%  (bets=285, staked=$285.00, profit=$-41.91)
+  1X2 ROI    @ EV>10%: -12.5%  (bets=245, staked=$245.00, profit=$-30.61)
+  Totals ROI @ EV>0%: -7.2%  (bets=220, staked=$220.00, profit=$-15.77)
+  Totals ROI @ EV>5%: -12.1%  (bets=137, staked=$137.00, profit=$-16.57)
+  Totals ROI @ EV>10%: -7.9%  (bets=89, staked=$89.00, profit=$-7.01)
+
+-- Premier League, across seasons --
+  1X2 Brier:      0.6106  (n=760)
+  Totals Brier:   0.5067  (n=760)
+  1X2 Bias vs Betfair Exchange: home=-0.0143  away=+0.0164  draw=-0.0021  (n=738)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: +2.6%  (bets=928, staked=$928.00, profit=$+23.88)
+  1X2 ROI    @ EV>5%: -2.4%  (bets=775, staked=$775.00, profit=$-18.97)
+  1X2 ROI    @ EV>10%: -0.9%  (bets=650, staked=$650.00, profit=$-5.75)
+  Totals ROI @ EV>0%: -2.0%  (bets=596, staked=$596.00, profit=$-12.06)
+  Totals ROI @ EV>5%: -0.8%  (bets=438, staked=$438.00, profit=$-3.55)
+  Totals ROI @ EV>10%: -3.8%  (bets=308, staked=$308.00, profit=$-11.82)
+
+-- Premier League, season 2024 --
+  1X2 Brier:      0.5853  (n=380)
+  Totals Brier:   0.4928  (n=380)
+  1X2 Bias vs Betfair Exchange: home=-0.0162  away=+0.0205  draw=-0.0043  (n=380)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: +8.8%  (bets=450, staked=$450.00, profit=$+39.45)
+  1X2 ROI    @ EV>5%: +4.1%  (bets=374, staked=$374.00, profit=$+15.35)
+  1X2 ROI    @ EV>10%: +4.9%  (bets=312, staked=$312.00, profit=$+15.25)
+  Totals ROI @ EV>0%: -0.6%  (bets=295, staked=$295.00, profit=$-1.77)
+  Totals ROI @ EV>5%: +1.6%  (bets=222, staked=$222.00, profit=$+3.60)
+  Totals ROI @ EV>10%: -1.7%  (bets=152, staked=$152.00, profit=$-2.52)
+
+-- Premier League, season 2025 --
+  1X2 Brier:      0.6359  (n=380)
+  Totals Brier:   0.5207  (n=380)
+  1X2 Bias vs Betfair Exchange: home=-0.0123  away=+0.0121  draw=+0.0002  (n=358)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -3.3%  (bets=478, staked=$478.00, profit=$-15.57)
+  1X2 ROI    @ EV>5%: -8.6%  (bets=401, staked=$401.00, profit=$-34.32)
+  1X2 ROI    @ EV>10%: -6.2%  (bets=338, staked=$338.00, profit=$-21.00)
+  Totals ROI @ EV>0%: -3.4%  (bets=301, staked=$301.00, profit=$-10.29)
+  Totals ROI @ EV>5%: -3.3%  (bets=216, staked=$216.00, profit=$-7.15)
+  Totals ROI @ EV>10%: -6.0%  (bets=156, staked=$156.00, profit=$-9.30)
+
+-- Serie A, across seasons --
+  1X2 Brier:      0.6081  (n=790)
+  Totals Brier:   0.5002  (n=790)
+  1X2 Bias vs Betfair Exchange: home=-0.0068  away=+0.0147  draw=-0.0079  (n=769)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -13.4%  (bets=984, staked=$984.00, profit=$-131.62)
+  1X2 ROI    @ EV>5%: -11.3%  (bets=838, staked=$838.00, profit=$-94.85)
+  1X2 ROI    @ EV>10%: -11.1%  (bets=698, staked=$698.00, profit=$-77.57)
+  Totals ROI @ EV>0%: +5.8%  (bets=599, staked=$599.00, profit=$+34.74)
+  Totals ROI @ EV>5%: +8.1%  (bets=443, staked=$443.00, profit=$+35.82)
+  Totals ROI @ EV>10%: +6.0%  (bets=304, staked=$304.00, profit=$+18.23)
+
+-- Serie A, season 2024 --
+  1X2 Brier:      0.6012  (n=380)
+  Totals Brier:   0.5083  (n=380)
+  1X2 Bias vs Betfair Exchange: home=-0.0067  away=+0.0183  draw=-0.0116  (n=380)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -21.3%  (bets=455, staked=$455.00, profit=$-96.74)
+  1X2 ROI    @ EV>5%: -21.3%  (bets=382, staked=$382.00, profit=$-81.32)
+  1X2 ROI    @ EV>10%: -21.0%  (bets=317, staked=$317.00, profit=$-66.50)
+  Totals ROI @ EV>0%: -6.1%  (bets=289, staked=$289.00, profit=$-17.52)
+  Totals ROI @ EV>5%: -7.5%  (bets=202, staked=$202.00, profit=$-15.08)
+  Totals ROI @ EV>10%: -14.7%  (bets=140, staked=$140.00, profit=$-20.60)
+
+-- Serie A, season 2025 --
+  1X2 Brier:      0.6145  (n=410)
+  Totals Brier:   0.4926  (n=410)
+  1X2 Bias vs Betfair Exchange: home=-0.0068  away=+0.0111  draw=-0.0042  (n=389)
+  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)
+  1X2 ROI    @ EV>0%: -6.6%  (bets=529, staked=$529.00, profit=$-34.88)
+  1X2 ROI    @ EV>5%: -3.0%  (bets=456, staked=$456.00, profit=$-13.53)
+  1X2 ROI    @ EV>10%: -2.9%  (bets=381, staked=$381.00, profit=$-11.07)
+  Totals ROI @ EV>0%: +16.9%  (bets=310, staked=$310.00, profit=$+52.26)
+  Totals ROI @ EV>5%: +21.1%  (bets=241, staked=$241.00, profit=$+50.90)
+  Totals ROI @ EV>10%: +23.7%  (bets=164, staked=$164.00, profit=$+38.83)

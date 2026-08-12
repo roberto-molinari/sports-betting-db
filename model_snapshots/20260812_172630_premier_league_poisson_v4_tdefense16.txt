@@ -1,0 +1,103 @@
+# Model metrics report -- poisson_v4_tdefense16 / Premier League
+Generated: 2026-08-12T21:26:30.463091+00:00
+Seasons: [2025]
+Note: team_defense_stretch pilot
+
+## Committed model constants at run time
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_SIZE = 10
+  core.poisson_model.TEAM_PAST_MATCH_WINDOW_DECAY = 1.0
+  core.poisson_model.TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES = 0
+  core.poisson_model.TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE = 3
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_SIZE = 100
+  core.poisson_model.LEAGUE_AVG_GOALS_PER_GAME_WINDOW_DECAY = 1.0
+  compute_club_player_strength.TEAM_RATING_XG_V_GOALS_BLEND = 1.0
+  compute_club_player_strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
+  compute_club_player_strength.PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+  compute_club_player_strength.PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW = 300.0
+  compute_club_player_strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {'Serie A': 1.0, 'Serie B': 0.663, 'Premier League': 1.0, 'Bundesliga': 1.0, 'La Liga': 1.0, 'Ligue 1': 1.0}
+  compute_club_player_strength.PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
+
+## Brier score (all games, not just bets -- lower is better; naive baseline ~0.667)
+  season 2025: Brier = 0.6507  (n=380)
+  pooled: Brier = 0.6507  (n=380)
+
+## Brier score, TOTALS/over-under (lower is better; naive baseline ~0.5 -- 2-class scale, not directly comparable to 1X2's 3-class number above)
+  season 2025: Brier = 0.5533  (n=380)
+  pooled: Brier = 0.5533  (n=380)
+
+## Compression-bucket table (model p_home - Betfair Exchange closing p_home, by market's own p_home)
+  season 2025:
+     0.00-0.15: -0.008  (n=13)
+     0.15-0.25: +0.017  (n=46)
+     0.25-0.35: +0.024  (n=75)
+     0.35-0.45: +0.018  (n=63)
+     0.45-0.55: -0.025  (n=64)
+     0.55-1.01: -0.036  (n=97)
+
+## Pooled signed bias vs Betfair Exchange closing (home/away split, target +/-0.01-0.02)
+  season 2025: home=-0.0041  away=+0.0096  draw=-0.0055  (n=358)
+
+## Bias, TOTALS/over-under: not available
+  No sharp-book totals odds are ingested anywhere in this codebase (soccer_market_odds
+  has no O/U columns at all), so there's no line to bias-check the totals market
+  against yet -- not a wiring gap, a real data gap. See FEATURE-015, BUGS.md.
+
+## ROI vs Bet365 (ROI success criterion -- must be positive at EV>0/5/10%)
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | EV threshold +0.0% | 380 graded matches
+  Bets: 432  Wins: 138  Win rate: 31.9%
+  Total staked: $432.00  Profit: $-21.13  ROI: -4.9%
+
+  By side:
+     home  n=145  wins=56   profit=$  -15.09  ROI=-10.4%
+     draw  n=125  wins=29   profit=$   -1.81  ROI=-1.4%
+     away  n=162  wins=53   profit=$   -4.23  ROI=-2.6%
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | EV threshold +5.0% | 380 graded matches
+  Bets: 354  Wins: 110  Win rate: 31.1%
+  Total staked: $354.00  Profit: $-16.56  ROI: -4.7%
+
+  By side:
+     home  n=120  wins=44   profit=$  -13.02  ROI=-10.9%
+     draw  n=85   wins=21   profit=$   +1.36  ROI=+1.6%
+     away  n=149  wins=45   profit=$   -4.90  ROI=-3.3%
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | EV threshold +10.0% | 380 graded matches
+  Bets: 297  Wins: 91  Win rate: 30.6%
+  Total staked: $297.00  Profit: $-15.13  ROI: -5.1%
+
+  By side:
+     home  n=97   wins=35   profit=$   -7.85  ROI=-8.1%
+     draw  n=73   wins=18   profit=$   +0.58  ROI=+0.8%
+     away  n=127  wins=38   profit=$   -7.86  ROI=-6.2%
+
+## ROI vs Bet365, TOTALS/over-under (never pooled with 1X2 ROI -- different markets)
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | TOTALS | EV threshold +0.0% | 380 graded matches
+  Bets: 341  Wins: 155  Win rate: 45.5%
+  Total staked: $341.00  Profit: $-29.82  ROI: -8.7%
+
+  By side:
+     over  n=99   wins=50   profit=$  -11.90  ROI=-12.0%
+    under  n=242  wins=105  profit=$  -17.92  ROI=-7.4%
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | TOTALS | EV threshold +5.0% | 380 graded matches
+  Bets: 279  Wins: 127  Win rate: 45.5%
+  Total staked: $279.00  Profit: $-20.46  ROI: -7.3%
+
+  By side:
+     over  n=73   wins=36   profit=$   -9.65  ROI=-13.2%
+    under  n=206  wins=91   profit=$  -10.81  ROI=-5.2%
+
+poisson_v4_tdefense16 | Premier League season 2025 | vs Bet365 | TOTALS | EV threshold +10.0% | 380 graded matches
+  Bets: 228  Wins: 106  Win rate: 46.5%
+  Total staked: $228.00  Profit: $-10.84  ROI: -4.8%
+
+  By side:
+     over  n=54   wins=29   profit=$   -3.04  ROI=-5.6%
+    under  n=174  wins=77   profit=$   -7.80  ROI=-4.5%

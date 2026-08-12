@@ -150,7 +150,7 @@ def test_add_player_set_team_id_false_does_not_overwrite_existing_team(db_path, 
     """A historical/backfill import (e.g. a promoted team's PRIOR Serie B season,
     imported after their current Serie A season already exists) must not stomp
     team_id back to the old club -- that would corrupt the live
-    current_squad_player_ids() signal. set_team_id=False should still update
+    current_roster_player_ids() signal. set_team_id=False should still update
     position/api_player_id, just not team_id, for an already-existing player."""
     old_team = sports_db.ensure_soccer_team("Spezia", "Serie B")
     new_team = sports_db.ensure_soccer_team("Cremonese", "Serie A")

@@ -73,10 +73,33 @@ PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
 PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
 PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
 
-# Blend-weight resolution (FEATURE-011_REQUIREMENTS.md, Blend, resolved 2026-07-30).
-# "Last season" (recency, not career totals) minutes a player needs before they count
-# as a strong individual signal for the data-coverage score below.
-PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON = 900.0
+# Blend-weight resolution (FEATURE-011_REQUIREMENTS.md, Blend, resolved 2026-07-30;
+# window made season-blind 2026-08-11, BUG-010). Minutes a player needs, across their
+# own last PLAYER_RATING_PAST_MATCH_WINDOW_SIZE appearances (recency, not career
+# totals), before they count as a strong individual signal for the data-coverage
+# score below. Was "last calendar season" until 2026-08-11 -- see BUG-010 in
+# BUGS.md: that hard-coded a literal season boundary, so a team with no data at all
+# under the specific `season - 1` label (a league's first tracked season, or the
+# feeder-division season before a team's promotion) collapsed to a hard 0.0 trust
+# regardless of how much real recent data actually existed. Same recency intent,
+# now measured the same season-blind way load_team_players' own window already is.
+#
+# Value recalibrated 2026-08-11, same BUG-010 fix -- the OLD value (900.0) was set
+# when this compared against a whole SEASON's minutes (thousands available, trivial
+# for any regular starter to clear). Once the comparison switched to this file's
+# `window`-appearance cap (PLAYER_RATING_PAST_MATCH_WINDOW_SIZE=10 games, 900
+# minutes the theoretical MAXIMUM if a player started and played all of every one of
+# their last 10 games), 900 became unreachable in practice -- checked directly
+# against 10 real Serie A rosters (241 roster slots, 2024-09-14): only 1 player
+# (0.4%) cleared it, so data_coverage_score was ~always 0 regardless of real roster
+# quality, silently zeroing out the whole trust score no matter how well-tracked a
+# team's players actually were. No natural gap/step exists in the real distribution
+# (it's smooth, not two separated clusters) -- 300 chosen as a plain data-driven
+# read (not a fitted/optimized value): ~48% of real roster slots clear it, matching
+# "a genuine rotation regular," not just the strict best-XI (500min -> 31%; 400 ->
+# 39%; 300 -> 48%; 200 -> 61%). Revisit if real bias/ROI validation after this fix
+# suggests otherwise -- this is a starting value, not a proven-correct one.
+PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW = 300.0
 
 # {league: {"attack": w, "defense": w}} -- a coarse override that forces EVERY team in
 # that league to the same weight for that component, taking precedence over each
@@ -117,6 +140,14 @@ PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
 # blend, not assumed equal to its top-flight, until a real Serie-B-style measurement
 # exists for each (needs the player-stats backfill for those divisions to finish
 # first -- also tracked in BUGS.md).
+#
+# 2026-08-12 (BUG-010 continued): the GATE (exclude a league with no entry here,
+# rather than assume Serie-A-equivalent) now also applies to defense in
+# load_team_players -- a promoted team's defense rating was being built almost
+# entirely from unadjusted feeder-league form. The numeric factor itself still
+# only scales attack (it's an attack-specific measurement); defense from a
+# league that DOES have an entry is included unscaled. See load_team_players'
+# docstring for the full mechanism.
 PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {
     "Serie A": 1.0,
     "Serie B": 0.663,
@@ -143,20 +174,57 @@ TEAM_RATING_XG_V_GOALS_BLEND = 1.0
 # on the biggest favorites/underdogs -- worst in matches like a bottom-table team
 # hosting a top-table one). For each of get_team_xg_ratings' four fields
 # (home/away attack/defense), recenters on that field's own league-wide mean at the
-# same before_date, then scales the deviation from that mean by this factor:
+# same before_date, then scales the deviation from that mean by the relevant factor
+# below:
 #     stretched = league_mean + (raw - league_mean) * factor
-# 1.0 is an exact no-op (today's pre-2026-08-07 behavior). Swept 1.0/1.3/1.66/2.0
-# (ad hoc, both Serie A seasons): bottom6-vs-other probability gap shrinks
-# monotonically and ROI improves in BOTH seasons as the factor increases -- notably
-# different from every other compression fix tried (blend, this constant's sibling
-# above) which always showed one season winning while the other lost -- but pooled
-# away-side bias grows with the stretch and breaches the +/-0.01-0.02 Model
-# Calibration target at 1.66 in one season and at 2.0 in both. 1.3 is the largest
-# value tested that stays inside the target in both seasons, so it's the DEFAULT
-# here rather than 1.0 -- pass 1.0 to reproduce the exact pre-2026-08-07 shape for
-# comparison. See BUGS.md, BUG-009, 2026-08-07 addendum for the full sweep and the
-# combined-with-blend test (negative result -- don't combine the two).
-TEAM_RATING_XG_SPREAD_STRETCH = 1.3
+# 1.0 is an exact no-op (today's pre-2026-08-07 shape). The original 2026-08-07 sweep
+# (1.0/1.3/1.66/2.0, ad hoc, both Serie A seasons) tested ONE shared factor across all
+# four fields: bottom6-vs-other probability gap shrinks monotonically and ROI improves
+# in BOTH seasons as the factor increases -- notably different from every other
+# compression fix tried (blend, this constant's sibling above) which always showed one
+# season winning while the other lost -- but pooled away-side bias grows with the
+# stretch and breaches the +/-0.01-0.02 Model Calibration target at 1.66 in one season
+# and at 2.0 in both. 1.3 was the largest value tested that stays inside the target in
+# both seasons, hence that shared default. See BUGS.md, BUG-009, 2026-08-07 addendum
+# for the full sweep and the combined-with-blend test (negative result -- don't
+# combine the two).
+#
+# Split into separate attack/defense constants 2026-08-12 (BUG-010 continued):
+# measuring xG-vs-actual-goals dispersion separately by side shows defense is MORE
+# compressed than attack (CV ratio goals/xG averaged ~1.64 for defense vs ~1.39 for
+# attack, across home/away, La Liga 2025 -- a single shared factor was calibrated on
+# attack-shaped data and applied uniformly, under-correcting defense). Both start at
+# the prior shared value (1.3) -- an unchanged-behavior starting point, not yet
+# re-calibrated separately; that needs its own sweep, same discipline as the
+# original 1.0/1.3/1.66/2.0 sweep, before either value should move.
+TEAM_RATING_XG_SPREAD_STRETCH_ATTACK = 1.3
+TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE = 1.3
+
+# Player-level counterpart to the team-level stretch above (2026-08-12, BUG-010
+# continued): player-level attack/defense ratings show the SAME kind of compression
+# relative to team-level xG ratings (measured on La Liga 2025: player-level away-
+# attack CV=0.157 vs team-level xG away-attack CV=0.246; player-level home-defense
+# CV=0.082 vs team-level xG home-defense CV=0.200 -- defense again more compressed
+# than attack, and more severely than at the team level). Applied the same way, in
+# compute(), recentering each team's raw player-level ra/rd around the league's own
+# attack_mean/defense_mean before the home/away unit conversion (a pure linear
+# rescale, so it doesn't touch relative dispersion -- the stretch has to happen
+# before that step, not after).
+#
+# ATTACK calibrated 2026-08-12 (5 leagues, season 2025, all-up pooled): swept
+# 1.0/1.3/1.6/2.0/2.5/3.0. Bias vs Betfair Exchange never breached the +/-0.01-0.02
+# target even at 3.0 (away bias only reached +0.0154) -- no hard ceiling from that
+# criterion. But Brier degraded monotonically across the whole range (0.5689 at 1.0
+# -> 0.5728 at 3.0) while ROI improvement plateaued after 2.0 (all three EV
+# thresholds sat in a tight -9.3% to -10.1% band from 2.0 through 3.0, vs
+# -11.8%/-11.1%/-10.5% at 1.0) -- past 2.0, further stretch bought steady Brier
+# cost for no further ROI gain. 2.0 shipped as the value that captures nearly all
+# the ROI improvement while Brier degradation is still modest (+0.001 vs baseline).
+#
+# DEFENSE not yet calibrated -- still 1.0 (true no-op) pending its own sweep, same
+# discipline, with attack held at its now-locked 2.0.
+PLAYER_RATING_SPREAD_STRETCH_ATTACK = 2.0
+PLAYER_RATING_SPREAD_STRETCH_DEFENSE = 1.0
 
 _MID_CODES = {"m", "mf", "cm", "dm", "am", "cdm", "cam", "rm", "lm", "mid"}
 _DEF_CODES = {"d", "df", "cb", "lb", "rb", "wb", "rwb", "lwb", "def"}
@@ -207,7 +275,11 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     without attempting Follow-up A's fuller roster/lineup-projection scope (still
     unbuilt; see BUGS.md FEATURE-011). A player whose most recent appearance wasn't
     for a team in `team_ids` doesn't appear in the result at all (e.g. they left the
-    league, or their most recent team isn't one being computed for right now).
+    league, or their most recent team isn't one being computed for right now) --
+    NOR does a player whose most recent appearance for team_ids happened longer ago
+    than team_ids' own last `window_size` matches (2026-08-11, performance +
+    correctness -- see the candidate-narrowing step above): they haven't featured
+    recently enough to still be part of what the team's actually been doing.
 
     min_date: optional ISO date lower bound -- when given, the window additionally
     can't reach earlier than this (e.g. a season's start date), for A/B-comparing a
@@ -230,15 +302,27 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     goals conceded) otherwise. "actual" forces club_ga_per90 always.
 
     Cross-league adjustment (`league_strength`, defaults to
-    PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT) is applied per-game to the ATTACK side
-    only, same established asymmetry as before (BUG-010: a defense-side equivalent
-    would need its own calibration) -- a game played in a league with NO factor entry
-    is excluded entirely from the attack calculation (both the goal/xg numerator and
-    the minutes denominator for that one game), not assumed Serie-A-equivalent. This
-    can make a player's effective attack-side window smaller than their defense-side
-    window when some games fall in an uncalibrated league -- both `attack_minutes` and
-    `defense_minutes` are returned separately (decay-weighted, NOT raw minutes) rather
-    than one shared `minutes` field, since they can legitimately differ.
+    PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT): a game played in a league with NO
+    factor entry is excluded entirely -- from BOTH attack and defense (goal/xg
+    numerator, goals-conceded numerator, and the minutes denominator for that one
+    game), never assumed Serie-A-equivalent. Found live 2026-08-12 (BUG-010,
+    Real Oviedo hosting Real Madrid): before this, the exclusion only applied to
+    attack, so a promoted team's defense rating was built almost entirely from
+    UNADJUSTED feeder-league form (e.g. one player: attack_minutes=90 -- their
+    real top-flight debut only -- vs defense_minutes=891, nearly the whole window,
+    from Segunda División) while attack correctly stayed thin and got shrunk
+    toward the league average. The GATE now applies symmetrically. The numeric
+    `factor` itself, however, still only SCALES attack -- Serie B's real `0.663`
+    was empirically measured from players' own goal-SCORING rate specifically
+    (see this constant's own comment) and has no established meaning for goals
+    conceded; naively reusing it as a defense multiplier would be a guess dressed
+    as a calibration, not an actual fix, so a calibrated league's games are
+    included on defense UNSCALED (effectively factor=1.0) until a real
+    defense-specific measurement exists. `attack_minutes` and `defense_minutes`
+    can still differ even post-fix -- not from league-gating anymore, but from a
+    game missing its own `club_ga_per90`/`club_xga_per90` value while still
+    having usable attack data -- so both are still returned separately
+    (decay-weighted, NOT raw minutes) rather than one shared `minutes` field.
 
     Each game is attributed to the team the player actually played for IN THAT MATCH
     (derived from venue + soccer_matches.home/away_team_id), NOT soccer_players.team_id
@@ -248,7 +332,46 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     """
     league_strength = PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT if league_strength is None else league_strength
     cur = conn.cursor()
-    sql = """
+
+    # Narrow to a candidate player pool BEFORE the full history fetch (2026-08-11,
+    # performance -- found while validating BUG-010: this query used to have no
+    # team/player filter at all, pulling the ENTIRE soccer_player_stats table on
+    # every single call, which became the dominant backfill cost once the
+    # multi-league expansion grew that table well past what this was originally
+    # written against, 15+ of ~23 seconds per 30 compute() calls in a live
+    # profile). Not just a speed shortcut: a player who hasn't appeared in ANY of
+    # team_ids' own last `window_size` matches hasn't plausibly been part of what
+    # this team's been doing lately, so excluding them is more correct, not a
+    # lossy approximation -- the old unbounded reach-back could pull in a player
+    # out injured far longer than the team's own recent form window, diluting the
+    # rating with a contribution that's no longer representative of anything.
+    team_placeholders = ",".join("?" * len(team_ids))
+    cur.execute(f"""
+        SELECT match_id, home_team_id, away_team_id FROM soccer_matches
+        WHERE match_date < ?
+          AND (home_team_id IN ({team_placeholders}) OR away_team_id IN ({team_placeholders}))
+        ORDER BY match_date DESC
+    """, [before_date] + list(team_ids) + list(team_ids))
+    matches_by_team = {tid: [] for tid in team_ids}
+    for match_id, home_id, away_id in cur.fetchall():
+        for tid in (home_id, away_id):
+            if tid in matches_by_team and len(matches_by_team[tid]) < window_size:
+                matches_by_team[tid].append(match_id)
+    candidate_match_ids = {mid for mids in matches_by_team.values() for mid in mids}
+    if not candidate_match_ids:
+        return {tid: [] for tid in team_ids}
+
+    match_placeholders = ",".join("?" * len(candidate_match_ids))
+    cur.execute(f"""
+        SELECT DISTINCT player_id FROM soccer_player_stats
+        WHERE match_id IN ({match_placeholders}) AND venue IS NOT NULL
+    """, list(candidate_match_ids))
+    candidate_player_ids = [row[0] for row in cur.fetchall()]
+    if not candidate_player_ids:
+        return {tid: [] for tid in team_ids}
+
+    player_placeholders = ",".join("?" * len(candidate_player_ids))
+    sql = f"""
         SELECT s.player_id, p.position, s.minutes_played, s.goals, s.xg,
                s.club_ga_per90, s.club_xga_per90,
                s.venue, m.home_team_id, m.away_team_id, m.match_date, m.league
@@ -256,8 +379,9 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
         JOIN soccer_players p ON p.player_id = s.player_id
         JOIN soccer_matches m ON m.match_id = s.match_id
         WHERE s.match_id IS NOT NULL AND s.venue IS NOT NULL AND m.match_date < ?
+          AND s.player_id IN ({player_placeholders})
     """
-    params = [before_date]
+    params = [before_date] + candidate_player_ids
     if min_date is not None:
         sql += " AND m.match_date >= ?"
         params.append(min_date)
@@ -289,14 +413,24 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
         for rank, g in enumerate(window):
             w = decay ** rank
             factor = league_strength.get(g["league"])
-            if factor is not None:
-                # When has_xg (ANY game in the window has real xg), a game WITHOUT
-                # its own xg contributes 0, not its goals -- never mix units within
-                # one player's rate. Only fall back to goals per-game when the whole
-                # window has no xg at all (has_xg False).
-                goal_val = (g["xg"] or 0) if has_xg else g["goals"]
-                attack_num += w * factor * (goal_val or 0)
-                attack_den += w * g["minutes"]
+            if factor is None:
+                # BUG-010, 2026-08-12: this gate now excludes the game from BOTH
+                # sides, not just attack -- see load_team_players' docstring for why
+                # a defense-side equivalent of `factor` isn't applied even for
+                # leagues that DO have one (Serie A/Serie B): 0.663 was measured
+                # from players' own goal-SCORING rate specifically and has no
+                # established meaning for goals conceded, so scaling defense by it
+                # would be an unvalidated guess, not a calibration. The gate itself
+                # (never assume Serie-A-equivalent for an uncalibrated league) is
+                # the part that generalizes to defense; the numeric factor is not.
+                continue
+            # When has_xg (ANY game in the window has real xg), a game WITHOUT
+            # its own xg contributes 0, not its goals -- never mix units within
+            # one player's rate. Only fall back to goals per-game when the whole
+            # window has no xg at all (has_xg False).
+            goal_val = (g["xg"] or 0) if has_xg else g["goals"]
+            attack_num += w * factor * (goal_val or 0)
+            attack_den += w * g["minutes"]
             if g["minutes"]:
                 if g["club_ga90"] is not None:
                     ga_num += w * g["minutes"] * g["club_ga90"]
@@ -407,7 +541,7 @@ def team_roster_minutes(conn, team_id, season, before_date=None):
     Used two ways: with no before_date, this gives a fully-completed season's final
     roster (safe -- the whole season is in the past by construction). WITH a
     before_date, it gives a point-in-time-correct read of the CURRENT season's roster
-    so far, for backtesting (see squad_as_of_date) -- no lookahead, since it only
+    so far, for backtesting (see roster_as_of_date) -- no lookahead, since it only
     counts matches that had already happened."""
     cur = conn.cursor()
     sql = """
@@ -427,41 +561,104 @@ def team_roster_minutes(conn, team_id, season, before_date=None):
     return {pid: mins or 0 for pid, mins in cur.fetchall()}
 
 
-def current_squad_player_ids(conn, team_id):
+def team_aggregated_recent_roster_minutes(conn, team_id, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
+    """{player_id: minutes played AT team_id, summed across team_id's own last `n`
+    matches (season-blind, strictly before before_date)} -- the season-blind
+    replacement (BUG-010, 2026-08-11) for team_roster_minutes(team_id, season - 1)
+    as player_trust_score's "prior roster" reference. Same window size/style as
+    load_team_players' own rating window (not a separately-tuned constant) -- the
+    point is comparing roster continuity over the SAME horizon the team-level and
+    player-level ratings themselves already use, not an arbitrary different one.
+
+    Team-scoped, same reasoning as team_roster_minutes: answers "how much of
+    team_id's own recent production is this player part of.\""""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT match_id FROM soccer_matches
+        WHERE match_date < ? AND (home_team_id = ? OR away_team_id = ?)
+        ORDER BY match_date DESC LIMIT ?
+    """, (before_date, team_id, team_id, n))
+    match_ids = [row[0] for row in cur.fetchall()]
+    if not match_ids:
+        return {}
+    placeholders = ",".join("?" * len(match_ids))
+    cur.execute(f"""
+        SELECT s.player_id, SUM(s.minutes_played)
+        FROM soccer_player_stats s
+        JOIN soccer_matches m ON m.match_id = s.match_id
+        WHERE s.match_id IN ({placeholders}) AND s.venue IS NOT NULL
+          AND ((s.venue = 'home' AND m.home_team_id = ?)
+               OR (s.venue = 'away' AND m.away_team_id = ?))
+        GROUP BY s.player_id
+    """, match_ids + [team_id, team_id])
+    return {pid: mins or 0 for pid, mins in cur.fetchall()}
+
+
+def players_aggregated_recent_minutes(conn, player_ids, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
+    """{player_id: total minutes across THAT player's own last `n` appearances,
+    ANY team/league (season-blind, strictly before before_date)} -- the season-
+    blind replacement (BUG-010, 2026-08-11) for player_season_minutes(season) as
+    player_trust_score's team-agnostic per-player signal. Deliberately NOT team-
+    scoped, same reasoning as player_season_minutes: a just-transferred player's
+    minutes at their previous club count in full toward their data-coverage
+    signal. Only computes for the given player_ids (not every player in the DB),
+    for efficiency -- callers already know which players they need this for."""
+    if not player_ids:
+        return {}
+    placeholders = ",".join("?" * len(player_ids))
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT s.player_id, m.match_date, s.minutes_played
+        FROM soccer_player_stats s
+        JOIN soccer_matches m ON m.match_id = s.match_id
+        WHERE s.player_id IN ({placeholders}) AND s.match_id IS NOT NULL AND s.venue IS NOT NULL
+          AND m.match_date < ?
+        ORDER BY s.player_id, m.match_date DESC
+    """, list(player_ids) + [before_date])
+    by_player = {}
+    for player_id, match_date, minutes in cur.fetchall():
+        by_player.setdefault(player_id, []).append(minutes or 0)
+    return {pid: sum(mins_list[:n]) for pid, mins_list in by_player.items()}
+
+
+def current_roster_player_ids(conn, team_id):
     """Players whose most-recently-seen team (soccer_players.team_id, see add_player's
     api_player_id-first identity resolution) is team_id right now -- the best available
     read of "who's on the roster today," not scoped to any particular season.
 
     LIVE use only. This field only ever holds the single latest known team, so it
     can't answer "who was on the roster as of a PAST date" -- for backtesting, use
-    squad_as_of_date instead (derived from real match appearances, so it's actually
+    roster_as_of_date instead (derived from real match appearances, so it's actually
     point-in-time correct)."""
     cur = conn.cursor()
     cur.execute("SELECT player_id FROM soccer_players WHERE team_id = ?", (team_id,))
     return {row[0] for row in cur.fetchall()}
 
 
-def squad_as_of_date(conn, team_id, season, before_date):
+def roster_as_of_date(conn, team_id, season, before_date):
     """Point-in-time "who's on this roster" for BACKTESTING a past season, where
-    current_squad_player_ids can't be trusted (soccer_players.team_id reflects TODAY's
+    current_roster_player_ids can't be trusted (soccer_players.team_id reflects TODAY's
     state, not what was true at before_date). Derived from real match appearances:
 
     1. Players who've played for team_id in `season`'s own matches so far (before
        before_date) -- the season's own transfer activity, as it becomes visible.
     2. If none yet (very early in the season, before any match has revealed summer
-       transfer activity), falls back to last season's full roster -- an honest
-       approximation: with no historical squad-list snapshot available, the first
-       matchday or two assumes roster continuity until match evidence says otherwise.
-       This understates day-one churn; a documented, bounded limitation (a season has
-       ~38 matchdays; this affects the first one or two), not a lookahead leak.
+       transfer activity), falls back to team_id's last PLAYER_RATING_PAST_MATCH_
+       WINDOW_SIZE matches, season-blind (BUG-010, 2026-08-11 -- was `season - 1`,
+       same literal-season-label fragility as player_trust_score's own fix) -- an
+       honest approximation: with no historical squad-list snapshot available, the
+       first matchday or two assumes roster continuity until match evidence says
+       otherwise. This understates day-one churn; a documented, bounded limitation
+       (a season has ~38 matchdays; this affects the first one or two), not a
+       lookahead leak.
 
-    NOT for live use -- current_squad_player_ids is the better signal there (updated
+    NOT for live use -- current_roster_player_ids is the better signal there (updated
     from a squad-list pull before the season begins, so it knows about a transfer
     before a ball is kicked; this only knows once the player actually plays)."""
     this_season = team_roster_minutes(conn, team_id, season, before_date=before_date)
     if this_season:
         return set(this_season.keys())
-    return set(team_roster_minutes(conn, team_id, season - 1).keys())
+    return set(team_aggregated_recent_roster_minutes(conn, team_id, before_date).keys())
 
 
 def _memoized(cache, key, fn):
@@ -476,76 +673,163 @@ def _memoized(cache, key, fn):
     return cache[key]
 
 
-def player_trust_score(conn, team_id, season, current_squad_ids=None, cache=None):
+def team_prior_window_cutoff_date(conn, team_id, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
+    """match_date of the OLDEST match in team_id's CURRENT n-match window (team_id's
+    own last n matches strictly before before_date) -- the boundary between that
+    window and the n-match window immediately preceding it. Pass this as `before_date`
+    to team_aggregated_recent_roster_minutes(..., n=n) to fetch that adjacent, older,
+    non-overlapping window -- player_trust_score's "prior roster" reference.
+
+    Replaces a fixed once-per-season anchor (league_season_start_date, 2026-08-11)
+    that computed the "prior roster" ONE time at season start and then reused that
+    same stale snapshot for every matchday for the rest of the season -- illogical
+    once you notice team_level_lambda's own rating is a SLIDING last-n-matches
+    window that moves forward every matchday, while the roster-churn reference it
+    was being compared against never did (BUG-010, 2026-08-12). Two adjacent
+    n-match windows, both anchored to before_date, genuinely recompute every call
+    as before_date advances -- by design a churned-over-the-summer squad stops
+    reading as "new" once enough same-roster matches exist to fill its own window,
+    rather than staying flagged all season.
+
+    None if team_id doesn't even have n matches before before_date yet (too early
+    for a full current window, let alone a second one to compare it against) --
+    caller falls back to trust=0.0 (team-level), same as any other no-history case."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT match_date FROM soccer_matches
+        WHERE match_date < ? AND (home_team_id = ? OR away_team_id = ?)
+        ORDER BY match_date DESC LIMIT 1 OFFSET ?
+    """, (before_date, team_id, team_id, n - 1))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cache=None,
+                       window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
     """1.0 = fully trust the player-level lambda for this team; 0.0 = fully trust
     team-level. Two factors, BOTH required (product, not sum/average) -- a stable,
     well-tracked squad has nothing to gain from the player signal even with great
     coverage, and a squad we don't know yet still can't be trusted even if it churned
     completely (FEATURE-011_REQUIREMENTS.md, Blend):
 
-    - data_coverage_score: of the CURRENT squad's tracked last-season minutes, the
-      fraction belonging to players with >= PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON last season
-      (recency, not career totals -- team-agnostic, see player_season_minutes).
-    - roster_change_score: last season's minutes lost to departed players (at THIS
-      team specifically) plus incoming players' last-season minutes (wherever they
-      played), as a fraction of the team's own total minutes last season. High churn
-      means last season's team-level number describes a squad that's mostly gone.
+    - data_coverage_score: of the CURRENT squad's tracked recent-window minutes, the
+      fraction belonging to players with >= PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW in
+      their own last `window` appearances (recency, not career totals -- team-agnostic,
+      see players_aggregated_recent_minutes).
+    - roster_change_score: recent-window minutes lost to departed players (at THIS
+      team specifically) plus incoming players' recent-window minutes (wherever they
+      played), as a fraction of the team's own total recent-window minutes. High churn
+      means the reference window describes a squad that's mostly gone.
 
-    current_squad_ids: optional override for "who's on the roster right now" --
-    defaults to current_squad_player_ids() (the live signal). Backtesting a PAST
-    season must pass a point-in-time squad instead (e.g. from squad_as_of_date), since
+    Season-blind (2026-08-11, BUG-010): the "prior roster" reference is team_id's
+    own last `window` matches (team_aggregated_recent_roster_minutes), reaching
+    back across a season boundary the same way load_team_players' rating window
+    already does -- NOT a literal "last calendar season" lookup like before. Same
+    window size as load_team_players' default (PLAYER_RATING_PAST_MATCH_WINDOW_
+    SIZE), deliberately not a separately-tuned constant: this is comparing roster
+    continuity over the SAME horizon the ratings themselves are computed over, not
+    an arbitrary different one. Was hard-coded to `season - 1` until this date --
+    see BUG-010 in BUGS.md: a league's first-ever tracked season (nothing before it
+    in the database at all) or a specific team's top-flight debut (promoted from an
+    untracked-that-far-back feeder division) collapsed this to a hard 0.0
+    regardless of how much real recent data actually existed, discarding a real,
+    differentiating player-level signal for BOTH teams in a match (found via
+    Holstein Kiel hosting FC Bayern München, 2024-09-14: both teams' trust scores
+    were exactly 0.0, not because their player data was bad, but because the
+    DATABASE had no rows under the literal season label "2023" for either).
+
+    The "prior roster" window boundary (2026-08-12, BUG-010 continued -- see
+    team_prior_window_cutoff_date): the FIRST fix above anchored this window to end
+    at the season's own start date, computed once and reused for every matchday all
+    season -- fixed the season-label bug, but introduced a new one: by design that
+    anchor never moves, so a squad that churned hard over the summer keeps reading
+    as "all new" every single matchday, even deep into the season once team_level_
+    lambda's own last-`window`-matches rating is built entirely from real games with
+    the current roster (found live 2026-08-12: Burnley hosting Manchester City,
+    2026-04-22 -- both teams' trust scores were still ~0.75-0.98 that late in the
+    season purely from stale summer-transfer churn, discarding the team-level
+    signal exactly when it had become the MORE reliable one). Anchored instead to
+    team_prior_window_cutoff_date(before_date, window): the `window` matches
+    immediately preceding team_id's CURRENT `window`-match window (the same one
+    team_level_lambda's own rating is built from) -- two adjacent, non-overlapping
+    periods that both shift forward every matchday as before_date advances, so
+    churn measured today reflects today's roster boundary, not August's. Player-
+    level coverage (players_aggregated_recent_minutes, both for qualifying/coverage
+    and for joined_minutes) still uses before_date directly -- that check wants the
+    most current read on a player's own recent form, not the older cutoff; only the
+    TEAM-side "prior roster" reference needs it.
+
+    current_roster_ids: optional override for "who's on the roster right now" --
+    defaults to current_roster_player_ids() (the live signal). Backtesting a PAST
+    season must pass a point-in-time squad instead (e.g. from roster_as_of_date), since
     the live default has no history.
 
-    cache: optional dict (BUG-011) memoizing team_roster_minutes(team_id, last_season)
-    and player_season_minutes(last_season) -- both fixed for an entire backfill run
-    (last season can't change while backtesting the current one), so a caller looping
-    over many matchdays/teams (e.g. a backfill script) can pass one dict created once
-    at the top of the loop and reused for the whole run, instead of re-running these
-    aggregates from scratch on every call. None (default) preserves the exact prior
-    behavior -- always recomputed, safe for one-off/live calls.
+    cache: optional dict (BUG-011) memoizing team_aggregated_recent_roster_minutes/
+    players_aggregated_recent_minutes within a single compute() call (this function is called
+    once per component -- attack, defense -- with identical inputs, so caching still
+    avoids a duplicate query pair per team per matchday). The window shifts every
+    matchday by design (matching load_team_players' own point-in-time-correct
+    cost), so this doesn't cache ACROSS matchdays -- only within one compute() call
+    at the same before_date. None (default) is a plain passthrough.
 
     NOTE: this is the INVERSE of the `w` convention used everywhere else in this file
     (blend(), soccer_player_team_strength.weight_attack/weight_defense -- there, 1.0
     means team-level). The inversion happens in exactly one place, resolve_blend_weight
     below, specifically so it isn't scattered across call sites.
 
-    No last-season history for team_id at all (e.g. backfill not run yet) -> 0.0
-    (caller falls back fully to team-level; not a crash)."""
-    last_season = season - 1
-    team_minutes = _memoized(cache, ("team_roster_minutes", team_id, last_season),
-                             lambda: team_roster_minutes(conn, team_id, last_season))
-    team_total_minutes = sum(team_minutes.values())
+    No recent-window history for team_id at all (e.g. backfill not run far back
+    enough yet, or fewer than `window` matches exist before before_date to even form
+    a current window, let alone a prior one to compare it against) -> 0.0 (caller
+    falls back fully to team-level; not a crash)."""
+    prior_cutoff = team_prior_window_cutoff_date(conn, team_id, before_date, n=window)
+    if prior_cutoff is None:
+        return 0.0
+    aggregated_recent_roster_minutes = _memoized(
+        cache, ("team_aggregated_recent_roster_minutes", team_id, prior_cutoff, window),
+        lambda: team_aggregated_recent_roster_minutes(conn, team_id, prior_cutoff, n=window))
+    team_total_minutes = sum(aggregated_recent_roster_minutes.values())
     if team_total_minutes <= 0:
         return 0.0
 
-    all_minutes = _memoized(cache, ("player_season_minutes", last_season),
-                            lambda: player_season_minutes(conn, last_season))
-    current_squad = current_squad_ids if current_squad_ids is not None else current_squad_player_ids(conn, team_id)
-    last_season_roster = set(team_minutes.keys())
+    current_roster = current_roster_ids if current_roster_ids is not None else current_roster_player_ids(conn, team_id)
+    aggregated_recent_roster = set(aggregated_recent_roster_minutes.keys())
 
-    qualifying = {p for p in current_squad if all_minutes.get(p, 0) >= PLAYER_RATING_MIN_MINUTES_FROM_PRIOR_SEASON}
-    coverage_minutes = sum(all_minutes.get(p, 0) for p in qualifying)
+    current_roster_minutes = _memoized(
+        cache, ("players_aggregated_recent_minutes", team_id, before_date, window),
+        lambda: players_aggregated_recent_minutes(conn, current_roster, before_date, n=window))
+
+    qualifying = {p for p in current_roster if current_roster_minutes.get(p, 0) >= PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW}
+    coverage_minutes = sum(current_roster_minutes.get(p, 0) for p in qualifying)
     data_coverage_score = min(coverage_minutes / team_total_minutes, 1.0)
 
-    departed = last_season_roster - current_squad
-    joined = current_squad - last_season_roster
-    departed_minutes = sum(team_minutes.get(p, 0) for p in departed)
-    joined_minutes = sum(all_minutes.get(p, 0) for p in joined)
+    departed = aggregated_recent_roster - current_roster
+    joined = current_roster - aggregated_recent_roster
+    departed_minutes = sum(aggregated_recent_roster_minutes.get(p, 0) for p in departed)
+    joined_minutes = sum(current_roster_minutes.get(p, 0) for p in joined)
     roster_change_score = min((departed_minutes + joined_minutes) / team_total_minutes, 1.0)
 
     return data_coverage_score * roster_change_score
 
 
-def resolve_blend_weight(conn, team_id, league, component, season, current_squad_ids=None, cache=None):
+def resolve_blend_weight(conn, team_id, league, component, before_date,
+                         current_roster_ids=None, cache=None,
+                         window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
     """Default per-team weight (`w`; 0=pure player, 1=pure team), with a league-wide
     override taking precedence per component (FEATURE-011_REQUIREMENTS.md, Blend).
-    current_squad_ids: see player_trust_score -- pass a point-in-time squad (e.g. from
-    squad_as_of_date) when backtesting a past season. cache: see player_trust_score
-    (BUG-011)."""
+    before_date: passed straight through to player_trust_score -- season-blind
+    (BUG-010, 2026-08-11/12), no season label or separate season-start anchor
+    involved. current_roster_ids: see player_trust_score -- pass a point-in-time
+    squad (e.g. from roster_as_of_date) when backtesting a past season. cache: see
+    player_trust_score (BUG-011). window: see player_trust_score -- compute()
+    threads its own player_window_size through here so the churn comparison stays
+    pinned to the SAME horizon as the ratings it's gating, per player_trust_score's
+    own docstring (not independently tunable from a call site)."""
     override = PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE.get(league, {}).get(component)
     if override is not None:
         return override
-    return 1.0 - player_trust_score(conn, team_id, season, current_squad_ids=current_squad_ids, cache=cache)
+    return 1.0 - player_trust_score(conn, team_id, before_date,
+                                    current_roster_ids=current_roster_ids, cache=cache,
+                                    window=window)
 
 
 def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZE, league="Serie A"):
@@ -568,27 +852,32 @@ def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZ
     Coverage caveat: only reaches as far back as player-level stats exist (seasons
     2023+ as of 2026-08-02) -- soccer_matches itself goes back to season 2022, so an
     early-season match's N-game lookback can hit a real, silent gap before that.
-    """
+
+    Team-filtered directly in SQL, not in Python (2026-08-12, performance -- the
+    same bug class BUG-010's 2026-08-11 load_team_players fix already addressed:
+    this query had no team filter at all, aggregating the ENTIRE league's player-
+    stats history on every single call, then discarding all but one team's rows in
+    Python. Became the dominant backfill cost once the multi-league expansion grew
+    this table -- 179 of 326 seconds in a live profile, 55% of one league-season's
+    runtime, made worse by being called TWICE per team per matchday with no
+    caching between callers. Two separate venue-scoped queries, each with its own
+    ORDER BY/LIMIT, mirror team_aggregated_recent_roster_minutes' own pattern)."""
     cur = conn.cursor()
-    cur.execute("""
-        SELECT s.match_id, m.match_date, s.venue, m.home_team_id, m.away_team_id,
-               SUM(s.xg) AS team_xg, MAX(s.club_xga_per90) AS team_xga
-        FROM soccer_player_stats s
-        JOIN soccer_matches m ON m.match_id = s.match_id
-        WHERE m.league = ? AND s.venue IS NOT NULL AND m.match_date < ?
-        GROUP BY s.match_id, s.venue
-    """, (league, before_date))
 
-    home_rows, away_rows = [], []
-    for match_id, match_date, venue, home_id, away_id, team_xg, team_xga in cur.fetchall():
-        match_team_id = home_id if venue == "home" else away_id
-        if match_team_id != team_id:
-            continue
-        (home_rows if venue == "home" else away_rows).append((match_date, team_xg, team_xga))
+    def venue_rows(venue, team_col):
+        cur.execute(f"""
+            SELECT m.match_date, SUM(s.xg) AS team_xg, MAX(s.club_xga_per90) AS team_xga
+            FROM soccer_player_stats s
+            JOIN soccer_matches m ON m.match_id = s.match_id
+            WHERE m.league = ? AND s.venue = ? AND m.{team_col} = ? AND m.match_date < ?
+            GROUP BY s.match_id
+            ORDER BY m.match_date DESC
+            LIMIT ?
+        """, (league, venue, team_id, before_date, n))
+        return cur.fetchall()
 
-    home_rows.sort(key=lambda r: r[0], reverse=True)
-    away_rows.sort(key=lambda r: r[0], reverse=True)
-    home_rows, away_rows = home_rows[:n], away_rows[:n]
+    home_rows = venue_rows("home", "home_team_id")
+    away_rows = venue_rows("away", "away_team_id")
 
     def avg(rows, idx):
         vals = [r[idx] for r in rows if r[idx] is not None]
@@ -601,19 +890,28 @@ def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZ
     }
 
 
-def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_PAST_MATCH_WINDOW_SIZE):
+def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_PAST_MATCH_WINDOW_SIZE, cache=None):
     """League-wide mean of each of get_team_xg_ratings' four fields across
     team_ids, at the same (league, before_date, n) every team_ids member will
-    be rated at -- the recentering point TEAM_RATING_XG_SPREAD_STRETCH stretches
-    around. Depends only on (league, before_date, n), not on which team is
+    be rated at -- the recentering point TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/
+    _DEFENSE stretch around. Depends only on (league, before_date, n), not on which team is
     currently being rated, so compute() calls this ONCE per call and passes the
     result to every team's team_level_lambda call, rather than each team
-    re-deriving the whole league's snapshot itself."""
+    re-deriving the whole league's snapshot itself.
+
+    cache: optional dict (BUG-011 pattern), memoizing get_team_xg_ratings by
+    (team_id, before_date, league, n) -- team_level_lambda queries the SAME
+    team's rating again independently right after this function runs for the
+    whole league, so without a shared cache every team gets queried twice per
+    matchday for no reason (2026-08-12, found in the same profile that surfaced
+    get_team_xg_ratings' missing team filter). None (default) is a plain
+    passthrough, identical to pre-2026-08-12 behavior."""
     fields = ("home_attack", "home_defense", "away_attack", "away_defense")
     sums = {f: 0.0 for f in fields}
     counts = {f: 0 for f in fields}
     for tid in team_ids:
-        ratings = get_team_xg_ratings(conn, tid, before_date, n=n, league=league)
+        ratings = _memoized(cache, ("get_team_xg_ratings", tid, before_date, league, n),
+                            lambda tid=tid: get_team_xg_ratings(conn, tid, before_date, n=n, league=league))
         for f in fields:
             if ratings[f] is not None:
                 sums[f] += ratings[f]
@@ -623,7 +921,9 @@ def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_
 
 def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=TEAM_PAST_MATCH_WINDOW_SIZE,
                       team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND,
-                      xg_spread_stretch=TEAM_RATING_XG_SPREAD_STRETCH, league_xg_means=None):
+                      xg_spread_stretch_attack=TEAM_RATING_XG_SPREAD_STRETCH_ATTACK,
+                      xg_spread_stretch_defense=TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE,
+                      league_xg_means=None, cache=None):
     """Home/away-split intrinsic attack/defense for a team from the EXISTING team-level
     system, mirroring estimate_lambdas()'s own fallback/shrink logic exactly
     (TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE/TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES, and now TEAM_PAST_MATCH_WINDOW_SIZE -- the old n=25 default here didn't match
@@ -671,27 +971,39 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
     a conservative choice (don't fully trust a blend unless BOTH sources have enough
     matches).
 
-    xg_spread_stretch (DEFAULT TEAM_RATING_XG_SPREAD_STRETCH -- see that constant's
-    comment for the full derivation): re-spreads the RAW xG ratings around the
-    league's own mean before they enter the blend above. Only takes effect when
-    league_xg_means is also given (the per-field league averages needed to recenter
-    on) -- this function only rates ONE team, so it can't compute a league-wide mean
-    itself without an extra full-league query; compute() calculates it once per call
-    and passes it down to every team rather than paying that cost per team. Callers
-    that don't pass league_xg_means (e.g. this function's own unit tests) get the
-    exact pre-2026-08-07 behavior regardless of xg_spread_stretch's value -- it's a
-    silent no-op without its companion, by design, so isolated tests of the blend
-    lever don't also need to fake up a league snapshot."""
+    xg_spread_stretch_attack/xg_spread_stretch_defense (DEFAULTS
+    TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE -- see those constants' comment
+    for the full derivation, including why they're separate): re-spreads the RAW
+    xG ratings around the league's own mean before they enter the blend above,
+    attack fields scaled by the attack factor and defense fields by the defense
+    factor. Only takes effect when league_xg_means is also given (the per-field
+    league averages needed to recenter on) -- this function only rates ONE team,
+    so it can't compute a league-wide mean itself without an extra full-league
+    query; compute() calculates it once per call and passes it down to every team
+    rather than paying that cost per team. Callers that don't pass league_xg_means
+    (e.g. this function's own unit tests) get the exact pre-2026-08-07 behavior
+    regardless of either stretch value -- it's a silent no-op without its
+    companion, by design, so isolated tests of the blend lever don't also need to
+    fake up a league snapshot.
+
+    cache: optional dict (BUG-011 pattern) -- see league_xg_field_means' docstring.
+    compute() calls league_xg_field_means for the WHOLE league right before
+    calling this function once per team, so without a shared cache this team's
+    own get_team_xg_ratings gets queried a second, redundant time here. None
+    (default) is a plain passthrough, identical to pre-2026-08-12 behavior."""
     goals_ratings = (get_team_ratings(conn, team_id, before_date, n=n, league=league, decay=1.0)
                      if team_xg_v_goals_blend < 1.0 else None)
-    xg_ratings = (get_team_xg_ratings(conn, team_id, before_date, n=n, league=league)
+    xg_ratings = (_memoized(cache, ("get_team_xg_ratings", team_id, before_date, league, n),
+                            lambda: get_team_xg_ratings(conn, team_id, before_date, n=n, league=league))
                  if team_xg_v_goals_blend > 0.0 else None)
-    if xg_ratings is not None and xg_spread_stretch != 1.0 and league_xg_means is not None:
+    if (xg_ratings is not None and league_xg_means is not None
+            and (xg_spread_stretch_attack != 1.0 or xg_spread_stretch_defense != 1.0)):
         xg_ratings = dict(xg_ratings)
         for field in ("home_attack", "home_defense", "away_attack", "away_defense"):
             v, m = xg_ratings[field], league_xg_means.get(field)
             if v is not None and m is not None:
-                xg_ratings[field] = m + (v - m) * xg_spread_stretch
+                factor = xg_spread_stretch_attack if "attack" in field else xg_spread_stretch_defense
+                xg_ratings[field] = m + (v - m) * factor
 
     def blend(field, n_field):
         g = goals_ratings[field] if goals_ratings is not None else None
@@ -728,9 +1040,12 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
 
 
 def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defense=None,
-           current_squad_ids_by_team=None, attack_xg_v_goals_source="xg", defense_xg_v_goals_source="xga",
+           current_roster_ids_by_team=None, attack_xg_v_goals_source="xg", defense_xg_v_goals_source="xga",
            team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND,
-           xg_spread_stretch=TEAM_RATING_XG_SPREAD_STRETCH,
+           xg_spread_stretch_attack=TEAM_RATING_XG_SPREAD_STRETCH_ATTACK,
+           xg_spread_stretch_defense=TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE,
+           player_spread_stretch_attack=PLAYER_RATING_SPREAD_STRETCH_ATTACK,
+           player_spread_stretch_defense=PLAYER_RATING_SPREAD_STRETCH_DEFENSE,
            player_window_size=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
            player_window_decay=PLAYER_RATING_PAST_MATCH_WINDOW_DECAY,
            player_window_min_date=None, cache=None):
@@ -746,14 +1061,26 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     (matches poisson_v3 exactly); values in between blend the two -- see that
     function's docstring (BUG-009's mismatch-size-compression diagnosis).
 
-    xg_spread_stretch: passed through to team_level_lambda, along with a
-    league_xg_means snapshot computed ONCE per compute() call (via
-    league_xg_field_means) across all of team_ids -- see TEAM_RATING_XG_SPREAD_STRETCH's
-    comment for the full derivation. 1.3 (default) is the largest factor tested that
-    stays inside the Model Calibration bias target in both seasons; pass 1.0 to
-    reproduce the exact pre-2026-08-07 shape. Skipped entirely (no snapshot query) when
-    team_xg_v_goals_blend is exactly 0.0 -- xG never enters the rating at that boundary,
-    so there's nothing to stretch.
+    xg_spread_stretch_attack/xg_spread_stretch_defense: passed through to
+    team_level_lambda, along with a league_xg_means snapshot computed ONCE per
+    compute() call (via league_xg_field_means) across all of team_ids -- see
+    TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE's comment for the full
+    derivation, including why attack and defense are separate constants (2026-08-12).
+    1.3/1.3 (defaults) match the original shared-factor default; pass 1.0/1.0 to
+    reproduce the exact pre-2026-08-07 shape. Skipped entirely (no snapshot query)
+    when team_xg_v_goals_blend is exactly 0.0 -- xG never enters the rating at that
+    boundary, so there's nothing to stretch.
+
+    player_spread_stretch_attack/player_spread_stretch_defense: the SAME kind of
+    re-spread as the xg_spread_stretch pair above, one level down -- applied to
+    raw[tid]["ra"]/["rd"] (the per-team player-level attack/defense rate, BEFORE
+    the avg_home/attack_mean unit-conversion step, which is a pure linear rescale
+    that doesn't touch relative dispersion) around attack_mean/defense_mean, the
+    same league-wide means already computed below for that conversion. See
+    PLAYER_RATING_SPREAD_STRETCH_ATTACK/_DEFENSE's comment for the compression
+    measurement that motivated this (2026-08-12, BUG-010 continued). 1.0/1.0
+    (defaults) are a true no-op -- unlike the team-level pair, these have no
+    calibrated non-1.0 value yet.
 
     player_window_size, player_window_decay: passed through to load_team_players --
     see that function's docstring. Not yet independently tuned (starting values match
@@ -766,9 +1093,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     (2026-08-06, replacing blend_prior_season_attack/PRIOR_SEASON_DISCOUNT) can be
     validated against bias/ROI the same way team_xg_v_goals_blend's rollout was.
 
-    current_squad_ids_by_team: optional {team_id: set(player_id)} override for the
+    current_roster_ids_by_team: optional {team_id: set(player_id)} override for the
     blend-weight "current squad" signal, passed through to resolve_blend_weight per
-    team -- pass this (built from squad_as_of_date per team) when backtesting a past
+    team -- pass this (built from roster_as_of_date per team) when backtesting a past
     season; leave None for live use. before_date is threaded through
     load_team_players and get_league_averages too, for the same reason: computing a
     PAST match's lambdas must only see data that existed before that match (live use,
@@ -788,8 +1115,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                                 min_date=player_window_min_date)
     apply_shrinkage(by_team)
 
-    league_xg_means = (league_xg_field_means(conn, team_ids, before_date, league=league)
-                       if xg_spread_stretch != 1.0 and team_xg_v_goals_blend > 0.0 else None)
+    league_xg_means = (league_xg_field_means(conn, team_ids, before_date, league=league, cache=cache)
+                       if (xg_spread_stretch_attack != 1.0 or xg_spread_stretch_defense != 1.0)
+                       and team_xg_v_goals_blend > 0.0 else None)
 
     raw = {}
     for tid, players in by_team.items():
@@ -811,6 +1139,21 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                      and r["dw"] >= PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE]
     attack_mean = mean(attack_vals) if attack_vals else None
     defense_mean = mean(defense_vals) if defense_vals else None
+
+    # Player-level counterpart to xg_spread_stretch_attack/_defense above (2026-08-12,
+    # BUG-010 continued) -- MUST happen here, before the avg_home/attack_mean unit
+    # conversion below, since that conversion is a pure linear rescale (multiply by a
+    # constant) that doesn't change relative dispersion at all; stretching after it
+    # would be a no-op in effect. Recenters each team's raw player-level rate around
+    # the SAME league mean the unit conversion itself uses, so the mean is preserved.
+    if player_spread_stretch_attack != 1.0 and attack_mean is not None:
+        for r in raw.values():
+            if r["ra"] is not None:
+                r["ra"] = attack_mean + (r["ra"] - attack_mean) * player_spread_stretch_attack
+    if player_spread_stretch_defense != 1.0 and defense_mean is not None:
+        for r in raw.values():
+            if r["rd"] is not None:
+                r["rd"] = defense_mean + (r["rd"] - defense_mean) * player_spread_stretch_defense
 
     results = {}
     for tid, players in by_team.items():
@@ -842,7 +1185,9 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         team_home_attack, team_away_attack, team_home_defense, team_away_defense = \
             team_level_lambda(conn, tid, league, before_date, avg_home, avg_away,
                               team_xg_v_goals_blend=team_xg_v_goals_blend,
-                              xg_spread_stretch=xg_spread_stretch, league_xg_means=league_xg_means)
+                              xg_spread_stretch_attack=xg_spread_stretch_attack,
+                              xg_spread_stretch_defense=xg_spread_stretch_defense,
+                              league_xg_means=league_xg_means, cache=cache)
 
         def blend(player_val, team_val, w):
             # team_val is always defined now (team_level_lambda falls back to the
@@ -851,11 +1196,13 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                 return team_val, 1.0
             return (1 - w) * player_val + w * team_val, w
 
-        squad_ids = current_squad_ids_by_team.get(tid) if current_squad_ids_by_team is not None else None
+        roster_ids = current_roster_ids_by_team.get(tid) if current_roster_ids_by_team is not None else None
         w_att = w_attack if w_attack is not None else resolve_blend_weight(
-            conn, tid, league, "attack", season, current_squad_ids=squad_ids, cache=cache)
+            conn, tid, league, "attack", before_date,
+            current_roster_ids=roster_ids, cache=cache, window=player_window_size)
         w_def = w_defense if w_defense is not None else resolve_blend_weight(
-            conn, tid, league, "defense", season, current_squad_ids=squad_ids, cache=cache)
+            conn, tid, league, "defense", before_date,
+            current_roster_ids=roster_ids, cache=cache, window=player_window_size)
         attack_home_blend, w_a_used = blend(la_player_home, team_home_attack, w_att)
         attack_away_blend, _ = blend(la_player_away, team_away_attack, w_att)
         defense_home_blend, w_d_used = blend(ld_player_home, team_home_defense, w_def)

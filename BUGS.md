@@ -389,13 +389,41 @@ end-to-end on a real Serie A season backfill (380 matches, 2025): **625s -> 248s
 1 pre-existing (unrelated, documented-as-expected-to-fail) failure, same as before
 this change — no behavior change for any existing caller.
 
+**2026-08-12 addendum: same class of bug found and fixed one level down, in
+`get_team_xg_ratings()`.** Profiled a live backfill again after the multi-league
+expansion made runs slow enough to matter (~30min for a full metrics validation
+pass) — `get_team_xg_ratings` (queries a team's own recent xG/xGA rows) had NO team
+filter in its SQL at all, the exact same bug class as `load_team_players` (see
+BUG-010's 2026-08-11/12 entry) — it pulled matches for every team in the league on
+every call, filtering in Python afterward. Fixed by rewriting its two queries
+(`venue_rows("home", ...)` / `venue_rows("away", ...)`) to filter by `team_id` in
+SQL directly with `ORDER BY match_date DESC LIMIT n`. Also found and fixed a
+redundant double-call of the same function for the same `(team_id, before_date,
+league, n)` between `league_xg_field_means` and `team_level_lambda` — memoized with
+the same `_memoized(cache, key, fn)` helper this bug's original fix introduced.
+**Verified byte-identical**: backed up `soccer_model_predictions` before the change,
+re-ran a full backfill after, diffed every prediction field (`p_home`, `p_draw`,
+`p_away`, `lambda_home`, `lambda_away`) row-by-row — exact match, confirming this is
+pure performance work with zero behavior change. Measured: 2.25x faster (one
+league-season backfill, 5:11 -> 2:18) — short of an initial ~8-15x profile-based
+estimate, owned as an overpromise rather than defended; the real bottleneck besides
+this fix is CPU-bound `compute()` work itself, not further redundant queries.
+
 ---
 
 ## BUG-010 — poisson_v4 (player-level xG blend, FEATURE-011) generates wildly overconfident home-win probabilities for underdog home teams, driving negative ROI despite clearing the bias criterion
 
 - **Type:** model calibration (tail behavior) · **Severity:** high (this is the concrete
   lead behind poisson_v4/poisson_v4_teamxg's negative ROI at every EV threshold, both
-  seasons tested) · **Status:** OPEN, root cause not yet located. Logged 2026-08-02.
+  seasons tested) · **Status:** OPEN -- THREE real contributing mechanisms found and
+  fixed 2026-08-11/12 (two in the trust-score window that gates player-vs-team-level
+  blending -- a season-label lookup bug, then a static once-per-season anchor -- and a
+  third, a cross-league defense-gating asymmetry), plus a structural player-level
+  rating-compression issue found with a fix mechanism now partially calibrated
+  (attack-side stretch locked in at 2.0, defense-side sweep pending). Confirmed to
+  meaningfully help but NOT to be the full root cause (ROI still mixed/flat, aggregate
+  home bias now ~eliminated but Brier ticked up). Logged 2026-08-02, see progress
+  notes below.
 
 **Context.** FEATURE-011's player-level blend (`compute_club_player_strength.py`,
 method `poisson_v4`/`poisson_v4_teamxg`) cleared the Model Calibration success
@@ -435,6 +463,297 @@ issue that under-trusts team-level (stabilizing) signal specifically for weak te
 `ev=+1.7`, `model_p=0.418` vs `implied_p=0.154` case in 2025-26) and trace which
 component (player blend vs. team xG rating vs. blend weight) is producing the inflated
 home lambda for that team/date.
+
+**2026-08-11/12 progress: ONE real contributing mechanism found and fixed --
+Status stays OPEN, this is not the root cause, just a confirmed contributor.**
+Revisited BUG-010 after the multi-league expansion (FEATURE-014) gave 5x the data to
+check the pattern against. Doing exactly what the "Next step" above asked -- pulling
+the actual worst home-underdog blowups and tracing the blend components -- found:
+
+`player_trust_score()`'s "prior roster" reference was hard-coded to a literal
+`season - 1` DATABASE LABEL, not an actual date lookback. Any league with nothing
+under that specific label (a newly-added league's first tracked season) collapsed
+EVERY team's trust to a hard 0.0 -- confirmed directly: Holstein Kiel hosting FC
+Bayern München (2024-09-14, `model_p_home=0.410` vs market-implied `0.091`) had
+BOTH teams at exactly `trust=0.000`, not because either team's player data was bad,
+but because the database had no rows under the literal season label "2023" for
+either. 17 of the 20 worst home-underdog blowups checked showed this same exact
+signature (both teams' trust hard-zero).
+
+Fixing this took more than the season-label swap -- two more real bugs surfaced
+along the way, all part of the same fix:
+- The replacement window (team's own last N matches, season-blind) initially still
+  overlapped with "current roster" (this season's own matches are always inside
+  "the last N matches"), so a genuinely NEW signing could never register as
+  "joined" -- only departures were detectable. Fixed by anchoring the prior-roster
+  window to the season's own start date (`league_season_start_date()`), not
+  `before_date` -- two genuinely non-overlapping periods to compare.
+- `PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW` (900.0) was calibrated for the OLD
+  definition (a whole season's minutes, thousands available) but the new window
+  caps at 900 minutes MAXIMUM (10 games x 90 min) -- checked directly against 241
+  real roster slots across 10 Serie A teams: only 1 player (0.4%) could ever clear
+  900 under the new definition, so `data_coverage_score` was ~always 0 regardless
+  of real roster quality. Recalibrated to 300 (data-driven, not fitted -- ~48% of
+  real roster slots clear it; no natural gap/step exists in the real distribution,
+  it's a smooth curve, so this is a reasoned choice, not a discovered constant).
+- `load_team_players()` (pre-existing, untouched until now) had NO team/player
+  filter in its SQL at all -- pulled the entire `soccer_player_stats` table on
+  every single call, filtering in Python afterward. Harmless when this was written
+  against a much smaller dataset; became the dominant backfill cost (15 of 23s in
+  a live profile) once this session's multi-league expansion + a new 2023-season
+  backfill (added specifically to give the fixed trust mechanism real historical
+  depth) grew the table past what it was designed for. Fixed by narrowing to a
+  candidate player pool (who's appeared in the requested teams' own last N
+  matches) before the full history fetch -- 2.6x faster (781ms -> 298ms per
+  `compute()` call), and arguably MORE correct, not just faster: a player who
+  hasn't appeared in longer than the team's own recent match window isn't
+  plausibly part of what the team's doing now, so excluding them is right, not a
+  lossy shortcut.
+
+Also renamed the core concepts throughout (`squad` -> `current_roster`,
+`recent_roster` -> `aggregated_recent_roster`) for clarity, per direct user
+request while working through the design.
+
+**Validation, on the actual case that found this (not just the aggregate ROI number
+alone):** Holstein Kiel vs Bayern's `model_p_home` moved from 0.410 to 0.333 (market-implied:
+0.091) -- real, meaningful, but not resolved. Across the worst 15 home-underdog
+blowups league-wide, combined EV severity dropped ~11% (35.4 -> 31.5) and the count
+of extreme cases (EV>2.5) dropped from 7 to 5. All-up Brier improved 0.5619 ->
+0.5487. **ROI is still negative at every threshold, and the general weak-home-vs-
+elite-away overconfidence pattern still shows up** (new worst case: Burnley hosting
+Manchester City, `model_p=0.247` vs `implied=0.053`) -- reduced, not eliminated.
+Full numbers: `model_snapshots/20260811_202910_all_leagues_poisson_v4.txt`.
+
+**Conclusion: this was a real, confirmed contributing mechanism, not THE root
+cause.** Status stays OPEN. Next step, same shape as before: pull the NEW worst
+blowup cases (Burnley/Man City is the current #1) and trace which component is
+still producing the inflated home probability now that the trust-score cliff is
+fixed -- the original "leading candidates" list above (xG small-sample instability
+for weak teams, a still-imperfect blend-weight resolution) is still the live
+hypothesis set.
+
+**2026-08-12 progress: a SECOND, distinct mechanism found and fixed in the same
+trust-score window -- still not THE root cause, Status stays OPEN.** Traced the
+new worst case named above (Burnley hosting Manchester City, 2026-04-22).
+
+**Finding.** Both teams' `resolve_blend_weight` had collapsed to near-zero team
+weight (Burnley: `weight_team=0.019`, i.e. 98% pure player-level; Man City:
+`0.253`) -- NOT because of the season-label bug (already fixed), but because
+`player_trust_score`'s "prior roster" reference was anchored to `season_start_date`
+(2026-08-11's own fix), computed once and reused for EVERY matchday for the rest
+of the season. This match is 2026-04-22 -- 8+ months after Burnley's summer
+transfer window. By then Burnley's team-level rating (`TEAM_PAST_MATCH_WINDOW_SIZE
+=10`) was built entirely from real games WITH the current roster (a solid, current
+signal on a struggling promoted side: weak home attack 1.098, leaky home defense
+1.898), but the trust score still compared today's roster against the stale August
+snapshot, measured churn at 0.98, and threw the team-level signal away almost
+entirely in favor of the player-level read -- which rated Burnley's home attack
+higher (1.321) and, critically, their home defense as LEAKING LESS (1.451 vs
+team-level's 1.898). With near-zero team weight, the blend took the optimistic
+player-level numbers almost unchanged, driving `p_home` to 0.247 against a
+market-implied 0.053-0.063.
+
+**Root cause: the reference window was computed once but compared against a
+window (`team_level_lambda`'s own last-10-matches rating) that moves every
+matchday -- an illogical mismatch once you notice it.** User's diagnosis,
+confirmed without needing further evidence. Fixed by replacing the
+`season_start_date` anchor with `team_prior_window_cutoff_date()`: the "prior
+roster" is now the team's own `window` matches immediately preceding its CURRENT
+`window`-match window (the same one `team_level_lambda`'s rating is built from) --
+two adjacent, non-overlapping periods, both anchored to `before_date`, that
+genuinely shift forward every matchday. A squad overhaul now reads as "new" right
+after it happens and stops being flagged once enough same-roster matches exist to
+fill its own window, instead of staying flagged for an entire season.
+`player_trust_score`/`resolve_blend_weight` no longer take a `season_start_date`
+parameter at all (removed, along with the now-dead `league_season_start_date()`);
+`resolve_blend_weight` gained a `window` passthrough so `compute()`'s own
+`player_window_size` stays the SAME horizon the churn check uses, per
+`player_trust_score`'s own documented invariant.
+
+**Validation, on the case that found it:** Burnley/Man City's `model_p_home`
+moved from 0.247 to 0.108 (market-implied: ~0.06) -- the gap shrank from +0.184 to
++0.049, and the match dropped out of the top-15 worst blowups entirely. Across the
+worst 15 home-underdog blowups league-wide (same method as 2026-08-11's check,
+re-run fresh since the ranking shifts as the worst cases change), combined EV
+severity dropped ~24% (31.5 -> 23.9) and extreme cases (EV>2.5) dropped from 5 to
+2. Aggregate home bias, the direct symptom this bug family targets, is
+essentially eliminated: `home=-0.0060` -> `home=+0.0000` (all-up, vs Betfair
+Exchange). **Mixed on the other two numbers, reported honestly rather than
+cherry-picked:** all-up Brier ticked UP slightly (0.5487 -> 0.5586, n=7066) and
+ROI stayed flat/mixed across thresholds (EV>0%: -7.5%->-7.7%; EV>5%:
+-8.2%->-8.0%; EV>10%: -6.7%->-7.5%). A small Brier regression alongside a clear
+bias improvement is plausible (more probability mass now sits nearer 0.5 for
+teams whose churn genuinely does carry real signal, trading some sharpness for
+correctness) but not yet explained instead of assumed. Full numbers:
+`model_snapshots/20260812_103003_all_leagues_poisson_v4.txt`.
+
+**2026-08-12: corrected an inaccurate claim used repeatedly in this file --
+"ROI is too noisy to trust at this sample size" is FALSE for the pooled all-up
+number itself.** Computed the real statistics instead of assuming: at n=6988
+individual bets (ALL-UP, EV>0%, both markets pooled), per-bet stdev is 1.40,
+giving a standard error of 1.67% on the mean -- the current -7.7% ROI has a 95%
+CI of [-11.0%, -4.4%], entirely below zero (t=-4.61). That is a statistically
+robust, trustworthy finding: the model does NOT currently have a betting edge,
+and this is not an artifact of insufficient data. A power calculation (80%
+power, 95% confidence, sigma=1.4) shows why: detecting an effect as large as the
+current -7.7% needs only ~2,600 bets, well within what we already have; only
+detecting something much SMALLER -- e.g. a modest 2% edge -- would need ~38,000
+bets (~10+ more seasons at current volume). What genuinely IS underpowered is a
+narrower claim this file has sometimes conflated with the above: comparing two
+MODEL VERSIONS against each other on a small delta (e.g. this entry's own
+-7.5%->-7.7% shift after the 2026-08-12 fix, well within the ±1.67% SE) --
+that specific before/after comparison can't be read confidently, but "is the
+model currently profitable" can. Caveat: this treats bets as independent, which
+is generous (bets share correlated risk via the same underlying model bias
+across a league/team), so the true noise floor is likely somewhat worse than
+these numbers suggest -- not corrected for here.
+
+**Conclusion: a second real, confirmed contributing mechanism inside the SAME
+trust-score window, not THE root cause.** Status stays OPEN. Both fixes so far
+have targeted the player-vs-team blend weight specifically; the original "leading
+candidates" (xG small-sample instability for weak teams, a still-imperfect
+blend-weight resolution beyond just the window boundary) remain the live
+hypothesis set. Next step: pull the current worst blowup case fresh (re-run the
+same top-15 query against `soccer_model_predictions`/`soccer_market_odds` -- the
+ranking has shifted now that Burnley/Man City is gone) and trace it the same way.
+
+**2026-08-12 progress: a THIRD mechanism found and fixed (cross-league defense
+gating asymmetry), plus a structural compression issue found and a fix mechanism
+built (not yet calibrated) -- Status stays OPEN.** Traced the next blowup case
+(Real Oviedo hosting Real Madrid) the same way as the two prior fixes -- corrected
+a methodology slip along the way (only 2 teams were passed to `compute()` instead
+of the full league, which `attack_mean`/`defense_mean` need; corrected result:
+`p_home` 0.385 -> 0.349, still far from the market).
+
+**Finding 1 (fixed): `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT` gated/scaled
+ATTACK only.** This constant exists to exclude/scale games from leagues whose goal
+rate isn't calibrated against the primary set (currently only Serie B, factor
+0.663, empirically derived) so they don't distort a team's rating. The gate was
+only ever applied on the attack side of `load_team_players()`'s per-game loop --
+defense accumulated minutes/goals-against from EVERY league a player appeared in,
+uncalibrated or not, unscaled. Fixed to gate (include/exclude) both attack and
+defense symmetrically -- a game from an uncalibrated league is now excluded from
+both accumulators, not just attack. The numeric 0.663 scaling factor itself stays
+attack-only (not applied to defense) since it was derived from an attack-specific
+self-comparison study with no validated defensive meaning -- reusing it for
+defense without evidence would be exactly the kind of guessed-not-measured
+constant this project avoids; extending it to defense is future work, pending its
+own analysis.
+
+**Finding 2 (fix built, not yet calibrated): player-level attack/defense ratings
+are structurally compressed vs. team-level xG ratings, mirroring BUG-009's
+already-fixed team-level compression issue one level down.** Continuing to dig on
+the same Oviedo/Real Madrid match ("what else pops up as incorrect") found
+player-level CV (coefficient of variation, stdev/mean -- the same diagnostic
+BUG-009 used) is consistently lower than the corresponding team-level xG CV,
+measured on La Liga 2025: player-level away-attack CV=0.157 vs team-level xG
+away-attack CV=0.246; player-level home-defense CV=0.082 vs team-level xG
+home-defense CV=0.200 (defense more compressed than attack, and more severely than
+at the team level). Verifying whether team-level itself already has this
+attack/defense asymmetry (it did: goals/xG CV ratio ~1.64 for defense vs ~1.39 for
+attack, La Liga 2025) motivated **splitting the existing shared
+`TEAM_RATING_XG_SPREAD_STRETCH` into `TEAM_RATING_XG_SPREAD_STRETCH_ATTACK`/
+`_DEFENSE`** (both start at the prior shared value, 1.3 -- unchanged-behavior
+starting point, team defense not yet separately recalibrated) and **building an
+analogous new player-level mechanism**, `PLAYER_RATING_SPREAD_STRETCH_ATTACK`/
+`_DEFENSE`, recentering each team's raw player-level attack/defense rate around
+the league mean before the home/away unit conversion (`stretched = mean + (raw -
+mean) * factor`, same formula as the team-level version). Shipped first as pure
+plumbing (both new player-level constants at 1.0, a true no-op) and verified
+byte-identical via the same before/after row-level prediction diff used for the
+BUG-011 performance fix above.
+
+**Player-level attack calibration (2026-08-12, 5 leagues, season 2025, all-up
+pooled): swept 1.0/1.3/1.6/2.0/2.5/3.0.** Bias vs Betfair Exchange never breached
+the +/-0.01-0.02 target even at 3.0 (away bias only reached +0.0154) -- no hard
+ceiling from that criterion. But Brier degraded monotonically across the range
+(0.5689 at 1.0 -> 0.5728 at 3.0) while ROI improvement plateaued after 2.0 (all
+three EV thresholds sat in a tight -9.3% to -10.1% band from 2.0 through 3.0, vs
+-11.8%/-11.1%/-10.5% at 1.0) -- past 2.0, further stretch bought steady Brier cost
+for no further ROI gain. **Shipped `PLAYER_RATING_SPREAD_STRETCH_ATTACK = 2.0`**
+(the value capturing nearly all the ROI improvement while Brier degradation is
+still modest, +0.001 vs baseline) -- production `poisson_v4` re-backfilled across
+all 10 league-seasons with this default. `PLAYER_RATING_SPREAD_STRETCH_DEFENSE`
+still 1.0 (not yet calibrated), then `TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE`
+after that, per the same discipline.
+
+**Conclusion: a third real, confirmed contributing mechanism (defense gating),
+plus a real structural issue (player-level compression) with a fix mechanism now
+partially calibrated -- neither is confirmed as THE root cause.** Status stays
+OPEN. Next: calibrate `player_spread_stretch_defense`, then
+`team_xg_spread_stretch_defense`, then re-trace the current worst blowup case
+fresh with all fixes applied.
+
+**2026-08-12: `player_spread_stretch_defense` swept (1.0/1.5/2.0/2.5/3.0, 5
+leagues, season 2025, attack held at its locked 2.0) -- NOT calibrated away from
+1.0 (no-op), on stronger evidence than "ROI didn't move."** Three independent
+checks all point the same direction: (1) aggregate ROI is flat-to-worse at every
+candidate above 1.0, not just noisy-flat; (2) aggregate Brier degrades
+monotonically across the whole range (0.5699 -> 0.5730), the same shape as the
+attack sweep's Brier cost, but attack bought real ROI improvement for that cost
+and defense didn't; (3) a targeted check against the exact population this bug
+exists to fix -- the current top-15 worst home-win-overconfidence blowups -- found
+13 of 15 got MORE overconfident (`p_home` higher) as defense stretch increased
+from 1.0 to 3.0, not less, including Atlético Madrid (an elite defense the
+player-level signal already rates as roughly average, made more extreme by the
+stretch).
+
+Investigated WHY defense behaves differently from attack given both showed real
+compression (the original motivation) -- one hypothesis (defense's raw
+player-level signal correlates more weakly with the team-level xG reference than
+attack's does, so stretching it amplifies more noise) was tested directly and
+**did not hold up**: Pearson r between raw player-level rating and team-level xG
+rating, averaged across all 5 leagues, is 0.722 for attack vs 0.699 for
+defense -- both moderate, not meaningfully different. **The attack/defense
+asymmetry in this sweep's results is real (three consistent, independent
+signals) but its root cause is NOT understood -- flagged here as an open
+question rather than closed with an unverified explanation**, since the first
+attempted explanation didn't survive being checked against real data. Worth
+revisiting if a future investigation needs it; not blocking -- the mechanism
+(`PLAYER_RATING_SPREAD_STRETCH_DEFENSE`) stays in the codebase, fully built and
+tested, just left at its no-op default pending better evidence to move it.
+
+**2026-08-12: `team_xg_spread_stretch_defense` swept fast/cheap (2-league pilot
+first, then a targeted 5-league confirmation of just the leading candidate --
+NOT a full 5-league x N-candidate sweep, per explicit direction to fail fast on a
+dead end rather than spend the same hours again) -- NOT calibrated away from its
+inherited 1.3.** Pilot (Serie A + Premier League only, n=1580): 1.0/1.6/2.3/2.6
+showed a real, monotonic-ish ROI improvement (-5.9%/-3.4%/-3.8% at 1.0 up to
+-3.6%/-0.1%/+0.8% at 2.3) with away bias approaching but not yet breaching the
+target at 2.3 (+0.0190). Confirming 2.3 at full 5-league scale changed the
+picture: away bias +0.0195 AND draw bias -0.0181 -- both now sitting right at the
++/-0.02 ceiling, not comfortably inside it the way the pilot suggested. Brier
+cost was also far steeper than any other stretch calibrated this session
+(0.5656 -> 0.5955, +0.0299 -- roughly 10x the player-attack stretch's Brier
+cost for its whole tested range). The ROI deltas (+0.3%/+0.2%/+2.1% at
+EV>0/5/10%, n~2200-3600) don't clear this same file's own established
+significance bar (SE~2.4-3.0% at this n) -- this is exactly the underpowered
+"version-to-version delta" case flagged in the 2026-08-12 ROI-noise correction
+above, not the well-powered "is there an edge" case. **Conclusion: no real
+signal survives scrutiny here (Brier and bias both argue against moving, ROI
+doesn't clear its own noise floor) -- left at 1.3.** Total cost: ~15 backfill
+runs (2-league pilot x 4 values + 5-league confirmation x 2 values) vs. ~50 for
+a full blind sweep -- the fail-fast approach caught this before spending the
+same hours the player-defense sweep did.
+
+**Net result of the whole four-constant spread-stretch effort (2026-08-12):**
+only ONE of the four constants actually moved --
+`PLAYER_RATING_SPREAD_STRETCH_ATTACK` (1.0 -> 2.0); the other three
+(`TEAM_RATING_XG_SPREAD_STRETCH_ATTACK`=1.3, `_DEFENSE`=1.3,
+`PLAYER_RATING_SPREAD_STRETCH_DEFENSE`=1.0) are unchanged from their pre-session
+values, each now backed by real tested-and-rejected evidence rather than being
+untested assumptions. The one real change: Brier flat (0.5689->0.5699, +0.001),
+bias unchanged inside target, ROI ~2 points better at every EV threshold
+(-11.8%/-11.1%/-10.5% -> -9.7%/-9.5%/-9.5%) -- a modest, plateau-shaped
+improvement (credible because it's the stable endpoint of a 6-point monotonic-ish
+sweep, not because any single before/after delta is independently significant).
+**BUG-010 is NOT resolved by this** -- aggregate ROI is still solidly negative
+(the real, statistically-confirmed finding from the 2026-08-12 correction above).
+This is one more modest, partial contributor stacked on the trust-score-window
+and cross-league-gating fixes already made, plus two now-disconfirmed hypotheses
+(player-defense stretch, team-defense stretch) that no longer need re-testing by
+a future investigation, plus a real, separate correctness bug fixed along the way
+(defense cross-league gating). Status stays OPEN.
 
 ---
 
@@ -556,6 +875,21 @@ debuts, long-benched-then-starting players) via existing external signals -- not
 same-day lineups -- is worth doing when convenient; a heavier system is not justified
 by this ceiling. Worth revisiting once a low-cost data source for those signals is
 identified.
+
+**2026-08-11: open design question -- how much (if at all) should roster changes
+impact player trust / blend?** Logged while investigating BUG-010's root cause,
+explicitly deferred by the user ("a conversation for another time"), not scoped or
+started. Current `player_trust_score()` requires BOTH good data coverage on the
+current squad AND meaningful roster change since last season before leaning on
+player-level data at all (a stable, well-tracked squad gets zero credit for good
+player data, on the theory that team-level would already agree with it). User's
+pushback: if the player-level data is good and the algorithm computing team-level
+IMPACT from it is trusted, why not generically bias toward player-level over
+team-level regardless of roster churn -- never necessarily 100% player (team
+performance is still what ultimately matters), but the roster-change gate feels
+like it's withholding a signal that should help even when the roster hasn't
+turned over. Not resolved either way; needs its own scoping conversation, separate
+from BUG-010's fix.
 
 ---
 

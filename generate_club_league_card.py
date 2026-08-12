@@ -8,7 +8,7 @@ Runs the REAL player-blend pipeline (compute_club_player_strength.compute() +
 core.poisson_model.analyse_match_wc()), the same one backfill_player_blend_
 predictions.py uses to build soccer_model_predictions for backtesting -- until now
 nothing in the live path benefited from FEATURE-011/BUG-009/BUG-010's work at all.
-current_squad_ids_by_team is left None (compute()'s live-use default: current actual
+current_roster_ids_by_team is left None (compute()'s live-use default: current actual
 roster, not a point-in-time reconstruction).
 
 Applies CLUB_LEAGUE_MIN_PICK_PROBABILITY as a guardrail (BUG-003's pattern, via the

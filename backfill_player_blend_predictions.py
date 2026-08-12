@@ -8,7 +8,7 @@ FEATURE-011_BUILD_TRACKER.md (task 5).
 Point-in-time correct throughout, mirroring analyse_match()'s no-lookahead discipline
 (BUG-008) -- for each match, the player-level lambda (compute_club_player_strength.
 load_team_players' before_date), the blend weight's "current squad" signal
-(squad_as_of_date, NOT soccer_players.team_id -- see that function's docstring for
+(roster_as_of_date, NOT soccer_players.team_id -- see that function's docstring for
 why the live signal can't be used for a past season), and the league baseline
 (get_league_averages' before_date) are all computed using ONLY data that existed
 strictly before that match. Team-level ratings reuse the existing, already-safe
@@ -75,12 +75,31 @@ def main():
                              "compression diagnosis and compute_club_player_strength."
                              "team_level_lambda's docstring. Never changes poisson_v3 "
                              "or core.poisson_model either way.")
-    parser.add_argument("--xg-stretch", dest="xg_spread_stretch", type=float,
-                        default=strength.TEAM_RATING_XG_SPREAD_STRETCH,
-                        help="Team-level xG rating spread multiplier (default: the shipped "
-                             "TEAM_RATING_XG_SPREAD_STRETCH, currently 1.3). 1.0 reproduces "
-                             "the pre-2026-08-07 shape exactly -- see that constant's comment "
-                             "and BUG-009's 2026-08-07 addendum.")
+    parser.add_argument("--xg-stretch-attack", dest="xg_spread_stretch_attack", type=float,
+                        default=strength.TEAM_RATING_XG_SPREAD_STRETCH_ATTACK,
+                        help="Team-level xG attack-rating spread multiplier (default: the "
+                             "shipped TEAM_RATING_XG_SPREAD_STRETCH_ATTACK, currently 1.3). "
+                             "1.0 reproduces the pre-2026-08-07 shape exactly -- see that "
+                             "constant's comment and BUG-009's 2026-08-07 addendum.")
+    parser.add_argument("--xg-stretch-defense", dest="xg_spread_stretch_defense", type=float,
+                        default=strength.TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE,
+                        help="Team-level xG defense-rating spread multiplier -- see "
+                             "--xg-stretch-attack and TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE's "
+                             "comment (split from a single shared constant 2026-08-12, "
+                             "BUG-010 continued: defense showed more xG-vs-goals compression "
+                             "than attack).")
+    parser.add_argument("--player-stretch-attack", dest="player_spread_stretch_attack", type=float,
+                        default=strength.PLAYER_RATING_SPREAD_STRETCH_ATTACK,
+                        help="Player-level attack-rating spread multiplier, same mechanism "
+                             "as --xg-stretch-attack one level down -- see "
+                             "PLAYER_RATING_SPREAD_STRETCH_ATTACK's comment. Default is the "
+                             "shipped, calibrated 2.0 (2026-08-12 sweep); pass 1.0 for the "
+                             "true no-op.")
+    parser.add_argument("--player-stretch-defense", dest="player_spread_stretch_defense", type=float,
+                        default=strength.PLAYER_RATING_SPREAD_STRETCH_DEFENSE,
+                        help="Player-level defense-rating spread multiplier -- see "
+                             "--player-stretch-attack and "
+                             "PLAYER_RATING_SPREAD_STRETCH_DEFENSE's comment.")
     parser.add_argument("--player-window-min-date", default=None,
                         help="Comparison/validation only: an ISO date lower bound "
                              "(e.g. a season start date) that stops the player-level "
@@ -120,14 +139,17 @@ def main():
 
     for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
         date_rows = list(date_rows)
-        squad_ids_by_team = {tid: strength.squad_as_of_date(conn, tid, args.season, match_date)
+        roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, args.season, match_date)
                              for tid in team_ids}
         results = strength.compute(conn, team_ids, args.league, args.season, match_date,
                                    w_attack=args.weight_attack, w_defense=args.weight_defense,
                                    attack_xg_v_goals_source=args.attack_xg_v_goals_source, team_xg_v_goals_blend=args.team_xg_v_goals_blend,
-                                   xg_spread_stretch=args.xg_spread_stretch,
+                                   xg_spread_stretch_attack=args.xg_spread_stretch_attack,
+                                   xg_spread_stretch_defense=args.xg_spread_stretch_defense,
+                                   player_spread_stretch_attack=args.player_spread_stretch_attack,
+                                   player_spread_stretch_defense=args.player_spread_stretch_defense,
                                    player_window_min_date=args.player_window_min_date,
-                                   current_squad_ids_by_team=squad_ids_by_team, cache=cache)
+                                   current_roster_ids_by_team=roster_ids_by_team, cache=cache)
 
         for row in date_rows:
             home = results[row["home_team_id"]]

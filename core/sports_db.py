@@ -1508,7 +1508,7 @@ def add_player(team_id, name, position=None, api_player_id=None, conn=None, set_
     recently played for". Without this, backfilling e.g. a promoted team's PRIOR
     Serie B season after their current Serie A season is already imported would
     silently stomp team_id back to the old club, corrupting the live
-    current_squad_player_ids() signal that resolve_blend_weight depends on for real
+    current_roster_player_ids() signal that resolve_blend_weight depends on for real
     predictions (found 2026-08-03 while designing the cross-league player-history
     ingestion, FEATURE-011). import_club_squads.py's live current-roster pull is the
     one call site that should keep set_team_id=True (default) -- it's the sole

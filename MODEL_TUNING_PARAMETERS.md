@@ -118,14 +118,17 @@ weight, bypassing the normal per-team calculation entirely. Currently empty/unus
 ### `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT`
 Converts a player's goal-scoring rate from a weaker league into a Serie-A-equivalent
 rate, so a goal in a lower division doesn't count the same as a Serie A goal. Applied
-per-game (not per-season-block) inside `load_team_players`'s rolling window, to the
-ATTACK side only (BUG-010: a defense-side equivalent would need its own calibration)
--- so a player whose window spans a league change gets each individual game scaled by
-that game's own league factor, correctly blending stints of different lengths in
-different leagues. A game in a league with no factor entry (uncalibrated) is excluded
-entirely from the attack calculation -- both goals/xg and minutes for that game --
-rather than assumed Serie-A-equivalent; this can make a player's attack-side window
-smaller than their defense-side window. *Docs: long comment — explains this was
+per-game (not per-season-block) inside `load_team_players`'s rolling window -- a
+player whose window spans a league change gets each individual game scaled by that
+game's own league factor, correctly blending stints of different lengths in
+different leagues. A game in a league with no factor entry (uncalibrated) is
+excluded entirely -- from BOTH attack and defense (2026-08-12, BUG-010: this GATE
+used to be attack-only, so a promoted team's defense rating was built almost
+entirely from unadjusted feeder-league form) -- rather than assumed
+Serie-A-equivalent. The numeric factor itself still only SCALES attack: it's an
+empirically measured goal-SCORING-rate ratio with no established defensive
+meaning, so a calibrated league's defense minutes are included unscaled rather
+than guessing a direction. *Docs: long comment — explains this was
 empirically measured (not guessed) and how; see also `load_team_players`'s docstring
 for the per-game mechanics.*
 
@@ -141,17 +144,50 @@ Blends a team's rating between actual-goals-based and xG-based sources — one e
 pure actual goals, the other end is pure xG, with a genuine blend in between. *Docs:
 long docstring (added alongside this parameter).*
 
-### `TEAM_RATING_XG_SPREAD_STRETCH` (`team_level_lambda` / `compute()`)
+### `TEAM_RATING_XG_SPREAD_STRETCH_ATTACK` / `_DEFENSE` (`team_level_lambda` / `compute()`)
 Spreads team-level xG ratings' cross-team dispersion back out toward (not all the way
 to) actual-goals-level dispersion, recentered on the league's own xG mean — xG has
 less team-to-team spread than actual goals by construction, which compresses win
-probabilities toward a coin flip on the biggest mismatches (BUG-009). 1.0 is a no-op;
-the shipped default (1.3) is the largest factor tested that stays inside the Model
-Calibration bias target in both seasons. Only takes effect when `compute()` calls it
-(it supplies the league-wide means via `league_xg_field_means`) — calling
-`team_level_lambda` directly without that snapshot is always a no-op regardless of
-this value. *Docs: long docstring on the constant itself plus `team_level_lambda`'s
-own docstring; see BUGS.md, BUG-009, 2026-08-07 addendum for the sweep.*
+probabilities toward a coin flip on the biggest mismatches (BUG-009). 1.0 is a no-op.
+Only takes effect when `compute()` calls it (it supplies the league-wide means via
+`league_xg_field_means`) — calling `team_level_lambda` directly without that snapshot
+is always a no-op regardless of this value.
+
+Split into separate attack/defense constants 2026-08-12 (BUG-010 continued) after
+measuring that xG-vs-actual-goals compression is itself asymmetric by side (defense
+more compressed than attack). **ATTACK**: 1.3, the largest factor tested (against the
+original shared constant, pre-split) that stays inside the Model Calibration bias
+target in both seasons. **DEFENSE**: still 1.3 (the unchanged-behavior value inherited
+from the pre-split shared constant) — independently swept 2026-08-12 (fast 2-league
+pilot, 1.0/1.6/2.3/2.6, then a targeted 5-league confirmation of the leading
+candidate, 2.3, rather than a full blind sweep) and **left unmoved**: at full 5-league
+scale the leading candidate sat right at the bias ceiling on both away (+0.0195) and
+draw (-0.0181) bias, carried a Brier cost ~10x steeper than the player-attack
+stretch's whole tested range, and its ROI deltas didn't clear this file's own
+established significance bar for a before/after comparison at that sample size. *Docs:
+long docstring on the constants themselves plus `team_level_lambda`'s own docstring;
+see BUGS.md, BUG-009 (2026-08-07 addendum) for the original sweep and BUG-010
+(2026-08-12 entries) for the split and the defense sweep.*
+
+### `PLAYER_RATING_SPREAD_STRETCH_ATTACK` / `_DEFENSE` (`compute()`)
+Same mechanism one level down — recenters each team's raw player-level attack/defense
+rate around the league's own player-level mean, before the home/away unit conversion
+(a pure linear rescale afterward wouldn't change relative dispersion at all, so the
+stretch has to happen before that step). Built 2026-08-12 after finding player-level
+ratings show the same kind of compression relative to team-level xG ratings that
+BUG-009 found at the team level. 1.0 is a no-op.
+
+**ATTACK**: shipped at 2.0 (2026-08-12 sweep, 1.0/1.3/1.6/2.0/2.5/3.0) — bias never
+breached the target even at 3.0, but Brier degraded monotonically while ROI
+improvement plateaued after 2.0, so 2.0 captures nearly all the ROI gain for the
+smallest Brier cost. **DEFENSE**: left at 1.0 (no-op) — swept the same range and found
+the OPPOSITE result: aggregate ROI flat-to-worse, Brier degrading with no offsetting
+ROI gain, and a targeted check against the worst home-win-overconfidence blowups
+showed the stretch made most of them MORE overconfident, not less. The attack/defense
+asymmetry is real (confirmed three independent ways) but its root cause is not
+understood — an initial hypothesis (weaker player-vs-team-level correlation for
+defense than attack) was tested and did not hold up (both ~0.7, not meaningfully
+different). See BUGS.md, BUG-010, 2026-08-12 entries for both sweeps.
 
 ### `PLAYER_RATING_PAST_MATCH_WINDOW_SIZE`
 How many of a player's most recent appearances (for whichever team they were actually
