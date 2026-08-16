@@ -122,6 +122,10 @@ lookahead bug in a backtest.
   session that found it.
 - **`MODEL_TUNING_PARAMETERS.md`** documents every tunable constant's current value and the
   calibration rationale behind it (a sweep, an empirical study — never a guessed number).
+- **`MODEL_VERSION_LOG.md`** is a running, append-only summary of each shipped
+  `soccer_model_predictions.method` tag's net impact (Brier/bias/ROI, before vs. after) — one
+  entry per version, so "what did version X actually do to the numbers" doesn't require digging
+  back through `BUGS.md`. Update it whenever a new method tag ships, alongside its `BUGS.md` entry.
 - **Calibration sweep discipline**: when tuning a constant, sweep real candidate values against
   bias (`compare_model_vs_market_odds.py`)/Brier/ROI (`model_metrics_report.py`,
   `backtest_from_predictions.py`), and pick the largest value that stays inside the bias target

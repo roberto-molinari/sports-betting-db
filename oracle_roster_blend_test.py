@@ -28,7 +28,6 @@ Usage:
 import argparse
 import sqlite3
 from datetime import datetime, timezone
-from itertools import groupby
 
 from core.sports_db import DATABASE_PATH, clear_soccer_model_predictions, add_soccer_model_prediction
 from core.poisson_model import analyse_match_wc
@@ -153,9 +152,10 @@ def main():
 
         inserted = 0
         cache = {}  # BUG-011: memoizes last-season aggregates across this season's matchdays
-        for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
-            date_rows = list(date_rows)
-            results = strength.compute(conn, team_ids, args.league, season, match_date, cache=cache)
+        dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
+        for before_date in dates:
+            date_rows = strength.matches_on_date(rows, before_date)
+            results = strength.compute(conn, team_ids, args.league, season, before_date, cache=cache)
 
             for row in date_rows:
                 home = results[row["home_team_id"]]

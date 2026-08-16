@@ -15,7 +15,7 @@ This script still monkeypatches get_team_xg_ratings for the duration of the run
 (compute_club_player_strength.py itself is untouched by running it) -- kept
 around for sweeps the production script's real flags don't cover.
 Mirrors backfill_player_blend_predictions.py's loop closely (point-in-time correct,
-one compute() call per unique match_date).
+one compute() call per unique calendar date -- BUG-016, 2026-08-15).
 
 Stretch: for each of get_team_xg_ratings' four fields (home_attack/away_attack/
 home_defense/away_defense), recenter around that field's own league-wide mean (across
@@ -32,7 +32,6 @@ import argparse
 import sqlite3
 from datetime import datetime, timezone
 from functools import lru_cache
-from itertools import groupby
 
 from core.sports_db import (
     DATABASE_PATH,
@@ -143,11 +142,12 @@ def main():
 
         inserted = 0
         cache = {}  # BUG-011: memoizes last-season aggregates across this season's matchdays
-        for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
-            date_rows = list(date_rows)
-            roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, season, match_date)
+        dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
+        for before_date in dates:
+            date_rows = strength.matches_on_date(rows, before_date)
+            roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, season, before_date)
                                  for tid in team_ids}
-            results = strength.compute(conn, team_ids, args.league, season, match_date,
+            results = strength.compute(conn, team_ids, args.league, season, before_date,
                                        team_xg_v_goals_blend=args.team_xg_v_goals_blend,
                                        current_roster_ids_by_team=roster_ids_by_team, cache=cache)
 

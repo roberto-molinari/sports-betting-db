@@ -9,6 +9,974 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-016 — Matchday grouping used the exact match_date timestamp, not calendar date: a later same-day kickoff's rating computation could see an earlier same-day match's already-finished result — **FIXED + SHIPPED 2026-08-15 as `poisson_v4_1_1`**
+
+- **Type:** bug (correctness, not just perf) · **Severity:** high on individual
+  matches (majority affected in leagues with dense same-day scheduling, shifts
+  up to 6 points of win probability), **negligible net effect measured
+  pooled/per-league** (see below — the leak is noise-like per match, not a
+  directional bias, so it washes out in aggregate). **Status:** fixed and
+  re-backfilled as `poisson_v4_1_1`; this is now the reference baseline for
+  ongoing BUG-012 Stage 2 work (superseding `poisson_v4_1` for that purpose).
+
+**Found while investigating a performance question** (why BUG-012 Stage 2 sweeps
+take so long): `backfill_player_blend_predictions.py` and its 3 siblings
+(`backfill_with_xg_stretch.py`, `generate_club_league_card.py`,
+`oracle_roster_blend_test.py`) all process matches "one matchday at a time" via
+`itertools.groupby(rows, key=lambda r: r["match_date"])` — grouping by the
+*exact* `match_date` string, not the calendar date. For TheStatsAPI-sourced
+leagues, `match_date` carries a full kickoff timestamp, so two matches on the
+same Saturday at 15:00 and 17:30 land in *different* groups, each triggering
+its own full-league `compute()` call with its own group key as `before_date`.
+
+**Two consequences, one perf, one correctness:**
+1. **Perf (the original motivation):** the "group same-date matches to avoid
+   redundant recomputation" optimization barely fires for these leagues.
+   Pooled across the 5 leagues x 2 seasons used in BUG-012's sweeps: 2,535
+   `compute()` calls today vs. 1,159 if grouped by calendar date — a ~2.2x
+   cut confirmed by timing (`compute()` measured at ~0.25s/call for a 20-team
+   league).
+2. **Correctness (found while verifying the perf fix is a true no-op — it
+   isn't):** `compute()`'s `before_date` argument gates every SQL query
+   pulling historical data via `match_date < before_date`, string-compared.
+   A later same-day match used its own late kickoff timestamp as `before_date`
+   — so an *earlier* same-day match (different teams, already finished, real
+   score already in the database by the time the later match is being
+   "predicted" in a backfill) satisfies `match_date < before_date` and gets
+   pulled into the shared league-wide baseline (`avg_home`/`avg_away`, league
+   attack/defense means) that every team's rating gets recentered against for
+   that `compute()` call. On a day with several matches, that's a real chunk
+   of the round's own results leaking into that same round's own predictions.
+
+**Confirmed empirically** — in-memory comparison (no DB writes) of predictions
+under the old exact-timestamp grouping vs. calendar-date grouping, same code
+otherwise, Stage 1 near-no-op recency defaults so decay isn't a variable:
+
+| League 2025 | matches | identical | differ | max diff | median diff (of those that differ) |
+|---|---|---|---|---|---|
+| Bundesliga | 306 | 81 (26%) | 225 (74%) | 0.060 | 0.0006 |
+| La Liga | 380 | 130 (34%) | 250 (66%) | 0.021 | 0.0022 |
+| Serie A | 410 | 206 (50%) | 174 (42%) | 0.024 | 0.0029 |
+
+The differing-match count lines up almost exactly with "every match except the
+first one of its calendar day" per league — consistent with the leakage
+mechanism above, not a fluke. Not a rare edge case: most Bundesliga matches in
+this sample were affected.
+
+**Fix implemented:** added `match_calendar_date(match_date)` (truncates to
+`YYYY-MM-DD`) and `matches_on_date(rows, date)` to `compute_club_player_
+strength.py`, and switched all 4 call sites above from `itertools.groupby` on
+the exact timestamp to grouping by calendar date, passing the bare date
+string (not any single match's own timestamp) as `before_date`. A bare date
+is a strict string-prefix of any same-day full timestamp, so `match_date <
+before_date` now excludes *every* match on that calendar day uniformly
+(matches the existing live-CLI convention, `compute()`'s own `__main__` already
+used `date.today().isoformat()` with no time component). Tests added in
+`tests/test_compute_club_player_strength.py`; full suite green, ruff clean.
+
+**Shipped as `poisson_v4_1_1`** — re-backfilled all 5 leagues x 2024/2025 with
+the identical config `poisson_v4_1` used (no other flags changed), the only
+difference being the corrected grouping. Real before/after, pooled and per
+league (Brier / ROI @0/5/10% EV, Bet365):
+
+| | Brier | ROI @0/5/10% |
+|---|---|---|
+| ALL-UP old (`poisson_v4_1`) | 0.6033 (n=3533) | -7.4 / -7.2 / -8.6% |
+| ALL-UP new (`poisson_v4_1_1`) | 0.6031 (n=3533) | -7.6 / -7.2 / -8.8% |
+| Serie A | 0.6073→0.6072 | -9.6/-8.9/-9.0% → -9.6/-8.9/-9.8% |
+| Premier League | 0.6112→0.6109 | +3.2/+3.9/+2.6% → +2.4/+4.2/+3.1% |
+| Bundesliga | 0.6066→0.6064 | -17.8/-18.2/-17.0% → -18.3/-18.1/-17.1% |
+| La Liga | 0.5922→0.5919 | -12.2/-13.1/-16.0% → -11.7/-13.4/-17.1% |
+| Ligue 1 | 0.5987→0.5987 | -1.2/-1.4/-4.8% → -1.5/-1.2/-3.8% |
+
+Every league moved by <0.001 Brier and roughly ±1.5pp ROI at most, with no
+consistent direction across leagues or EV thresholds. **Interpretation:** the
+per-match leakage confirmed above is real (up to 6pp on individual matches),
+but it pushes each affected match's prediction up or down depending on
+whether that day's earlier same-day results happened to be high- or
+low-scoring — noise, not a systematic bias — so across ~3,500 matches it
+washes out almost entirely. Still worth fixing: a specific live card
+generated on a day with an earlier same-day kickoff can get a meaningfully
+wrong number for that one match, even though it doesn't move the season-long
+scorecard. Given the negligible pooled/per-league shift, the BUG-012 Stage 2
+sweep (6 candidates run against the old, leaky `poisson_v4_1` baseline) was
+judged not worth re-running from scratch — the corrected baseline is close
+enough that the existing sweep's candidate ranking almost certainly holds.
+
+**Not yet done:**
+- **User's follow-up idea, not yet designed or implemented:** calendar-date
+  grouping stops same-day leakage, but doesn't stop a match played a day or
+  two off the "core" round (e.g. a Friday match ahead of a Saturday/Sunday
+  round) from counting as history for that round's Saturday/Sunday matches,
+  even though it's arguably the same round, not genuinely "earlier." User's
+  framing: the model should arguably look back to the *previous matchday*
+  (round), not just the previous *calendar day*. Worth a real design pass (how
+  is "matchday/round" even defined when there's no explicit round number in
+  the schema?) rather than folding in ad hoc.
+
+## BUG-015 — Bundesliga's guardrail ROI (~-19%) is far worse than every other club league despite a normal Brier score — **INVESTIGATED 2026-08-14, no fix; most likely real variance in a small (2-season) sample**
+
+- **Type:** investigation (no code change) · **Status:** concluded for now, not
+  actionable. Found while running BUG-012's Stage 2 calibration sweep: every
+  half_life/cutoff/shape candidate tried (exponential and linear decay, flat
+  weighting, half-lives 15-120d, cutoffs 45-270d) underperformed the `poisson_v4_1`
+  baseline on Bundesliga 2024+2025, prompting "is Bundesliga just bad, independent
+  of BUG-012" — confirmed yes, by a wide margin (`poisson_v4_1`, guardrail EV
+  0/5/10%, Bet365):
+
+  | League | Brier | ROI @0/5/10% |
+  |---|---|---|
+  | Serie A | 0.6073 | -5.3 / -6.4 / -7.9% |
+  | Premier League | 0.6112 | +6.0 / +8.0 / +7.4% |
+  | Bundesliga | 0.6066 | **-19.0 / -19.0 / -17.1%** |
+  | La Liga | 0.5922 | -8.1 / -8.7 / -9.4% |
+  | Ligue 1 | 0.5987 | -0.2 / -1.0 / -4.4% |
+
+  Bundesliga's Brier is fine (comparable to or better than Serie A/Premier
+  League) -- this isn't a probability-calibration problem in the aggregate.
+  ROI is uniquely bad, and unlike every other league, **every one of the three
+  bet sides loses money** (home -27.6%, draw -22.0%, away -9.8%, guardrail
+  pooled) -- every other league has at least one clearly profitable side.
+
+  **Ruled out, one at a time (each independently checked, no smoking gun in
+  any of them):**
+  - Odds coverage: 306/308 matches per season have Bet365 odds (2 missing =
+    postponed/incomplete, same pattern other leagues would show).
+  - Odds format/overround: Bet365's average bookmaker margin is ~1.055 for
+    all 5 leagues, Bundesliga included -- no scaling/format bug.
+  - Odds distribution shape: mean/sd of implied home/draw/away probabilities,
+    checked against BOTH Bet365 and Betfair Exchange closing lines, are
+    essentially identical across all 5 leagues -- Bundesliga's odds aren't
+    unusually spread out, concentrated, or shifted.
+  - Player/team blend mix: Bundesliga runs 75.1% team-level / 24.9%
+    player-level (via `resolve_blend_weight`, point-in-time correct,
+    `roster_as_of_date`-driven, same computation the real backfill uses) --
+    right in the middle of the pack (70.9%-75.8% across all 5 leagues).
+    Premier League actually leans slightly MORE team-level and has the best
+    ROI, ruling out "too player-reliant" as the story.
+  - Team-name mapping: every one of the 20 real top-flight Bundesliga teams
+    has complete Bet365 odds coverage (68/68 or the full season count) -- no
+    silently-dropped or misattributed team. **Found one real, harmless gap**
+    while checking: `core/team_name_maps.py`'s Bundesliga dict is missing
+    entries for SC Paderborn 07 / SV 07 Elversberg (the two 2. Bundesliga
+    opponents from that season's top-flight relegation playoff -- 1. FC
+    Heidenheim vs. Elversberg 2024-25, VfL Wolfsburg vs. Paderborn 2025-26).
+    Confirmed harmless: those 4 matches have zero `soccer_betting_odds` rows
+    and zero `soccer_model_predictions` rows, so they never enter the graded
+    backtest sample at all. Worth a one-line fix later so it doesn't bite if
+    relegation-playoff odds are ever ingested -- not done now, out of scope.
+  - Unicode/encoding: verified via raw byte inspection (`hex(name)`) that
+    every diacritic-bearing Bundesliga team name (Köln, München, Nürnberg,
+    Saarbrücken, Düsseldorf, Preußen Münster) is stored as correct,
+    precomposed (NFC) UTF-8 -- no mojibake, no NFC/NFD mismatch. No duplicate
+    team rows anywhere in `soccer_teams` for Bundesliga/2. Bundesliga. Also
+    checked (prompted by the "1." prefix on club names like "1. FC Köln,"
+    itself a genuine German naming convention, not a data artifact --
+    historically means "first" sports club founded under that name/city):
+    `import_club_squads.py`'s `normalize_team_name()` is a regex built
+    specifically for Italian club-name conventions (strips "AC"/"AS"/"US"
+    prefixes, "Calcio"/"CFC"/"FC" suffixes, trailing year numbers) and,
+    applied to German names, does mangle them in unintended ways ("1. FC
+    Köln" -> "1. köln", dropping "FC" from the *middle* because "1." creates
+    the leading-whitespace pattern the suffix regex looks for; "VfL Bochum
+    1848" -> "vfl bochum", dropping the year). This was already flagged as a
+    known risk in the multi-league expansion plan ("confirmed NOT to
+    generalize past Serie A") but never revisited. Checked for real damage:
+    across all Bundesliga + 2. Bundesliga team names, **zero collisions**
+    (no two distinct real clubs fold to the same mangled string), so it
+    isn't silently merging any two teams' squad/player data. Still flagged
+    as fragile tech debt worth a real fix later, just not the cause here.
+
+  **The "does the model overrate win probability" check needed the right
+  scope to show anything.** Checked model win-probability vs actual outcome
+  across EVERY match: Bundesliga's gap (+0.0104 pooled) wasn't unusual --
+  Premier League's was actually larger (+0.0147) despite having the best ROI
+  of any league. Re-checked restricted to ONLY the matches where a bet
+  actually cleared EV>0 + the guardrail floor (`CLUB_LEAGUE_MIN_PICK_
+  PROBABILITY`) -- this is the metric that actually discriminates:
+
+  | League | bets | model's avg win prob (selected) | actual win rate (selected) | gap |
+  |---|---|---|---|---|
+  | Serie A | 552 | 49.2% | 38.4% | +0.107 |
+  | Premier League | 543 | 51.9% | 43.5% | +0.085 |
+  | Bundesliga | 459 | 50.9% | 36.4% | **+0.146** |
+  | La Liga | 570 | 50.5% | 39.5% | +0.110 |
+  | Ligue 1 | 493 | 54.4% | 44.2% | +0.102 |
+
+  Bundesliga's selected-bet gap is the largest of all 5 leagues, and **the
+  gap ranking exactly matches the ROI ranking** across every league (worst to
+  best: Bundesliga > La Liga > Serie A > Ligue 1 > Premier League, both
+  metrics, same order). Confirms the earlier all-matches check was just
+  measuring the wrong population -- most of a league's matches never become
+  bets, so their calibration doesn't drive ROI.
+
+  **Per-Bundesliga-team breakdown** (same selected-bets-only gap, by team)
+  showed the pattern holds broadly but isn't confined to promoted/weak teams:
+  VfL Bochum 1848, 1. FC Union Berlin, FC St. Pauli, Hamburger SV, and 1. FC
+  Köln have the largest gaps and worst ROI (-52% to -74%), but Bayer 04
+  Leverkusen (n=34 bets, the 2023-24 Bundesliga CHAMPION, not remotely a weak
+  or promoted club) also shows a large gap (+0.206) and bad ROI (-24.2%) --
+  ruling out "only thin-history promoted teams" as the full story. Spot-
+  checking Leverkusen's actual bet log found 12 of its 19 losing bets were
+  DRAWS (not defeats), several at high model confidence (p=0.65-0.88) --
+  prompted checking draw-probability calibration specifically, but this did
+  NOT discriminate Bundesliga either: restricted to selected bets, Bundesliga's
+  draw-underestimation (-0.0375) was close to Serie A's (-0.0365) and Premier
+  League's (-0.0354) -- every league underestimates draws by a similar amount
+  on its selected bets, so this is a real but leaguewide (not Bundesliga-
+  specific) pattern, not the differentiator.
+
+  **Dispersion (spread of the model's own probabilities) also ruled out**,
+  checked both across all matches and restricted to selected bets, against
+  BOTH Bet365 and Betfair Exchange. Across all matches, the model's own
+  p_home is consistently more spread out than either book in EVERY league
+  (not Bundesliga-specific), and the size of that model-vs-market dispersion
+  gap doesn't track ROI (Ligue 1's gap is the largest of all 5 leagues despite
+  a much better ROI than Bundesliga's). Restricted to selected bets, sd is
+  essentially identical across every league for the model AND both books
+  (0.16-0.17 across the board) -- no outlier at all once scoped correctly.
+
+  **The decisive check: is it just the model, or is the market wrong too?**
+  On the same selected-bet matches, compared model/Bet365/Betfair's own gap
+  vs the actual outcome:
+
+  | League | model gap | Bet365 gap | Betfair (sharp) gap |
+  |---|---|---|---|
+  | Serie A | +0.107 | +0.022 | -0.007 |
+  | Premier League | +0.085 | -0.014 | -0.033 |
+  | Bundesliga | +0.146 | +0.062 | **+0.039** |
+  | La Liga | +0.110 | +0.018 | -0.001 |
+  | Ligue 1 | +0.102 | +0.001 | -0.023 |
+
+  Bundesliga is the ONLY league where even the SHARP book (Betfair Exchange,
+  a real-money efficient market) is overconfident on these specific matches --
+  every other league's sharp-book gap is at or below zero. And critically,
+  the model's OWN incremental error beyond what the sharp market already got
+  wrong (model gap minus Betfair gap) is actually the SMALLEST of all 5
+  leagues for Bundesliga (+0.107, vs +0.111 to +0.125 elsewhere) -- the model
+  isn't uniquely bad at reading Bundesliga relative to the sharp market. What's
+  different is that the sharp market itself got surprised more often on
+  exactly these Bundesliga matches than on any other league's selected bets.
+
+  **Conclusion: most likely genuine variance in a small sample, not a
+  discoverable pipeline bug.** Exhausted the checkable candidates (odds
+  coverage/format/distribution, blend mix, team-name mapping/encoding, draw
+  calibration, dispersion) with nothing found strong enough to explain the
+  gap, and the one signal that DOES discriminate Bundesliga (the selected-bet
+  win-probability gap) shows up even in the SHARP market's own numbers on the
+  same matches, not just the model's -- consistent with "this specific
+  612-match, 2-season window of Bundesliga results happened to run more
+  upset-heavy than even Betfair Exchange priced for," not "our pipeline is
+  broken for Bundesliga." No code changes made. Revisit once more Bundesliga
+  seasons accumulate -- 2 seasons/612 matches is a small sample for separating
+  real mispricing from variance, and this conclusion could look wrong with
+  more data.
+
+---
+
+## BUG-014 — Spread-stretch recentering (additive) has no floor: can silently produce a negative attack/defense rating, masked by an unrelated hardcoded final-lambda clamp — **FIXED 2026-08-14 (shipped as poisson_v4_1)**
+
+- **Type:** bug (correctness + missing test coverage) · **Status:** in progress.
+  Found 2026-08-14, same walkthrough as BUG-013, investigating the negative
+  `home_attack_player`/`home_attack_blend` values (-0.24) the user spotted for
+  1. FC Köln vs. SC Freiburg (2025-08-31, Bundesliga). User: "some formula problem
+  in whatever computes `*_attack_player` and `*_attack_blend` (and maybe the
+  defense variants too) that allowed a negative value without returning/flagging
+  an error. Also missing tests on this one."
+
+**Root cause.** The player-level spread-stretch recentering in `compute()`
+(`compute_club_player_strength.py`, ~line 1328):
+```
+r["ra"] = attack_mean + (r["ra"] - attack_mean) * player_spread_stretch_attack
+```
+has no protection against overshooting past zero when a team's raw pre-stretch
+rate sits far enough below the league mean. Confirmed concretely: Köln's raw
+player attack rate as of 2025-08-31 was 0.0807 vs. a league `attack_mean` of
+0.1911; with `PLAYER_RATING_SPREAD_STRETCH_ATTACK = 2.0` (locked in earlier this
+session), `0.1911 + (0.0807 - 0.1911) * 2.0 = -0.0296` — negative. This propagates
+through the `avg_home/attack_mean` unit conversion into a negative
+`lambda_attack_player_home`, and because Köln's blend weight was `w=0.0` for this
+match (fully player-level — see BUG-012's walkthrough example, same match), it
+passes straight through into a negative `home_attack_blend` too. Nothing in
+`compute()` or the blend path notices or flags this.
+
+**Where it's currently masked, not fixed.** The negative value isn't caught until
+`analyse_match_wc`'s hardcoded floor (`core/poisson_model.py:556-557`):
+```
+lambda_H = max(lambda_H, 0.1)
+lambda_A = max(lambda_A, 0.1)
+```
+— which clamps the FINAL combined lambda (attack × opponent-defense / baseline),
+not the broken attack/defense component itself. This means: (a) a genuinely
+negative intermediate rating exists silently, with no error/warning anywhere in
+the pipeline; (b) the clamp forces an arbitrary flat 0.1, which has no
+relationship to how weak the team's attack actually is — indistinguishable
+between "genuinely weak" and "broken/negative" — and 0.1 expected goals is not a
+realistic value for any real match. Confirmed in production: **exactly 3 of
+~3,548 `poisson_v4` predictions across all 10 currently-backfilled league-seasons
+hit this floor, ALL in Bundesliga 2025, ALL involving 1. FC Köln** (home attack
+once, away attack twice): RB Leipzig vs. Köln (2025-09-20, actual 3-1), VfL
+Wolfsburg vs. Köln (2025-09-13, actual 3-3), Köln vs. SC Freiburg (2025-08-31,
+actual 4-1) — the last of these was already sitting in the Bundesliga bucket-2
+outlier list (agg_delta 3.43) found the day before.
+
+**Defense side doesn't currently manifest this** — `PLAYER_RATING_SPREAD_STRETCH_
+DEFENSE` is presently locked at `1.0` (a true no-op, per this session's earlier
+calibration work), so no defense rating can be pushed past its mean at all right
+now. Confirmed live: scanning all Bundesliga 2025 teams for this same date, only
+Köln's ATTACK goes negative post-stretch; no team's defense does. But the formula
+itself has the identical, unguarded vulnerability and would trigger the same way
+the moment `PLAYER_RATING_SPREAD_STRETCH_DEFENSE` is ever recalibrated away from
+1.0 — this is latent, not defense-specific-safe by design.
+
+**Missing test coverage (user's own framing):** no test asserts that a
+player-level (or team-level) attack/defense rating stays non-negative after the
+spread-stretch transform, and nothing catches a negative rating being silently
+absorbed by the unrelated `analyse_match_wc` final-lambda floor instead of being
+caught at its actual source.
+
+**Design resolved 2026-08-14: switch additive stretch to multiplicative.**
+Discussed and rejected clamping the output at an arbitrary floor (0.0 or
+otherwise) — a clamped value doesn't represent anything the model actually
+believes about the team, it's just where broken math happened to land before
+going negative; the model's real (pre-stretch) belief for Köln was 0.0807, not
+whatever floor got chosen. Landed on a different fix entirely: additive
+recentering (`mean + (raw - mean) * factor`) is the textbook way to increase
+dispersion around a fixed mean, which is genuinely what the stretch is FOR
+(compression correction) — the bug is that this technique assumes the quantity
+can range over the whole real line, when a goal-scoring rate has a hard floor at
+zero. **This project already learned this exact lesson once before**, in a
+neighboring computation (see `compute()`'s player-level home/away unit
+conversion, BUG-009 2026-08-09: "keep the raw sample's RATIO spread... previously
+additive, an unexplained asymmetry with defense's own multiplicative form...
+ratio is correct: it can't drive lambda negative the way a flat shift can") — it
+just never got carried over to the spread-stretch step specifically. Fix:
+`stretched = mean * (raw / mean) ** factor` — below-mean values shrink toward
+(never past) zero, above-mean values grow, exact no-op at raw == mean, only
+reaches exactly 0 if raw itself is already 0.
+
+**Scan found this same additive defect in 4 places, not 2** (searched the whole
+repo for the pattern): `team_level_lambda`'s `xg_spread_stretch_attack/_defense`
+(compute_club_player_strength.py), `compute()`'s
+`player_spread_stretch_attack/_defense` (2 sites, same file), and
+`compute_wc_team_strength.py`'s attack/defense normalization (same shape,
+different parameterization — targets a specific standard deviation rather than a
+fixed factor). **World Cup explicitly OUT of scope for this fix** — separate
+product area, own tuning history; left as a documented follow-up, not touched.
+(`backfill_with_xg_stretch.py` also has a copy, but it's a standalone sweep tool,
+not production — not touched either.)
+
+**Staged rollout, explicitly NOT all at once** (user's call — wants to measure
+impact one call site at a time, not switch every site to multiplicative in one
+shot): built one shared function, `spread_around_mean(raw, mean, factor, mode)`
+(compute_club_player_strength.py, right before `raw_team_strength`), with
+`mode="additive"` (today's formula, byte-identical) and `mode="multiplicative"`
+(the fix). Unit-tested directly (7 new tests: additive matches the old inline
+formula exactly, additive can still go negative — documents the known defect,
+not a desired behavior — multiplicative can't, no-op at raw==mean, only reaches
+0 at raw==0, None/non-positive-mean handling, unknown-mode rejection).
+
+**Stage 1 (DONE 2026-08-14): wire all 3 club-league call sites through the
+shared function in `mode="additive"` — verified true no-op.** All 423
+previously-passing tests (including the exact-value assertions on the stretch
+formula, which would catch any drift) still pass unchanged. The two
+negative-value regression tests
+(`test_compute_player_spread_stretch_cannot_push_attack_negative`,
+`test_team_level_lambda_stretch_cannot_push_attack_negative`) are marked
+`@pytest.mark.xfail(strict=True)` for now, with a reason string pointing back
+here — expected, since no call site has switched to multiplicative yet; removing
+each marker is literally the acceptance criterion for that site's own stage.
+
+**Stage 2 (DONE 2026-08-14): all 4 club-league call sites now `mode=
+"multiplicative"`.** Switched player-level attack first (the site that
+originally surfaced this bug via Köln), then player-level defense (currently a
+true no-op in production either way — `PLAYER_RATING_SPREAD_STRETCH_DEFENSE=
+1.0` — but switched for consistency and to protect it whenever that constant
+is ever tuned away from 1.0; added its own negative-value regression test,
+`test_compute_player_spread_stretch_cannot_push_defense_negative` — first
+draft of that test accidentally passed even under additive mode because TeamB's
+300 raw minutes didn't clear the 300-WEIGHTED-minutes threshold at DEF's 0.8
+position weight (240 < 300) to even join the league mean at all, making the
+stretch a guaranteed no-op regardless of formula; fixed by giving TeamB 375
+raw minutes, re-confirmed genuinely red before the site switch), then
+team-level (attack+defense share one code path in `team_level_lambda`, both
+switch together). All existing tests hardcoding the additive formula's exact
+output (`test_team_level_lambda_stretch_recenters_on_league_mean`,
+`test_team_level_lambda_attack_and_defense_stretch_apply_independently`,
+`test_compute_wires_xg_spread_stretch_through_to_team_level_lambda`) updated
+to the multiplicative formula's expected values — legitimate updates, not
+loosened assertions, since the underlying formula genuinely changed shape.
+Suite: 426 passed, 0 xfailed, ruff clean.
+
+**Validation — Bundesliga 2025 (full additive-vs-multiplicative comparison,
+isolated from BUG-013 since both sides of this specific comparison already
+had that fix applied equally):** 1X2 Brier 0.5942→0.5927, Totals Brier
+0.5274→0.5150, bias stayed within target both ways. ROI: 1X2 roughly flat
+(within ~1pp either direction across EV thresholds — noise-level for one
+league-season); **Totals ROI improved at every threshold** (EV>0%: -23.7%→
+-22.5%; EV>5%: -24.9%→-20.3%; EV>10%: -24.4%→-18.1%). No metric moved
+meaningfully the wrong way.
+
+**Shipped as `poisson_v4_1`** (kept as its own method tag rather than
+overwriting `poisson_v4`, so the pre-fix baseline stays comparable — see
+"Versioning" note below) — backfilled for all 5 leagues × both seasons
+(3,534 rows, matching `poisson_v4`'s row counts exactly). ALL-UP pooled
+(all leagues/seasons/markets): Brier 0.5591→0.5572, ROI roughly flat
+(@0%: -6.6%→-6.7%; @5%: -6.9%→-6.3%; @10%: -6.6%→-6.8%) — small net
+positive, diluted at full pool since most leagues aren't touched much by
+BUG-013 specifically, but BUG-014's fix applies uniformly everywhere.
+
+**Real per-league signal found post-backfill (guardrail mode, TOTALS market,
+pooled across both seasons per league) — ROI improving monotonically with EV
+threshold, the shape you'd expect from a model whose own confidence tracks
+real edge rather than noise:**
+  - **Serie A**: -0.2% → +0.5% → +6.4% (EV>0/5/10%) — flips positive
+  - **Premier League**: -3.9% → -3.6% → -0.8% — right shape, still negative
+  - **Ligue 1**: -10.3% → -9.8% → -7.9% — right shape, still clearly negative
+  - Bundesliga and La Liga do NOT show this shape yet (not monotonic).
+
+**Versioning note (2026-08-14):** these fixes (BUG-013 + BUG-014) are tagged
+`poisson_v4_1`, not `poisson_v4` (not overwritten) and not `poisson_v5`.
+Rationale: `v3→v4` was a structural mechanism change (the whole player-level
+blend system); this stays the same architecture with corrected data/formula,
+matching how prior fixes (spread-stretch calibration, cross-league adjustment
+work) stayed under `v4`. Reserved `v5` for BUG-012 (calendar-time windowing),
+which replaces the underlying recency mechanism itself — a comparable
+structural shift to what earned v4 its own number. `v4_1` costs ~1MB in a
+105MB database (266 bytes/row × 3,534 rows) — negligible, kept alongside
+`v4` rather than overwriting so the pre-fix baseline stays available for
+comparison. `model_metrics_report.py` and other tools still default to
+`poisson_v4` (`DEFAULT_METHOD` in 4 files: `model_metrics_report.py`,
+`backfill_player_blend_predictions.py`, `sample_xg_lookback_ab.py`,
+`diagnose_home_bet_calibration.py`) — must pass `--method poisson_v4_1`
+explicitly until/unless `v4_1` is promoted (edit that one constant in each,
+or just re-backfill under the `poisson_v4` name directly once fully satisfied).
+**Note: `generate_club_league_card.py` (the LIVE card generator) does not read
+`method` tags at all — it calls `compute()` directly with whatever's in the
+current code, so every league already reflects today's fixes in live picks
+regardless of any `method`-tag versioning discussion above; the tags only
+affect backtest/comparison tooling.**
+
+---
+
+## BUG-013 — `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT` has no entries for the 4 new leagues' feeder divisions — a promoted team's real recent history gets almost entirely discarded — **FIXED 2026-08-14**
+
+- **Type:** bug (missing calibration data + missing test coverage) · **Status:**
+  FIXED same day. Found 2026-08-14, same investigation as BUG-014, walking through
+  why 1. FC Köln's player-level attack rating was so far below the league mean
+  that BUG-014's spread-stretch pushed it negative.
+
+**Fix.** Measured all four factors the same way Serie B's `0.663` was measured
+(not guessed): players with ≥300 minutes in BOTH the top-flight league and its
+feeder division (any season), own goals/90 in each, pooled by minutes, ratio =
+top-flight rate / feeder rate. Sample sizes (152-196 qualifying players per pair)
+are larger than Serie B's original 82-player measurement, and all four factors
+land in a tight, plausible band consistent with Serie B's own 0.663 — a real
+cross-check that the methodology itself is sound:
+  - Bundesliga / 2. Bundesliga: 152 players, 0.1143/0.1906 = **0.5999**
+  - Premier League / Championship: 162 players, 0.0931/0.1402 = **0.6643**
+  - La Liga / LaLiga 2: 196 players, 0.0842/0.1294 = **0.6512**
+  - Ligue 1 / Ligue 2: 159 players, 0.1016/0.1372 = **0.7408**
+
+Added to `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT` with the same rationale
+comment style as Serie B's entry. Added a generic regression test,
+`test_every_registered_feeder_division_has_a_cross_league_adjustment_entry`
+(tests/test_compute_club_player_strength.py) — asserts every league with a
+`lower_division` set in `core.leagues.LEAGUES` has a matching entry here; keyed
+off the leagues registry, not hardcoded to today's 4 divisions, so it also
+catches this class of gap for any future league added the same way. Confirmed
+red against the pre-fix code (caught the exact 4 missing divisions), green after.
+
+**Validated the fix resolves BUG-014's known real-world trigger.** Re-ran
+Köln's player-level attack computation for all 3 matches that had hit the
+downstream 0.1 floor (see BUG-014) — none go negative anymore post-stretch:
+Köln vs. Freiburg (2025-08-31): -0.0296 → **+0.0061**; Wolfsburg vs. Köln
+(2025-09-13) and Leipzig vs. Köln (2025-09-20) both similarly resolved. Also
+confirmed no OTHER team in Bundesliga 2025 goes negative post-stretch as of
+these dates. Köln's effective attack-rating sample size (`aw`, the weighted
+minutes behind the rating) also jumped from 1,156.8 to 6,162.4 — over 5x more
+real data now counted, since previously-excluded `2. Bundesliga` games are back
+in (scaled by 0.5999).
+
+**Not yet done: re-backfill production.** `soccer_model_predictions` for the 4
+new leagues' 2025 seasons still reflects the OLD (buggy) factors — this fix only
+changes the constant + tests, not the stored predictions. Re-backfill + real
+before/after Brier/bias/ROI check still pending, deferred while BUG-014's own
+fix is worked (no point re-backfilling twice).
+
+**Open anomaly found validating this fix, NOT resolved by it — Hamburger SV.**
+Hamburger SV (also promoted from `2. Bundesliga` this season, same timing as
+Köln) appears ~17 times in the Bundesliga "model expects ~2 goals" bucket-2
+outlier table from 2026-08-13's diagnostic session, several with large
+predicted-vs-actual deltas — genuinely bad predictions for this team across
+2025. The natural hypothesis was that BUG-013 (this bug) explained it the same
+way it explained Köln's. Checked directly: it doesn't. HSV's raw attack rating
+barely moved from this fix (0.1385 → 0.1005, and its `ratio_to_mean` stayed
+comfortably away from BUG-014's overshoot boundary both before and after,
+0.725 → 0.627) — unlike Köln, whose rating was much more exposed. Root cause:
+HSV's squad already had substantial genuine non-`2. Bundesliga` data even
+before this fix — most notably Nicolai Remberg, who carries 38.8% of the
+team's ENTIRE weighted attack contribution alone (871 real minutes at MID
+weight, from a loan spell at Holstein Kiel, an actual Bundesliga club, last
+season — nothing to do with HSV's own second-division history). So this fix
+was never going to move HSV's number much; whatever is actually causing HSV's
+poor 2025 predictions is a still-undiagnosed, separate issue. Flagged here so
+it isn't lost — worth its own diagnostic pass later (same style as the
+Bundesliga bucket-2 drill-down), not assumed solved by BUG-013 or BUG-014.
+
+**Root cause.** `PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT` (in
+`compute_club_player_strength.py`) currently has entries for only `Serie A, Serie
+B, Premier League, Bundesliga, La Liga, Ligue 1` — none of the four new feeder
+divisions added during the multi-league expansion (`2. Bundesliga`,
+`Championship`, `LaLiga 2`, `Ligue 2`) have an entry at all, not even a
+placeholder. Per `load_team_players`'s own documented behavior, a game played in a
+league with NO factor entry is excluded ENTIRELY from that player's rating — not
+scaled, not discounted, just dropped, from both the attack/defense numerator AND
+the minutes denominator.
+
+**Concrete evidence.** Marvin Schwäbe (Köln's GK, promoted from `2. Bundesliga`
+this season): of his last 10 tracked appearances before 2025-08-31, **9 were in
+`2. Bundesliga` and got excluded entirely**, leaving exactly **1 real game** (Aug
+24 2025, 90 minutes, 0 goals) to represent his entire attacking-rating input. This
+is not an isolated case — it plausibly affects most of Köln's promoted squad, and
+by the same mechanism presumably any newly-promoted team in the other 3 new
+leagues (Championship→Premier League, LaLiga 2→La Liga, Ligue 2→Ligue 1) — not yet
+checked for those. A roster reduced to single-match, mostly-scoreless samples is
+exactly what drove Köln's raw team-wide attack rate down to 0.0807 against a
+league mean of 0.1911, which is what BUG-014's unguarded stretch then pushed
+negative.
+
+**Note this isn't quite the same gap the multi-league expansion plan already
+flagged.** That plan explicitly logged the 4 new TOP-FLIGHT leagues'
+cross-league-adjustment values as "an assumption to validate empirically later"
+(defaulted to `1.0`, peer top-5 leagues) — those entries exist. The gap found here
+is different and was apparently never flagged: the FEEDER divisions themselves
+have no entry whatsoever, so promotion/call-up history from them (the exact
+mechanism this constant exists to support, per BUG-010) is being silently thrown
+away rather than scaled/gated deliberately.
+
+**Missing test coverage (user's own framing):** nothing currently asserts that
+every feeder division actually referenced by a team's real promotion history has
+a calibrated (or explicitly gated) entry, and nothing catches a player's
+rating-window sample size collapsing to as little as one match because of a
+missing entry.
+
+**Not yet resolved — real calibration work, not a guess.** Serie B's existing
+`0.663` factor was empirically measured from players' own goal-scoring rate
+specifically (see that constant's own comment) — the 4 missing feeder divisions
+need the same real measurement, per this project's calibration-sweep discipline,
+not a placeholder `1.0` assumed by analogy. Scope still open: measure real
+factors for `2. Bundesliga`, `Championship`, `LaLiga 2`, `Ligue 2`, add entries,
+then re-run BUG-014's Köln example to see whether the negative-rating trigger
+disappears on its own once the sample size problem is fixed.
+
+---
+
+## BUG-012 — Player-recency windows are count-based ("last N appearances"), not calendar-based, so a player out for months can still count as fully "recent" — **STAGE 1 DONE 2026-08-14; STAGE 2 SHIPPED 2026-08-15 as `poisson_v4_2`; ROOT CAUSE #3 SHIPPED 2026-08-15 as `poisson_v4_3`; trust-score windowing (root cause #4, found during v4_3 validation) scoped but not built**
+
+- **Type:** bug (design agreed, implementation deferred) · **Status:** open. Found
+  2026-08-13 while walking through `player_trust_score`'s `data_coverage_score`
+  calculation for 1. FC Köln (promoted from Bundesliga 2) ahead of its 2025-08-31
+  match vs. SC Freiburg, at the user's request, step by step. User: "this opens the
+  door for the model to reach back weeks/months/years to fill up the player's
+  minutes, which defeats the purpose of the 'recent 10 games' window... this is
+  absolutely a bug."
+
+**Root cause (confirmed in three places now, one worse than the others):**
+
+1. **`players_aggregated_recent_minutes()`** (used only inside `player_trust_score`,
+   for `data_coverage_score` and the `joined_minutes` half of `roster_change_score`)
+   takes a player's own last `window_size` (10) appearances, *any team*, with
+   **zero calendar bound** — ordered purely by recency rank, no date cutoff at all.
+   A player returning from a long injury layoff would have their "last 10" reach
+   back however far necessary, treated identically to a player who played those
+   same 10 games in the last 10 weeks. Confirmed live: for Köln vs. Freiburg
+   (2025-08-31), several qualifying players' minutes came from BEFORE the
+   promotion (i.e. a different club, a different division, many months earlier) —
+   e.g. Ísak Bergmann Jóhannesson: 889 of 889 minutes counted came from a different
+   team; only 80 were at Köln itself.
+2. **`load_team_players()`** (the actual player-level attack/defense rating engine —
+   NOT just the trust score) has the *same underlying flaw in milder form*: line
+   ~429, `window = games[:window_size]`, decayed by **rank** (`w = decay ** rank`
+   at line ~436), not by elapsed calendar time. A player's 9th-most-recent game
+   gets the same weight (`decay**9`) whether that game was 3 weeks old (dense
+   recent schedule) or 8 months old (return from injury/thin schedule) — rank says
+   nothing about actual staleness. Confirmed this is a real, separate instance of
+   the same class of bug, not just "the same bug twice" — `load_team_players`
+   already has a *different*, narrower fix from 2026-08-11 (candidate players must
+   have appeared in the TEAM's own last `window_size` matches to be considered at
+   all — a team-recency gate), but that gate doesn't bound how far back a
+   *qualifying* player's own rate-computation window can still reach. **Covers
+   defense too, not just attack, with no separate fix needed:** the same `w =
+   decay ** rank` value computed once per game in this loop is applied to BOTH the
+   attack accumulators (`attack_num`/`attack_den`) AND the defense accumulators
+   (`ga_num`/`ga_den`, `xga_num`/`xga_den`) — one shared per-game weight, not two
+   independent ones (confirmed 2026-08-14) — so fixing this one weight fixes both
+   sides of the rating at once.
+3. **The team-attribution gate itself is also count-based, not calendar-based**
+   (found 2026-08-14, walking through why a specific Köln player's attack rating
+   looked wrong). `load_team_players`'s candidate-narrowing step (the 2026-08-11
+   fix referenced above) considers a match "recent" if it falls within a TEAM's
+   own last `window_size` (10) matches — a count, not a date range. Confirmed live:
+   Köln's own last-10-matches window (as of 2025-08-31) spans **2025-03-15 to
+   2025-08-24 — over 5 months** — because Köln just came up from `2. Bundesliga`,
+   so 9 of those 10 "recent" matches are actually from months earlier. A player
+   whose only appearance for Köln was that March match, and who hasn't played
+   since, would still register as "recent enough" to be attributed to Köln under
+   this gate, with no calendar check at all. Same root design flaw as #1/#2 above
+   (match-count standing in for calendar time), just at the attribution step
+   rather than the minutes/rating step — folded into this entry rather than
+   tracked separately, since the fix is the same fix.
+
+**Architectural direction agreed 2026-08-14 (in addition to the 2026-08-13
+design):** rather than fixing these three call sites independently and risking a
+fourth, undiscovered one, build **one centralized function** — "how much does
+player X count for team Y, as of date D (with a given lookback window)" — that
+owns ALL of the calendar-time-decay logic in one place: team attribution/
+candidacy, minutes weighting (`player_trust_score`), and rating-window weighting
+(`load_team_players`) all call through it rather than each reimplementing their
+own version of "recent." User: "it's sounding like we need a centralized...
+function that takes a player, a team, and a date... and figures out how much that
+player matters to the team... so there's one place to implement the calendar
+based time decay and it's used uniformly across all scenarios." This centralized-
+function idea should shape how the staged implementation plan below gets built —
+worth revisiting the plan's step 1 (shared time-decay helper) as "build this
+function first, then migrate all three call sites onto it" rather than three
+separate patches.
+
+**Design agreed with user (2026-08-13), not yet built:**
+
+- Replace **rank-based decay** (`decay ** rank`, position in an ordered list) with
+  **calendar-time-based decay** (a function of actual elapsed days/weeks since the
+  match), applied consistently everywhere a "recent window" is computed — both
+  `load_team_players` (replacing today's rank decay) and `player_trust_score`
+  (replacing today's flat, undecayed minute sums). Rationale (user): "calendar
+  time is a singular universal concept whereas matches introduce a bunch of
+  variability that clearly has already caused problems" — directly analogous to
+  this file's BUG-010 "season-blind" precedent (continuous, date-driven logic
+  beats anything keyed to discrete boundaries/counts).
+- **Shape: exponential decay with a hard floor** — smooth exponential falloff by
+  elapsed time, forced to exactly 0 past some cutoff (a real number TBD, user's
+  working intuition: "any stats that occurred 3mo from the current match date are
+  probably useless"). Explicitly NOT season-aware: no season-label check, no
+  special-case discontinuity at a season boundary — the earlier illustrative
+  example's apparent "steep drop" across an 8-week gap was confirmed to be nothing
+  more than the natural shape of one continuous decay curve evaluated at two
+  distant elapsed-time points, not a separate rule. A hard cutoff also lets the
+  underlying SQL query stop pulling games past that point at all, rather than
+  fetching a full last-10 and discarding/near-zero-weighting the stale ones.
+- **`player_trust_score`'s totals must decay consistently, both sides of BOTH
+  ratios — not just `data_coverage_score`'s.** If `players_aggregated_recent_
+  minutes`'s numerator becomes time-decayed, `team_aggregated_recent_roster_
+  minutes` (the `team_total_minutes` denominator) must decay the same way too, or
+  the `min(ratio, 1.0)` cap stops meaning "fully covered." This isn't only
+  `data_coverage_score`'s concern: `roster_change_score`'s `departed_minutes` and
+  `joined_minutes` are built from these SAME two functions
+  (`team_aggregated_recent_roster_minutes` and `players_aggregated_recent_minutes`
+  respectively) — so decaying both functions once fixes `data_coverage_score` AND
+  `roster_change_score` together, no separate mechanism needed for the second one
+  (confirmed 2026-08-13, walking through `roster_change_score` step by step after
+  `data_coverage_score`).
+- **`PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW` (currently 300, a literal minutes
+  count) needs re-examination once minutes are decay-weighted** — 300 raw minutes
+  from last week and 300 raw minutes from 10 weeks ago currently qualify a player
+  identically; once decayed, "300" stops being a real minutes count and the
+  qualifying bar likely needs its own recalibration (user: "I'm not sure the 300
+  minute bar still makes sense... presumably there's a different number that
+  needs to serve the same purpose").
+
+**Staged implementation plan (agreed, deferred until picked back up):**
+
+1. **Structural refactor first, as a verified near-no-op.** Build one shared
+   time-decay helper, wire it into both `load_team_players` (replacing rank decay)
+   and `player_trust_score` (replacing flat sums), using TDD (write the tests for
+   the desired decay behavior first, per user's explicit request, then implement
+   against them). Choose a starting decay parameter close to today's shipped
+   rank-decay behavior and verify via row-level diff of `soccer_model_predictions`
+   before/after (this project's standard "verify plumbing changes are true
+   no-ops" discipline), NOT just "tests pass."
+2. **Calibration sweep second, as a real model-behavior change.** Because this
+   touches `load_team_players` (the rating engine feeding `lambda_home`/
+   `lambda_away` for every prediction), the actual decay half-life/cutoff constant
+   needs the same bias/Brier/ROI sweep discipline as every other tuned constant in
+   `MODEL_TUNING_PARAMETERS.md` — picked from real backtest evidence, not the
+   number that felt reasonable in design conversation.
+3. Recalibrate/redefine the minutes-qualifying threshold (replacing the current
+   300-minute literal bar) once decayed minutes are in place, on the same
+   evidence-based footing.
+
+**Stage 1 (DONE 2026-08-14): built the centralized function, wired it into all
+three call sites, verified structurally near-no-op.** Built via TDD (tests
+first, confirmed red, then implemented): `calendar_recency_weight(match_date,
+before_date, half_life_days, cutoff_days)` (compute_club_player_strength.py,
+right before raw_team_strength -- same placement convention as BUG-014's
+`spread_around_mean`). Exponential decay by elapsed CALENDAR days (not
+rank/position in a list), with a hard floor: exactly 0.0 once
+`elapsed_days > cutoff_days`, 1.0 at `elapsed_days == 0`, halving every
+`half_life_days` below the cutoff. Two matches on the same calendar day with
+different kickoff times (a real case -- an early and a late kickoff on the
+same matchday) truncate to `elapsed_days == 0`, not an error -- only a
+genuinely negative gap (a real lookahead) raises. `match_date`/`before_date`
+are parsed via `str(x)[:10]` before `date.fromisoformat` -- found live
+backfilling Bundesliga that `soccer_matches.match_date` carries a full
+timestamp for some data sources (`'2025-08-22T18:30:00.000Z'`) and a plain
+`'YYYY-MM-DD'` for others; adopted the same truncate-then-parse convention
+already used elsewhere in this codebase (e.g. `import_wc_match_xg.py`) rather
+than inventing a new one. 9 unit tests cover the decay shape, the hard-cutoff
+boundary, same-day handling, the mixed-timestamp-format parsing, and the
+negative-gap rejection.
+
+Wired into all three root-cause call sites from the design above:
+- `load_team_players`'s per-game weight (`w = decay ** rank`, rank = position in
+  the top-`window_size` list) replaced by `calendar_recency_weight(g["match_date"],
+  before_date, ...)` -- an actual elapsed-time weight, applied to both the
+  attack and defense accumulators (they already shared one per-game weight, see
+  root-cause #2 above, so one change fixes both sides).
+- `team_aggregated_recent_roster_minutes` and `players_aggregated_recent_minutes`
+  (player_trust_score's two aggregation functions) -- both changed from a flat
+  SQL `SUM(minutes_played)` to a per-game `calendar_recency_weight`-weighted sum
+  computed in Python (had to pull `match_date` alongside `minutes_played` per
+  row instead of letting SQL aggregate it). Both decay the same way, per the
+  design note above (`roster_change_score`'s ratio compares them against each
+  other, so they must move together).
+- Root cause #3 (the team-attribution/candidate-narrowing gate, still a match
+  COUNT not a calendar bound) is deliberately **not** touched in Stage 1 -- the
+  design's own staged plan only calls for the shared time-decay helper wired
+  into `load_team_players` and `player_trust_score` at this stage; the
+  attribution gate is folded into Stage 2's real cutoff-day tightening instead
+  (a hard `cutoff_days` is what lets that gate become calendar-bound instead of
+  count-bound, per the design note: "a hard cutoff also lets the underlying SQL
+  query stop pulling games past that point at all").
+
+`PLAYER_RATING_RECENCY_HALF_LIFE_DAYS`/`PLAYER_RATING_RECENCY_CUTOFF_DAYS`
+(new constants, replacing the now-dead `PLAYER_RATING_PAST_MATCH_WINDOW_DECAY`,
+which no call site used anymore -- deleted rather than left as backwards-compat
+cruft, and swapped for the two new constants in `model_metrics_report.py`'s
+auto-recorded `KNOB_NAMES` list) both default to `1.0e12` days -- deliberately
+absurd, so `0.5 ** (elapsed_days / half_life_days)` is indistinguishable from
+1.0 to double-precision float error for any realistic elapsed gap. This is
+Stage 1's actual no-op mechanism, not just "a small number": even a literal
+multi-century elapsed_days value rounds to a weight of 1.0 - O(1e-9) or
+smaller.
+
+**Verified near-no-op two ways:**
+1. Full test suite (435 tests) required updating ~13 existing assertions from
+   exact `==` float/dict equality to `pytest.approx(...)` -- the previous
+   rank-based `decay=1.0` was a mathematically EXACT no-op (`1.0 ** rank ==
+   1.0` for every rank), so old tests could assert exact sums; calendar decay
+   at even the most extreme near-no-op setting is still a real (if
+   ~1e-9-to-1e-11-scale) floating-point computation, not an exact identity.
+   Four tests seeding a player at exactly the 300-minute
+   `PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING` boundary had
+   to move to 400 minutes -- any nonzero decay strictly below 1.0, applied to a
+   value sitting exactly ON a `>=` gate, tips it just under, dropping the
+   player from having an own rating entirely (a genuine edge-case discovery,
+   not just a tolerance issue -- documented as vanishingly unlikely in real
+   production data, since real weighted-minutes sums essentially never land on
+   an exact integer boundary once real decay curves are involved, but real for
+   a hand-constructed boundary-exact test fixture).
+2. Row-level diff of real production data: re-backfilled Bundesliga 2025 under
+   a scratch method tag (`poisson_v4_1_stage1_calendar_decay`, since deleted)
+   with today's code (calendar decay wired in) and diffed all 306 matches'
+   `p_home`/`p_draw`/`p_away` against the existing `poisson_v4_1` rows
+   (pre-Stage-1 code). Zero rows differ by more than 1e-6; the actual max
+   deviation across all 306 matches x 3 outcomes was ~2.7e-11 -- floating-point
+   noise, not a behavior change. This project's "verify plumbing changes are
+   true no-ops" discipline (row diff, not just "tests pass") -- same standard
+   BUG-014's Stage 1 was held to.
+
+**Stage 2, shipped 2026-08-15 as `poisson_v4_2`.** Swept exponential-shape
+candidates (half_life/cutoff pairs, ratio 1.5x per the user's own "half-life
+felt too fast relative to the cutoff" feedback) pooled across all 5 leagues x
+2024/2025 -- 6 candidates tried (60/90, 80/120, 120/180, 150/225, 200/300,
+300/450) against the `poisson_v4_1_1` baseline (BUG-016-corrected). Picked
+half_life=120d (~4mo) / cutoff=180d (~6mo): among the best EV>10% ROI gains of
+any candidate (+1.8pp pooled) for a modest Brier cost, and easy to remember.
+Real impact vs. `poisson_v4_1_1`, pooled and per-league (Brier / ROI @0/5/10%
+EV, Bet365):
+
+| | Brier | ROI @0/5/10% |
+|---|---|---|
+| ALL-UP old | 0.6031 (n=3533) | -7.6 / -7.2 / -8.8% |
+| ALL-UP new | 0.6037 (n=3533) | -7.3 / -8.1 / -7.0% |
+| Serie A | 0.6072→**0.6059** | -9.4/-9.0/-6.9% (was -9.6/-8.9/-9.8%) |
+| Premier League | 0.6109→0.6107 | +6.1/+6.0/+4.7% (was +2.4/+4.2/+3.1%) |
+| Bundesliga | 0.6064→0.6087 (worse) | -17.0/-19.8/-17.7% (was -18.3/-18.1/-17.1%) |
+| La Liga | 0.5919→0.5916 | -12.7/-14.2/-12.8% (was -11.7/-13.4/-17.1%) |
+| Ligue 1 | 0.5987→0.6019 (worse) | -5.0/-5.4/-4.7% (was -1.5/-1.2/-3.8%) |
+
+Mixed per-league, not a clean win everywhere: Serie A/Premier League/La Liga
+improve, Bundesliga and Ligue 1 get worse. Bundesliga's degradation isn't
+surprising (BUG-015: already a known-noisy 2-season sample). **Ligue 1's
+degradation was investigated in depth** (user pushed back correctly on an
+initial hand-wavy "early season = thinner data" explanation, since every
+league uses the identical window/decay/schedule and that alone can't explain
+one league/season standing out) -- traced to a real, verified mechanism: it's
+concentrated almost entirely in Aug/Sep 2025 (108 of 611 matches, but ~88% of
+the whole season's Brier degradation), and the proximate cause isn't the
+player-rating math itself (checked: no player's last-10-appearance window
+actually drops a game to the 180-day cutoff for the worst-affected teams) but
+`player_trust_score`'s blend weight collapsing hard toward team-level right at
+a new season's start -- e.g. RC Lens's `weight_attack` went from 0.0 (fully
+trust player-level) to 0.41-0.54 across its worst-affected matches, because
+the "current squad minutes coverage" signal (same half_life/cutoff) has much
+less to work with right when a season has barely begun, and RC Lens's
+team-level rating happens to underrate them relative to their real
+(player-level) strength this season. Not really "Ligue-1-specific" as a root
+cause -- every league's early season hits the same starvation, it just landed
+harder on these particular teams' player-vs-team gap. This is a direct preview
+of, and motivation for, the still-open **root cause #3** below (the
+count-based team-attribution gate) -- v4_3's unified weighted-minutes design
+is the more targeted fix for this exact interaction, not further half-life/
+cutoff tuning.
+
+**Follow-on fix found and shipped alongside v4_2, same day:** `roster_as_of_
+date`'s fallback path (used only for a team's literal first match of a season,
+before any current-season match exists yet -- reaches into the PREVIOUS
+season by design) called `team_aggregated_recent_roster_minutes` with no way
+to override half_life/cutoff, so it silently inherited whatever the module
+default was. Found while re-validating the test suite after promoting real
+Stage 2 values to the module defaults (28 tests failed, one of which exposed
+this). Fixed by hardcoding that one internal call to near-no-op regardless of
+the module default -- the fallback's whole purpose is reaching back as far as
+needed, independent of the rating-decay cutoff. Traced the actual timeline:
+both `poisson_v4_1_1` and `poisson_v4_2`'s backfills ran BEFORE the module
+defaults were promoted from Stage 1's near-infinite values to the real 120/180
+-- so this bug was dormant during both runs (the un-parameterized fallback
+call was already using near-infinite values at that time, coincidentally
+identical to what the fix now hardcodes) and neither already-shipped version's
+numbers needed re-running. The fix matters going forward: every future
+backfill now permanently has the real 120/180 as its module default, so
+without this fix, `roster_as_of_date`'s fallback would have started silently
+picking up real decay on every future run's first-match-of-season predictions.
+
+Promoted to shipped module defaults (`PLAYER_RATING_RECENCY_HALF_LIFE_DAYS`/
+`_CUTOFF_DAYS` = 120.0/180.0) -- live picks (`generate_club_league_card.py`)
+reflect this now, not just backfill/backtest tooling.
+
+**Root cause #3, shipped 2026-08-15 as `poisson_v4_3`.** The count-based
+team-attribution/candidate-narrowing gate in `load_team_players` (a player had
+to have appeared in the team's own last `window_size` matches by COUNT to be
+considered at all) converted to calendar-based: a new constant,
+`PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_TO_BE_A_CANDIDATE = 10.0`, gates on
+calendar-decayed weighted minutes at the player's actual attributed team
+(summed across every appearance within `cutoff_days`), checked against the
+team they're really attributed to -- not just "cleared some team's floor"
+(see the constant's own comment for why that scoping matters: a thin debut at
+a new team isn't rescued by a big history at the old one). Deliberately low
+floor (10 minutes, per the user's own reasoning): this is just a gate, not a
+calibration target -- `apply_shrinkage` already pulls thin samples toward the
+positional prior regardless, so the gate only needs to guard against literal
+single-minute-cameo data-artifact noise, not protect against thin-but-real
+data. Old gate was fixture-density-sensitive (a team's own "last window_size
+matches" stretches or shrinks in calendar time depending on how densely
+they've played -- a dense cup stretch could exclude a player out just 6-7
+weeks; a sparse schedule could still include one who hasn't played in
+months); new gate doesn't care how many matches the team has played since,
+only real elapsed time. TDD (7 new tests replacing the old count-based test),
+full suite green (455 tests), ruff clean.
+
+**Impact vs. `poisson_v4_2` (real backfill, 5 leagues x 2024/2025 + Serie A
+2022/2023):** pooled Brier 0.6037→0.6036 (negligible), ROI within ~0.1-0.6pp
+at every threshold, no consistent direction, every league near-flat. Same
+profile as BUG-016: a real, individually-meaningful fix (fixes a genuine
+fixture-density bug) whose pooled effect is small because it only changes
+which players qualify for a relatively narrow set of matches. Promoted
+immediately -- pure code fix, no tunable constant to separately promote,
+live picks reflect it now.
+
+**Investigated and explicitly did NOT fix Ligue 1's v4_2 weakness (important
+correction to this entry's own earlier framing).** v4_3 only touches
+`load_team_players` (the RATING computation). The actual mechanism behind
+RC Lens/Lille/Nice/Le Havre's `weight_attack` collapse lives in a completely
+different function, `player_trust_score` (the BLEND-WEIGHT computation) --
+confirmed empirically: RC Lens's `weight_attack` is bit-for-bit unchanged by
+v4_3. Digging into `player_trust_score` found a real, deeper issue: its
+"prior roster reference" is anchored not to the real `before_date` but to
+`team_prior_window_cutoff_date`'s output -- a purely count-based boundary (no
+calendar awareness, no decay) that, early in a season, can reach back nearly
+a full year (confirmed for RC Lens: `prior_cutoff` = 2025-03-30, itself 152
+days before the real 2025-08-29 evaluation date, with the actual roster data
+reaching toward October 2024). `team_aggregated_recent_roster_minutes`'s own
+decay is then computed relative to that stale `prior_cutoff`, not the real
+date -- so simply calendar-izing that function's OWN count limit (its
+`LIMIT n`) wouldn't fix anything, since it's being fed the wrong reference
+point to begin with. Proposed fix (prototyped, not yet built): drop
+`team_prior_window_cutoff_date` and the two-adjacent-count-windows design
+entirely -- decay already lets a single calendar window express "how recent"
+smoothly, so the second window (originally built to compensate for
+count-based windows having no granularity) is no longer needed. Compare
+current roster directly against one calendar-decayed recent-minutes window,
+anchored to the real `before_date`.
+
+**Prototype validated for churn-signal correctness** (methodical check,
+per the user's explicit request, using the CORRECT point-in-time roster via
+`roster_as_of_date` -- see the correction below) across RC Lens + 4 other real
+Ligue 1 teams, both early- and mid-season: departed-player counts look
+real and plausible (7-19 depending on team), and at mid-season the new design
+correctly converges to zero detected churn (roster has caught up with
+itself), cleaner than the old mechanism, which still shows small nonzero
+"leftover" churn readings months later (a residue of the stale-window bug).
+**But it moves trust the WRONG direction for the original goal**: at
+season-start, the corrected mechanism gives LOWER trust (MORE team-level
+weight) than the current buggy one, not higher -- RC Lens goes from 0.4763
+(current, buggy) to 0.2945 (prototype). This is backwards from what would
+help Ligue 1's calibration. Why: a point-in-time roster (what backtesting
+uses) can only register players who've ALREADY PLAYED for the team this
+season -- by construction it can never detect a "joined" player who hasn't
+debuted yet, so 100% of the churn signal comes from the "departed" side. The
+old, bloated, stale reference window diluted real departures inside a huge
+pool of ancient data; the tighter, correct window surfaces MORE of that
+departure signal cleanly -- more technically correct, but reads as more
+churn, not less. **Not built into production** -- real architectural
+improvement worth having on its own merits (removes a genuine staleness bug,
+cleaner mid-season behavior), but doesn't rescue Ligue 1's calibration, so
+not urgent. Logged here as a scoped, ready-to-build follow-up if/when wanted.
+
+**Correction found along the way:** the ad-hoc diagnostic scripts used
+earlier in this investigation (the ones that produced the original
+`weight_attack` numbers cited above in this entry, e.g. "0.000 -> 0.414")
+had a real methodology bug -- they called `resolve_blend_weight`/`compute()`
+without passing `current_roster_ids_by_team`, so they silently used
+`current_roster_player_ids` (today's LIVE roster, as of whenever the script
+ran) instead of the point-in-time roster (`roster_as_of_date`) the real
+backfill actually uses. **The shipped `poisson_v4_1_1`/`poisson_v4_2`
+predictions themselves are unaffected** -- `backfill_player_blend_
+predictions.py` always correctly passes the point-in-time roster -- only the
+follow-up diagnostic scripts used the wrong signal. Corrected real numbers
+for the originally-flagged matches (baseline = near-no-op decay, v4_2 = real
+shipped settings, both with the correct point-in-time roster):
+
+| Team | Date | baseline | v4_2 (corrected) |
+|---|---|---|---|
+| RC Lens | 2025-08-29 | 0.0000 | 0.5237 |
+| RC Lens | 2025-09-20 | 0.0019 | 0.5985 |
+| Lille | 2025-09-28 | 0.0000 | 0.5513 |
+| Nice | 2025-08-31 | 0.3205 | 0.6794 |
+| Nice | 2025-10-29 | 0.1695 | 0.4866 |
+| Le Havre | 2025-08-31 | 0.4021 | 0.7126 |
+
+**Magnitude check, done properly (not just eyeballed):** is a +0.3-to-+0.6
+shift, or a resulting weight in the 0.5-0.7 range, actually unusual? Two
+checks, both real data:
+1. Shift size for a TYPICAL (not cherry-picked) team's early match, across
+   all 5 leagues, one match per team: mean/median shifts of +0.02 to +0.04
+   everywhere, Ligue 1 unremarkable among them (mean +0.044, max +0.107) --
+   the 6 flagged matches (+0.31 to +0.60) are genuine outliers, not
+   "what early season normally looks like."
+2. Absolute weight_attack VALUE at a genuinely comparable point (each Ligue 1
+   team's 2nd graded match of the season, same `roster_as_of_date` branch):
+   league range 0.62-0.91, mean 0.80. RC Lens (0.619) is the LOWEST of all 18
+   teams -- i.e. the model trusts player-level data MORE for RC Lens than for
+   any other Ligue 1 team at this point in the season, not less. Lille/Nice/
+   Le Havre are also bottom-third, not top. **The flagged teams are not
+   outliers toward excessive team-level trust -- if anything the opposite.**
+   Reinforces the read that this is real season-to-season variance in which
+   teams the (normally-behaving) team-level fallback happens to fit well,
+   not a mechanism defect -- same flavor of conclusion as BUG-015.
+
+---
+
 ## FEATURE-017 — All-up metrics report across every league/season/market; renamed model_snapshot.py — **SHIPPED 2026-08-11**
 
 - **Type:** enhancement · **Status:** SHIPPED 2026-08-11. Logged/built same day —
@@ -754,6 +1722,65 @@ and cross-league-gating fixes already made, plus two now-disconfirmed hypotheses
 (player-defense stretch, team-defense stretch) that no longer need re-testing by
 a future investigation, plus a real, separate correctness bug fixed along the way
 (defense cross-league gating). Status stays OPEN.
+
+**2026-08-12 addendum: home-bet calibration diagnostic shipped
+(`diagnose_home_bet_calibration.py`).** ROI investigation clarified that the
+failure is not mean bias vs Betfair but **selection-conditional overconfidence
+on home sides that clear EV>0** (optional floor=0.25). Tool has two modes: (1)
+fast slice report on stored predictions — calib = model_p − realized wr, by
+league/season/month/gap_bf/λ-diff/team; (2) `--deep-dive N` point-in-time
+recompute of player/team/blend λ components (same path as
+`backfill_player_blend_predictions.py`) for the N largest model−Betfair home
+gaps. First live read on current `poisson_v4` (floor on, 5 leagues × 2024–25):
+
+- Home EV+ floor bets: n=1330, ROI −8.3%, **calib +0.124** (model 0.557 vs wr 0.433).
+- **gap_bf ≤ 0.05**: calib ~0, ROI **+6.3%**. **gap_bf > 0.15**: calib **+0.202**.
+  Disagreement with sharp ranks error, not edge.
+- Bundesliga home-bet calib **+0.199** / ROI −28%; Ligue 1 least bad (+0.078 / +8% ROI).
+- Deep-dive top-12 by gap_bf: mean p 0.679 vs wr 0.167; recomputes match stored
+  rows (Δ=0). Cohort is **team-weight heavy** (mean home/away w≈0.80–0.83), not
+  pure-player trust collapse. Mean (player−team) home_att ≈ −0.09 (mixed);
+  away_def player is **lower** than team on average (player rates elite away
+  defenses tighter) — so the inflated p_home on this tail is often already in
+  **team-level λs** (and/or matchup math), not only a player-blend blow-up.
+  Counterexamples still exist (e.g. Levante/Madrid, Southampton/Man Utd with
+  low home w_att and player attack >> team).
+
+**2026-08-12 follow-up: Pattern A/B classifier + control cohort in the same
+tool.** `--deep-dive N` now labels each recompute (A = home team-weight ≥0.85;
+B = home team-weight ≤0.40 and player home-att − team ≥0.15; else MIXED) and,
+by default, also recomputes N low-|gap_bf| controls (`--control 0` to skip).
+First live n=8 / n=8:
+
+- Overconfident tail: **A=5, B=2, MIXED=1**. Pattern A mean p=0.76 vs wr=0.20;
+  away **team** attack mean only **0.86** (crushed visitor attack in team form).
+  Pattern B: home att player−team **+0.53**, w≈0.18.
+- Controls (mean gap_bf≈0, wr=0.50≈model 0.51): **no B**; A=4 MIXED=4; away team
+  attack **0.99** (not collapsed like bad-tail A). So high team weight alone is
+  not the bug — bad A cases look like **extreme team matchup tilt** (especially
+  dead away attack), not merely “used team blend.” Status stays OPEN.
+
+**2026-08-12 follow-up: structural team-xG lookback (not another stretch sweep).**
+Diagnosis: live v4 team form is a **flat last-10 sum-of-player-xG mean** with
+**no opponent adjustment**; goals-path decay exists but is 1.0 and unused under
+pure xG. Shipped wire-up (defaults **unchanged** so stored poisson_v4 is a
+no-op):
+
+- `TEAM_RATING_XG_WINDOW_DECAY` (default 1.0) + `get_team_xg_ratings(..., decay=)`
+- `TEAM_RATING_XG_OPPONENT_ADJUST` (default False): point-in-time scale each past
+  match’s xG/xGA by opponent’s **raw** defense/attack as of that match date
+  (two-pass league means; no circular adjust-on-adjust).
+- Threaded through `league_xg_field_means` / `team_level_lambda` / `compute`
+  (`xg_window_decay=`, `xg_opponent_adjust=`).
+
+Unit tests cover decay weighting, SOS boost vs stingy defense, and default =
+legacy mean. First live case A/B on Pattern A examples (full `compute`, not
+production default): **mixed** — e.g. Milan–Roma gap_bf improved with opp_adj
+(+0.245→+0.181) while Auxerre–St-Étienne and Freiburg–Bremen did not; City
+away attack correctly rose under SOS but home p gap worsened. Takeaway: the
+plumbing is the right layer to attack, but opponent-adjust alone is not a
+free lunch — needs method-tagged season backfill + home-bet calib / bias /
+ROI before flipping defaults. Status stays OPEN.
 
 ---
 

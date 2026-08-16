@@ -10,6 +10,7 @@ and excluding pre-rework season-total rows that share the same `season` value.
 import pytest
 
 from core import sports_db
+from core.leagues import LEAGUES
 import compute_club_player_strength as strength
 from compute_club_player_strength import PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE
 
@@ -46,11 +47,11 @@ def test_sums_totals_before_computing_rate_not_average_of_per_match_rates(db_pat
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=10, goals=1, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=80, goals=0, conn=conn)
 
-    by_team = strength.load_team_players(conn, [team], "2026-01-01")
+    by_team = strength.load_team_players(conn, [team], "2026-01-01", half_life_days=1.0e12, cutoff_days=1.0e12)
     assert len(by_team[team]) == 1
     assert by_team[team][0]["attack_rate"] == pytest.approx(1.0)
     assert by_team[team][0]["attack_rate"] != pytest.approx(4.5)
-    assert by_team[team][0]["attack_minutes"] == 90
+    assert by_team[team][0]["attack_minutes"] == pytest.approx(90)
 
 
 def test_prefers_real_xg_over_goals_when_present(db_path, conn):
@@ -85,7 +86,7 @@ def test_uses_xg_total_even_when_only_some_matches_have_it(db_path, conn):
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=45,
                                      goals=1, xg=None, conn=conn)
 
-    by_team = strength.load_team_players(conn, [team], "2026-01-01")
+    by_team = strength.load_team_players(conn, [team], "2026-01-01", half_life_days=1.0e12, cutoff_days=1.0e12)
     # total xg = 0.5 (second match contributes 0, not its goal), total minutes = 90
     assert by_team[team][0]["attack_rate"] == pytest.approx(0.5)
 
@@ -103,7 +104,7 @@ def test_defense_is_minutes_weighted_not_simple_average(db_path, conn):
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=10,
                                      club_ga_per90=0, conn=conn)
 
-    by_team = strength.load_team_players(conn, [team], "2026-01-01")
+    by_team = strength.load_team_players(conn, [team], "2026-01-01", half_life_days=1.0e12, cutoff_days=1.0e12)
     expected = (90 * 2 + 10 * 0) / 100
     assert by_team[team][0]["club_ga_per90"] == pytest.approx(expected)
     assert by_team[team][0]["club_ga_per90"] != pytest.approx(1.0)
@@ -145,9 +146,9 @@ def test_excludes_legacy_season_total_rows_without_match_id(tmp_path):
                    VALUES (1, NULL, 2025, NULL, 2500, 20)""")
     raw.commit()
 
-    by_team = strength.load_team_players(raw, [10], "2026-01-01")
+    by_team = strength.load_team_players(raw, [10], "2026-01-01", half_life_days=1.0e12, cutoff_days=1.0e12)
     assert len(by_team[10]) == 1
-    assert by_team[10][0]["attack_minutes"] == 90   # NOT 90 + 2500
+    assert by_team[10][0]["attack_minutes"] == pytest.approx(90)   # NOT 90 + 2500
     raw.close()
 
 
@@ -175,7 +176,7 @@ def test_attributes_stats_to_match_time_team_not_current_team(db_path, conn):
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home",
                                      minutes_played=450, goals=1, conn=conn)
 
-    by_team = strength.load_team_players(conn, [team_a, team_b], "2026-06-01")
+    by_team = strength.load_team_players(conn, [team_a, team_b], "2026-06-01", half_life_days=1.0e12, cutoff_days=1.0e12)
     assert by_team[team_a] == []
     assert len(by_team[team_b]) == 1
     assert by_team[team_b][0]["attack_minutes"] == pytest.approx(1350)
@@ -258,8 +259,9 @@ def test_team_aggregated_recent_roster_minutes_reaches_across_a_season_boundary(
     player = sports_db.add_player(team_a, "Veteran", conn=conn)
     sports_db.add_player_match_stats(player, m1, season=2023, venue="home", minutes_played=900, conn=conn)
 
-    minutes = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2025-01-01")
-    assert minutes[player] == 900
+    minutes = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2025-01-01",
+                                                               half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert minutes[player] == pytest.approx(900)
 
 
 def test_team_aggregated_recent_roster_minutes_is_team_scoped(db_path, conn):
@@ -280,9 +282,10 @@ def test_team_aggregated_recent_roster_minutes_is_team_scoped(db_path, conn):
     sports_db.add_player_match_stats(opp_a_player, m1, season=2025, venue="away", minutes_played=90, conn=conn)
     sports_db.add_player_match_stats(opp_b_player, m2, season=2025, venue="away", minutes_played=90, conn=conn)
 
-    assert strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01") == {player: 400}
-    assert strength.team_aggregated_recent_roster_minutes(conn, team_b, "2026-01-01") == {player: 600}
-    assert strength.team_aggregated_recent_roster_minutes(conn, opp_a, "2026-01-01") == {opp_a_player: 90}
+    kw = dict(half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01", **kw) == pytest.approx({player: 400})
+    assert strength.team_aggregated_recent_roster_minutes(conn, team_b, "2026-01-01", **kw) == pytest.approx({player: 600})
+    assert strength.team_aggregated_recent_roster_minutes(conn, opp_a, "2026-01-01", **kw) == pytest.approx({opp_a_player: 90})
 
 
 def test_team_aggregated_recent_roster_minutes_before_date_excludes_later_matches(db_path, conn):
@@ -292,10 +295,12 @@ def test_team_aggregated_recent_roster_minutes_before_date_excludes_later_matche
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=90, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=90, conn=conn)
 
-    early = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2025-10-01")
-    full = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01")
-    assert early[player] == 90    # only m1
-    assert full[player] == 180    # both
+    early = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2025-10-01",
+                                                             half_life_days=1.0e12, cutoff_days=1.0e12)
+    full = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01",
+                                                            half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert early[player] == pytest.approx(90)    # only m1
+    assert full[player] == pytest.approx(180)    # both
 
 
 def test_team_aggregated_recent_roster_minutes_limits_to_last_n_matches(db_path, conn):
@@ -307,8 +312,9 @@ def test_team_aggregated_recent_roster_minutes_limits_to_last_n_matches(db_path,
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=90, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=90, conn=conn)
 
-    windowed = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01", n=1)
-    assert windowed[player] == 90   # only m2, the more recent of the two
+    windowed = strength.team_aggregated_recent_roster_minutes(conn, team_a, "2026-01-01", n=1,
+                                                                half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert windowed[player] == pytest.approx(90)   # only m2, the more recent of the two
 
 
 def test_team_aggregated_recent_roster_minutes_empty_when_no_matches_at_all(db_path, conn):
@@ -328,8 +334,9 @@ def test_players_recent_minutes_is_team_agnostic(db_path, conn):
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=400, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=600, conn=conn)
 
-    minutes = strength.players_aggregated_recent_minutes(conn, {player}, "2026-01-01")
-    assert minutes[player] == 1000
+    minutes = strength.players_aggregated_recent_minutes(conn, {player}, "2026-01-01",
+                                                           half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert minutes[player] == pytest.approx(1000)
 
 
 def test_players_recent_minutes_only_computes_requested_players(db_path, conn):
@@ -339,8 +346,9 @@ def test_players_recent_minutes_only_computes_requested_players(db_path, conn):
     sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, conn=conn)
     sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=90, conn=conn)
 
-    minutes = strength.players_aggregated_recent_minutes(conn, {p1}, "2026-01-01")
-    assert minutes == {p1: 90}
+    minutes = strength.players_aggregated_recent_minutes(conn, {p1}, "2026-01-01",
+                                                           half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert minutes == pytest.approx({p1: 90})
 
 
 def test_players_recent_minutes_limits_to_last_n_appearances_per_player(db_path, conn):
@@ -350,8 +358,9 @@ def test_players_recent_minutes_limits_to_last_n_appearances_per_player(db_path,
     sports_db.add_player_match_stats(player, m1, season=2025, venue="home", minutes_played=90, conn=conn)
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home", minutes_played=90, conn=conn)
 
-    windowed = strength.players_aggregated_recent_minutes(conn, {player}, "2026-01-01", n=1)
-    assert windowed[player] == 90   # only the more recent appearance
+    windowed = strength.players_aggregated_recent_minutes(conn, {player}, "2026-01-01", n=1,
+                                                            half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert windowed[player] == pytest.approx(90)   # only the more recent appearance
 
 
 def test_players_recent_minutes_empty_for_no_player_ids(db_path, conn):
@@ -389,10 +398,12 @@ def test_player_trust_high_when_full_coverage_and_full_churn(db_path, conn):
     _transfer(conn, team_a, "P3", "ext_p3")
     _transfer(conn, team_a, "P4", "ext_p4")
 
-    trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1)
+    trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
     assert trust == pytest.approx(1.0)
     assert strength.resolve_blend_weight(
-        conn, team_a, "Serie A", "attack", "2026-09-14", window=1) == pytest.approx(0.0)
+        conn, team_a, "Serie A", "attack", "2026-09-14", window=1,
+        half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0)
 
 
 def test_player_trust_low_when_roster_is_stable_despite_full_coverage(db_path, conn):
@@ -490,6 +501,52 @@ def test_player_trust_zero_when_no_recent_window_history(db_path, conn):
     assert strength.resolve_blend_weight(conn, team_a, "Serie A", "attack", "2026-09-14") == 1.0
 
 
+def test_player_trust_score_half_life_and_cutoff_thread_through_to_aggregations(db_path, conn):
+    """BUG-012 (2026-08-14): half_life_days/cutoff_days must actually reach
+    team_aggregated_recent_roster_minutes/players_aggregated_recent_minutes
+    inside player_trust_score, not just sit accepted-but-unused. Reproduces
+    test_player_trust_high_when_full_coverage_and_full_churn's exact setup
+    (trust=1.0 under explicit near-no-op values -- Stage 2, 2026-08-15, shipped
+    real module defaults, so this test pins its own no-op baseline explicitly
+    rather than relying on the module's) and shows a real, tight cutoff_days
+    collapses it: the "prior roster" reference match (2025-09-01) falls outside
+    a 30-day cutoff from its own window boundary (2025-10-15), so its minutes
+    are excluded entirely and team_total_minutes hits the same zero-history
+    fallback the true no-data case uses."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", season=2025, date="2025-10-01")
+    away_team = sports_db.ensure_soccer_team("MovedOn", "Serie A")
+    _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-10-15")   # boundary only
+
+    p1 = _transfer(conn, team_a, "P1", "ext_p1")
+    p2 = _transfer(conn, team_a, "P2", "ext_p2")
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+
+    p3 = _transfer(conn, team_b, "P3", "ext_p3")
+    p4 = _transfer(conn, team_b, "P4", "ext_p4")
+    sports_db.add_player_match_stats(p3, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+    sports_db.add_player_match_stats(p4, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+
+    _transfer(conn, away_team, "P1", "ext_p1")
+    _transfer(conn, away_team, "P2", "ext_p2")
+    _transfer(conn, team_a, "P3", "ext_p3")
+    _transfer(conn, team_a, "P4", "ext_p4")
+
+    default_trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
+                                                  half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert default_trust == pytest.approx(1.0)
+
+    tight_cutoff_trust = strength.player_trust_score(
+        conn, team_a, "2026-09-14", window=1, half_life_days=30.0, cutoff_days=30.0)
+    assert tight_cutoff_trust == pytest.approx(0.0)
+
+    # And resolve_blend_weight (the inverse, `w`) reflects the same swing.
+    assert strength.resolve_blend_weight(
+        conn, team_a, "Serie A", "attack", "2026-09-14", window=1,
+        half_life_days=30.0, cutoff_days=30.0) == pytest.approx(1.0)
+
+
 def test_resolve_blend_weight_league_override_takes_precedence(db_path, conn, monkeypatch):
     """A league-wide override short-circuits the per-team computation entirely --
     confirmed here by NOT seeding any data (if it fell through to the real
@@ -555,14 +612,16 @@ def test_player_trust_score_accepts_current_roster_ids_override(db_path, conn):
     p1 = sports_db.add_player(team_a, "Stayed Player", api_player_id="ext_stay", conn=conn)
     sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
     # Live default: current_roster_player_ids(team_a) == {p1} -- roster unchanged, trust 0.
-    assert strength.player_trust_score(conn, team_a, "2026-09-14", window=1) == pytest.approx(0.0)
+    assert strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
+                                        half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0)
 
     # Override with a squad that looks completely different from the prior-roster reference.
     p2 = sports_db.add_player(team_a, "Hypothetical New Player", api_player_id="ext_hyp", conn=conn)
     team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppC", season=2025, date="2025-09-08")
     sports_db.add_player_match_stats(p2, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
     overridden_trust = strength.player_trust_score(
-        conn, team_a, "2026-09-14", current_roster_ids={p2}, window=1)
+        conn, team_a, "2026-09-14", current_roster_ids={p2}, window=1,
+        half_life_days=1.0e12, cutoff_days=1.0e12)
     assert overridden_trust == pytest.approx(1.0)
 
 
@@ -614,10 +673,10 @@ def test_load_team_players_before_date_excludes_later_matches(db_path, conn):
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home",
                                      minutes_played=90, goals=5, conn=conn)
 
-    early = strength.load_team_players(conn, [team_a], "2025-10-01")
-    full = strength.load_team_players(conn, [team_a], "2026-01-01")
-    assert early[team_a][0]["attack_minutes"] == 90     # only m1
-    assert full[team_a][0]["attack_minutes"] == 180     # both
+    early = strength.load_team_players(conn, [team_a], "2025-10-01", half_life_days=1.0e12, cutoff_days=1.0e12)
+    full = strength.load_team_players(conn, [team_a], "2026-01-01", half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert early[team_a][0]["attack_minutes"] == pytest.approx(90)     # only m1
+    assert full[team_a][0]["attack_minutes"] == pytest.approx(180)     # both
 
 
 def test_compute_falls_back_to_baseline_for_true_cold_start_team(db_path, conn):
@@ -638,6 +697,30 @@ def test_compute_falls_back_to_baseline_for_true_cold_start_team(db_path, conn):
     assert r["lambda_attack_away_blend"] == pytest.approx(r["avg_away"])
     assert r["lambda_defense_home_blend"] == pytest.approx(r["avg_away"])
     assert r["lambda_defense_away_blend"] == pytest.approx(r["avg_home"])
+
+
+def test_compute_falls_back_to_team_level_when_league_attack_mean_is_exactly_zero(db_path, conn):
+    """Found live (BUG-012 Stage 2 calibration sweep, 2026-08-14): a tight recency
+    cutoff can leave so few qualifying teams that the league-wide attack_mean
+    lands on EXACTLY 0.0 (here: the sole qualifying team's own raw rate is 0,
+    since every one of their real matches was scoreless) -- used to reach
+    `avg_home / attack_mean` and raise ZeroDivisionError. Must fall back to
+    team-level instead, same as attack_mean being None entirely."""
+    team_id, opp_id, m1 = _seed_match(conn, "Scoreless", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "Scoreless", "OppB", date="2025-09-08")
+    _, _, m3 = _seed_match(conn, "Scoreless", "OppC", date="2025-09-15")
+    _, _, m4 = _seed_match(conn, "Scoreless", "OppD", date="2025-09-22")
+    player = sports_db.add_player(team_id, "Blanked Striker", position="F", conn=conn)
+    for m in (m1, m2, m3, m4):
+        sports_db.add_player_match_stats(player, m, season=2025, venue="home",
+                                         minutes_played=90, goals=0, conn=conn)
+
+    # Only team_id in scope -> it's the SOLE contributor to attack_vals, so
+    # attack_mean == its own ra == 0.0 exactly, not None.
+    results = strength.compute(conn, [team_id], "Serie A", 2025, before_date="2025-09-23")
+    r = results[team_id]
+    assert r["lambda_attack_home_blend"] == pytest.approx(r["avg_home"])   # team-level fallback
+    assert r["lambda_attack_away_blend"] == pytest.approx(r["avg_away"])
 
 
 # ── get_team_xg_ratings / team_level_lambda's team_metric switch ──────────────────
@@ -731,6 +814,92 @@ def test_get_team_xg_ratings_sum_ignores_teammates_with_no_xg_data(db_path, conn
     assert ratings["home_attack"] == pytest.approx(1.4)
 
 
+
+def test_get_team_xg_ratings_decay_weights_recent_games_more(db_path, conn):
+    """decay<1 weights the most recent match more than older ones in the window."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=90, xg=1.0, conn=conn)
+    sports_db.add_player_match_stats(p1, m2, season=2025, venue="home", minutes_played=90, xg=3.0, conn=conn)
+
+    flat = strength.get_team_xg_ratings(conn, team, "2025-09-09", n=10, league="Serie A", decay=1.0)
+    # most recent (3.0) weight 1, older (1.0) weight 0.5 => (3 + 0.5)/1.5 = 2.333...
+    decayed = strength.get_team_xg_ratings(conn, team, "2025-09-09", n=10, league="Serie A", decay=0.5)
+    assert flat["home_attack"] == pytest.approx(2.0)
+    assert decayed["home_attack"] == pytest.approx((3.0 * 1.0 + 1.0 * 0.5) / 1.5)
+
+
+def test_get_team_xg_ratings_opponent_adjust_boosts_xg_vs_stingy_defense(db_path, conn):
+    """Same raw xG against a tougher defense should rate higher when adjust is on.
+
+    Setup: TeamA away at StrongDef and SoftDef, 1.0 xG both times.
+    StrongDef's home_defense (xGA allowed at home) is low; SoftDef's is high.
+    With league_raw_means fixed, adjust scales attack by mean_def / opp_def.
+    """
+    team = sports_db.ensure_soccer_team("TeamA", "Serie A")
+    strong = sports_db.ensure_soccer_team("StrongDef", "Serie A")
+    soft = sports_db.ensure_soccer_team("SoftDef", "Serie A")
+    fodder = sports_db.ensure_soccer_team("Fodder", "Serie A")
+
+    # Give StrongDef a stingy home_defense history: low xGA at home before the rated matches.
+    # StrongDef home vs Fodder on 2025-08-01: club_xga_per90=0.5 on StrongDef's home rows.
+    m_s_hist = sports_db.add_soccer_match("Serie A", 2025, strong, fodder, "2025-08-01")
+    ps = sports_db.add_player(strong, "SD1", position="D", conn=conn)
+    sports_db.add_player_match_stats(ps, m_s_hist, season=2025, venue="home", minutes_played=90,
+                                     xg=0.1, club_xga_per90=0.5, conn=conn)
+
+    # SoftDef leaky at home: club_xga_per90=2.0
+    m_w_hist = sports_db.add_soccer_match("Serie A", 2025, soft, fodder, "2025-08-02")
+    pw = sports_db.add_player(soft, "WD1", position="D", conn=conn)
+    sports_db.add_player_match_stats(pw, m_w_hist, season=2025, venue="home", minutes_played=90,
+                                     xg=0.1, club_xga_per90=2.0, conn=conn)
+
+    # TeamA away 1.0 xG at each (after their hist so opp ratings are available as-of match date)
+    m1 = sports_db.add_soccer_match("Serie A", 2025, strong, team, "2025-09-01")
+    m2 = sports_db.add_soccer_match("Serie A", 2025, soft, team, "2025-09-08")
+    pa = sports_db.add_player(team, "Att", position="F", conn=conn)
+    sports_db.add_player_match_stats(pa, m1, season=2025, venue="away", minutes_played=90, xg=1.0,
+                                     club_xga_per90=1.0, conn=conn)
+    sports_db.add_player_match_stats(pa, m2, season=2025, venue="away", minutes_played=90, xg=1.0,
+                                     club_xga_per90=1.0, conn=conn)
+
+    league_raw = {
+        "home_attack": 1.2, "home_defense": 1.2,
+        "away_attack": 1.0, "away_defense": 1.0,
+    }
+    raw = strength.get_team_xg_ratings(
+        conn, team, "2025-09-09", n=10, league="Serie A",
+        opponent_adjust=False,
+    )
+    adj = strength.get_team_xg_ratings(
+        conn, team, "2025-09-09", n=10, league="Serie A",
+        opponent_adjust=True, league_raw_means=league_raw,
+    )
+    assert raw["away_attack"] == pytest.approx(1.0)
+    # vs strong (opp home_def=0.5): 1.0 * (1.2/0.5) = 2.4
+    # vs soft   (opp home_def=2.0): 1.0 * (1.2/2.0) = 0.6
+    # mean = 1.5
+    assert adj["away_attack"] == pytest.approx(1.5)
+    assert adj["away_attack"] > raw["away_attack"]
+
+
+def test_get_team_xg_ratings_opponent_adjust_false_matches_legacy_mean(db_path, conn):
+    """Default / opponent_adjust=False must stay a plain mean of team xG (no SOS)."""
+    # TeamA must be the AWAY side so venue=away rows attach to away_team_id.
+    opp, team, m1 = _seed_match(conn, "OppA", "TeamA", date="2025-09-01")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="away", minutes_played=90, xg=1.7, conn=conn)
+    r = strength.get_team_xg_ratings(conn, team, "2025-09-02", n=10, league="Serie A")
+    assert r["away_attack"] == pytest.approx(1.7)
+
+
+def test_decay_weighted_mean_skips_none_and_orders_recent_first():
+    assert strength._decay_weighted_mean([2.0, 0.0], 1.0) == pytest.approx(1.0)
+    assert strength._decay_weighted_mean([2.0, None, 0.0], 1.0) == pytest.approx(1.0)
+    assert strength._decay_weighted_mean([], 0.8) is None
+
+
 def test_team_level_lambda_defaults_to_xg_not_goals(db_path, conn):
     """team_xg_v_goals_blend defaults to 1.0 (pure xG, 2026-08-02) -- must reflect the
     xG-based number, not the goals-based one, proving the default is really wired to
@@ -803,6 +972,231 @@ def test_team_level_lambda_blend_requires_both_sources_to_clear_min_matches(db_p
     assert blended[0] == pytest.approx(1.3)      # blend falls back to avg_home (min(3,2)=2 < 3)
 
 
+# ── spread_around_mean (BUG-014, 2026-08-14) ──────────────────────────────────────
+
+def test_spread_around_mean_additive_matches_the_old_inline_formula():
+    """mode="additive" must be byte-for-byte the same formula every call site
+    used to compute inline, since this refactor's whole point is to be a
+    verified no-op before any call site's behavior changes."""
+    assert strength.spread_around_mean(0.15, 0.20, 2.0, mode="additive") == pytest.approx(
+        0.20 + (0.15 - 0.20) * 2.0
+    )
+
+
+def test_spread_around_mean_additive_can_go_negative():
+    """Documents the KNOWN defect, not a desired behavior -- additive mode is
+    kept only for the no-op wiring stage, not as a fix."""
+    result = strength.spread_around_mean(0.05, 0.20, 2.0, mode="additive")
+    assert result < 0.0
+
+
+def test_spread_around_mean_multiplicative_cannot_go_negative():
+    """The actual fix (BUG-014): multiplicative mode on the exact same inputs
+    that push additive negative above must stay >= 0."""
+    result = strength.spread_around_mean(0.05, 0.20, 2.0, mode="multiplicative")
+    assert result >= 0.0
+    assert result == pytest.approx(0.20 * (0.05 / 0.20) ** 2.0)
+
+
+def test_spread_around_mean_multiplicative_is_a_noop_at_raw_equals_mean():
+    """Same no-op boundary as additive mode: when raw == mean, there's no
+    distance to stretch, so both modes must agree and leave the value alone."""
+    assert strength.spread_around_mean(0.20, 0.20, 2.0, mode="multiplicative") == pytest.approx(0.20)
+    assert strength.spread_around_mean(0.20, 0.20, 2.0, mode="additive") == pytest.approx(0.20)
+
+
+def test_spread_around_mean_multiplicative_only_reaches_zero_at_raw_zero():
+    assert strength.spread_around_mean(0.0, 0.20, 2.0, mode="multiplicative") == pytest.approx(0.0)
+
+
+def test_spread_around_mean_handles_none_and_non_positive_mean():
+    assert strength.spread_around_mean(None, 0.20, 2.0, mode="additive") is None
+    assert strength.spread_around_mean(0.15, None, 2.0, mode="additive") == pytest.approx(0.15)
+    assert strength.spread_around_mean(0.15, 0.0, 2.0, mode="multiplicative") == pytest.approx(0.15)
+
+
+def test_spread_around_mean_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        strength.spread_around_mean(0.15, 0.20, 2.0, mode="bogus")
+
+
+# ── calendar_recency_weight (BUG-012 Stage 1, 2026-08-14) ─────────────────────────
+
+def test_calendar_recency_weight_is_1_at_zero_elapsed_days():
+    """A match played the day right before before_date has elapsed_days=1 (the
+    smallest possible gap given every caller's strict `match_date < before_date`
+    filter) -- weight must be very close to 1.0, not exactly 1.0."""
+    w = strength.calendar_recency_weight("2025-08-30", "2025-08-31", half_life_days=90.0, cutoff_days=365.0)
+    assert w == pytest.approx(0.5 ** (1 / 90.0))
+
+
+def test_calendar_recency_weight_halves_at_the_half_life():
+    w = strength.calendar_recency_weight("2025-06-01", "2025-08-30", half_life_days=90.0, cutoff_days=365.0)
+    assert w == pytest.approx(0.5)
+
+
+def test_calendar_recency_weight_is_zero_past_the_cutoff():
+    """A hard floor, not an asymptote -- exactly 0.0 once elapsed_days exceeds
+    cutoff_days, matching the design's 'any stats 3mo+ old are probably useless'
+    intent (a real cutoff a caller can use to stop counting a match entirely)."""
+    w = strength.calendar_recency_weight("2025-01-01", "2025-12-31", half_life_days=90.0, cutoff_days=180.0)
+    assert w == 0.0
+
+
+def test_calendar_recency_weight_at_exactly_the_cutoff_is_still_positive():
+    """cutoff_days is the boundary elapsed_days must EXCEED to zero out -- a
+    match exactly at the cutoff still gets its (small) decayed weight."""
+    w = strength.calendar_recency_weight("2025-01-01", "2025-06-30", half_life_days=90.0, cutoff_days=180.0)
+    assert w > 0.0
+    assert w == pytest.approx(0.5 ** (180 / 90.0))
+
+
+def test_calendar_recency_weight_longer_half_life_decays_slower():
+    fast = strength.calendar_recency_weight("2025-06-01", "2025-08-30", half_life_days=30.0, cutoff_days=365.0)
+    slow = strength.calendar_recency_weight("2025-06-01", "2025-08-30", half_life_days=180.0, cutoff_days=365.0)
+    assert slow > fast
+
+
+def test_calendar_recency_weight_linear_shape_is_a_straight_ramp_to_the_cutoff():
+    """shape='linear' (added 2026-08-14, exploring a slower-feeling decay than
+    exponential per user feedback that half-life decay felt too fast relative
+    to the cutoff): weight = 1 - elapsed_days / cutoff_days -- half_life_days is
+    unused in this shape, the cutoff alone defines the whole ramp."""
+    w = strength.calendar_recency_weight("2025-06-01", "2025-08-30", cutoff_days=180.0, shape="linear")
+    elapsed = 90
+    assert w == pytest.approx(1.0 - elapsed / 180.0)
+
+
+def test_calendar_recency_weight_linear_shape_is_1_at_zero_elapsed_and_0_at_cutoff():
+    at_start = strength.calendar_recency_weight("2025-08-30", "2025-08-31", cutoff_days=90.0, shape="linear")
+    assert at_start == pytest.approx(1.0 - 1 / 90.0)
+    at_cutoff = strength.calendar_recency_weight("2025-06-02", "2025-08-31", cutoff_days=90.0, shape="linear")
+    assert at_cutoff == pytest.approx(0.0, abs=1e-9)
+
+
+def test_calendar_recency_weight_linear_decays_slower_than_exponential_near_the_start():
+    """The whole point of adding this shape: at the SAME cutoff, linear should
+    keep more weight on recent-but-not-brand-new matches than exponential decay
+    with a half-life well inside that cutoff does."""
+    linear = strength.calendar_recency_weight("2025-06-01", "2025-07-01", cutoff_days=90.0, shape="linear")
+    exponential = strength.calendar_recency_weight("2025-06-01", "2025-07-01", half_life_days=30.0,
+                                                    cutoff_days=90.0, shape="exponential")
+    assert linear > exponential
+
+
+def test_calendar_recency_weight_flat_shape_is_full_weight_inside_the_cutoff():
+    """shape='flat' (added 2026-08-14): isolates the "count-window -> calendar-
+    window" swap from adding any decay curve at all -- full weight (1.0) for
+    any match within cutoff_days, same old-behavior flatness the count-based
+    window used to have (decay=1.0 shipped), just bounded by calendar days
+    instead of by game count. half_life_days is unused, same as linear."""
+    just_inside = strength.calendar_recency_weight("2025-03-01", "2025-08-27", cutoff_days=180.0, shape="flat")
+    assert just_inside == pytest.approx(1.0)
+
+
+def test_calendar_recency_weight_flat_shape_is_zero_just_past_the_cutoff():
+    just_outside = strength.calendar_recency_weight("2025-02-01", "2025-08-27", cutoff_days=180.0, shape="flat")
+    assert just_outside == pytest.approx(0.0)
+
+
+def test_calendar_recency_weight_rejects_unknown_shape():
+    with pytest.raises(ValueError):
+        strength.calendar_recency_weight("2025-08-30", "2025-08-31", cutoff_days=90.0, shape="bogus")
+
+
+def test_calendar_recency_weight_same_calendar_day_is_not_an_error():
+    """Two matches on the same calendar day with different kickoff times (a real
+    case: an early and a late kickoff on the same matchday) truncate to
+    elapsed_days == 0 -- valid, not a lookahead, full weight."""
+    w = strength.calendar_recency_weight(
+        "2025-08-22T16:30:00.000Z", "2025-08-22T18:30:00.000Z", half_life_days=90.0, cutoff_days=365.0
+    )
+    assert w == pytest.approx(1.0)
+    assert strength.calendar_recency_weight("2025-08-31", "2025-08-31", half_life_days=90.0, cutoff_days=365.0) == pytest.approx(1.0)
+
+
+def test_calendar_recency_weight_rejects_negative_elapsed_days():
+    """A genuinely negative gap (before_date's calendar day earlier than
+    match_date's) signals a real caller bug -- a lookahead -- not a valid
+    input -- fail loud rather than silently return a meaningless weight."""
+    with pytest.raises(ValueError):
+        strength.calendar_recency_weight("2025-09-01", "2025-08-31", half_life_days=90.0, cutoff_days=365.0)
+
+
+def test_calendar_recency_weight_handles_full_timestamp_match_dates():
+    """soccer_matches.match_date carries a full timestamp for some data sources
+    (e.g. TheStatsAPI-sourced leagues: '2025-08-22T18:30:00.000Z'), plain
+    'YYYY-MM-DD' for others -- found live backfilling Bundesliga under this
+    function. Must parse both the same way (first 10 chars)."""
+    w = strength.calendar_recency_weight(
+        "2025-08-22T18:30:00.000Z", "2025-08-31", half_life_days=90.0, cutoff_days=365.0
+    )
+    assert w == pytest.approx(0.5 ** (9 / 90.0))
+
+
+def test_calendar_recency_weight_defaults_are_the_shipped_stage2_values():
+    """Stage 2 (2026-08-15, shipped as poisson_v4_2): module defaults are the real,
+    swept half_life=120d/cutoff=180d -- picked from a multi-league sweep pooled
+    across all 5 leagues x 2 seasons (BUGS.md BUG-012). Pins the actual shipped
+    behavior directly, rather than the old Stage 1 near-no-op assumption this test
+    used to check (module defaults are no longer a no-op)."""
+    assert strength.PLAYER_RATING_RECENCY_HALF_LIFE_DAYS == pytest.approx(120.0)
+    assert strength.PLAYER_RATING_RECENCY_CUTOFF_DAYS == pytest.approx(180.0)
+    # A match 120 days old should carry ~half weight; one past 180 days, none.
+    w_at_half_life = strength.calendar_recency_weight("2025-05-03", "2025-08-31")
+    assert w_at_half_life == pytest.approx(0.5, abs=1e-2)
+    w_past_cutoff = strength.calendar_recency_weight("2025-01-01", "2025-08-31")
+    assert w_past_cutoff == 0.0
+
+
+# ── match_calendar_date/matches_on_date (BUG-016, 2026-08-15) ──────────────────
+
+def test_match_calendar_date_truncates_a_full_timestamp():
+    assert strength.match_calendar_date("2025-08-22T18:30:00.000Z") == "2025-08-22"
+
+
+def test_match_calendar_date_is_a_noop_on_a_plain_date():
+    assert strength.match_calendar_date("2025-08-22") == "2025-08-22"
+
+
+def test_matches_on_date_groups_same_day_different_kickoff_times_together():
+    """The bug this function fixes: two matches on the same Saturday at
+    different kickoff times used to land in separate itertools.groupby groups
+    (grouped by the exact match_date string) and trigger two redundant
+    full-league compute() calls instead of one."""
+    rows = [
+        {"match_id": 1, "match_date": "2025-08-22T15:00:00.000Z"},
+        {"match_id": 2, "match_date": "2025-08-22T17:30:00.000Z"},
+        {"match_id": 3, "match_date": "2025-08-23T15:00:00.000Z"},
+    ]
+    same_day = strength.matches_on_date(rows, "2025-08-22")
+    assert [r["match_id"] for r in same_day] == [1, 2]
+    next_day = strength.matches_on_date(rows, "2025-08-23")
+    assert [r["match_id"] for r in next_day] == [3]
+
+
+def test_matches_on_date_handles_plain_date_rows_too():
+    rows = [{"match_id": 1, "match_date": "2025-08-22"}, {"match_id": 2, "match_date": "2025-08-23"}]
+    assert [r["match_id"] for r in strength.matches_on_date(rows, "2025-08-22")] == [1]
+
+
+def test_matches_on_date_returns_empty_for_a_date_with_no_matches():
+    rows = [{"match_id": 1, "match_date": "2025-08-22"}]
+    assert strength.matches_on_date(rows, "2025-09-01") == []
+
+
+def test_bare_calendar_date_before_date_excludes_every_same_day_match():
+    """A bare 'YYYY-MM-DD' before_date (what matches_on_date's caller now
+    passes to compute()) is a strict string-prefix of any full-timestamp
+    match_date on that same day, so 'match_date < before_date' correctly
+    excludes ALL of that day's matches -- including an earlier same-day
+    kickoff, which the old exact-timestamp grouping could let leak into a
+    later same-day match's rating (before_date = that later match's own,
+    later timestamp)."""
+    assert not ("2025-08-22T15:00:00.000Z" < "2025-08-22")
+    assert "2025-08-15T18:30:00.000Z" < "2025-08-22"
+
+
 # ── TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE (BUG-009, 2026-08-07 addendum;
 # split into separate attack/defense constants 2026-08-12, BUG-010 continued) ────
 
@@ -828,7 +1222,10 @@ def test_team_level_lambda_stretch_noop_without_league_means(db_path, conn):
 
 def test_team_level_lambda_stretch_recenters_on_league_mean(db_path, conn):
     """With a league_xg_means snapshot supplied, xg_spread_stretch_attack actually
-    moves the raw xG rating: stretched = league_mean + (raw - league_mean) * factor.
+    moves the raw xG rating: stretched = league_mean * (raw / league_mean) ** factor
+    (multiplicative, BUG-014 2026-08-14 -- see spread_around_mean; was additive
+    before this fix, see git history/BUGS.md for the prior formula and the
+    negative-overshoot defect it had).
     Team's own raw home_attack is 2.0 (3 matches clears TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE,
     and TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES=0 makes the shrink-to-fallback step a no-op), so the result
     should be exactly the stretched value, not the raw 2.0."""
@@ -843,7 +1240,7 @@ def test_team_level_lambda_stretch_recenters_on_league_mean(db_path, conn):
     result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1,
                                         xg_spread_stretch_attack=1.3, xg_spread_stretch_defense=1.3,
                                         league_xg_means=league_means)
-    assert result[0] == pytest.approx(1.0 + (2.0 - 1.0) * 1.3)  # 2.3
+    assert result[0] == pytest.approx(1.0 * (2.0 / 1.0) ** 1.3)  # ~2.462
 
 
 def test_team_level_lambda_attack_and_defense_stretch_apply_independently(db_path, conn):
@@ -863,8 +1260,30 @@ def test_team_level_lambda_attack_and_defense_stretch_apply_independently(db_pat
     home_attack, _, home_defense, _ = strength.team_level_lambda(
         conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1,
         xg_spread_stretch_attack=2.0, xg_spread_stretch_defense=1.0, league_xg_means=league_means)
-    assert home_attack == pytest.approx(1.0 + (2.0 - 1.0) * 2.0)   # stretched
+    assert home_attack == pytest.approx(1.0 * (2.0 / 1.0) ** 2.0)  # stretched (multiplicative), = 4.0
     assert home_defense == pytest.approx(2.0)                       # untouched (raw, factor=1.0)
+
+
+def test_team_level_lambda_stretch_cannot_push_attack_negative(db_path, conn):
+    """BUG-014 (2026-08-14): same unguarded formula the player-level stretch had
+    (test_compute_player_spread_stretch_cannot_push_attack_negative), one level
+    up. Was additive (`league_mean + (raw - league_mean) * factor`, no floor); a
+    team with a raw home_attack of 0.0 against a league mean of 1.0, stretched
+    by 2.0x, used to overshoot to -1.0. Now multiplicative (spread_around_mean,
+    mode="multiplicative") -- structurally can't go negative."""
+    team, opp, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    _, _, m2 = _seed_match(conn, "TeamA", "OppB", date="2025-09-08")
+    _, _, m3 = _seed_match(conn, "TeamA", "OppC", date="2025-09-15")
+    p1 = sports_db.add_player(team, "Striker", position="F", conn=conn)
+    for mid in (m1, m2, m3):
+        sports_db.add_player_match_stats(p1, mid, season=2025, venue="home", minutes_played=90, xg=0.0, conn=conn)
+
+    league_means = {"home_attack": 1.0, "home_defense": 1.0, "away_attack": 1.0, "away_defense": 1.0}
+    result = strength.team_level_lambda(conn, team, "Serie A", "2025-09-16", avg_home=1.3, avg_away=1.1,
+                                        xg_spread_stretch_attack=2.0, xg_spread_stretch_defense=1.0,
+                                        league_xg_means=league_means)
+    home_attack = result[0]
+    assert home_attack >= 0.0
 
 
 def test_league_xg_field_means_averages_across_team_ids(db_path, conn):
@@ -905,7 +1324,7 @@ def test_compute_wires_xg_spread_stretch_through_to_team_level_lambda(db_path, c
 
     assert unstretched[team_a]["lambda_attack_team_home"] == pytest.approx(2.0)
     league_mean = (2.0 + 1.0) / 2
-    assert stretched[team_a]["lambda_attack_team_home"] == pytest.approx(league_mean + (2.0 - league_mean) * 1.3)
+    assert stretched[team_a]["lambda_attack_team_home"] == pytest.approx(league_mean * (2.0 / league_mean) ** 1.3)
     assert stretched[team_a]["lambda_attack_team_home"] != pytest.approx(unstretched[team_a]["lambda_attack_team_home"])
 
 
@@ -921,8 +1340,12 @@ def test_compute_player_spread_stretch_true_noop_at_1_1(db_path, conn):
     team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
     pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
     pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
-    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=300, goals=2, conn=conn)
-    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=300, goals=0, conn=conn)
+    # 400, not exactly 300 -- clears PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_
+    # HAVE_OWN_RATING with room to spare, so BUG-012's calendar decay (even at its
+    # near-no-op Stage 1 defaults, which shave an infinitesimal amount off any
+    # nonzero elapsed gap) can't flip this player across the boundary.
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
 
     noop = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
                             xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
@@ -942,8 +1365,8 @@ def test_compute_player_spread_stretch_default_is_the_locked_in_attack_value(db_
     team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
     pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
     pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
-    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=300, goals=2, conn=conn)
-    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=300, goals=0, conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
 
     default = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
                                xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0)
@@ -964,8 +1387,8 @@ def test_compute_player_spread_stretch_moves_attack_away_from_the_mean(db_path, 
     team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
     pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
     pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
-    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=300, goals=2, conn=conn)
-    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=300, goals=0, conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
 
     unstretched = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
                                    xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
@@ -989,9 +1412,9 @@ def test_compute_player_spread_stretch_attack_and_defense_apply_independently(db
     team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
     pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
     pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
-    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=300,
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400,
                                      goals=2, club_ga_per90=2.0, conn=conn)
-    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=300,
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400,
                                      goals=0, club_ga_per90=0.5, conn=conn)
 
     baseline = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
@@ -1003,6 +1426,87 @@ def test_compute_player_spread_stretch_attack_and_defense_apply_independently(db
 
     assert attack_only[team_a]["lambda_attack_player_home"] != pytest.approx(baseline[team_a]["lambda_attack_player_home"])
     assert attack_only[team_a]["lambda_defense_player_home"] == pytest.approx(baseline[team_a]["lambda_defense_player_home"])
+
+
+def test_compute_player_spread_stretch_cannot_push_attack_negative(db_path, conn):
+    """BUG-014 (2026-08-14): the player_spread_stretch_attack recentering
+    (`new = mean + (raw - mean) * factor`) has no floor -- a team whose raw rate
+    sits far enough below the league mean gets pushed past zero into a negative
+    "attack rate," which is meaningless (a rate of scoring goals can't be
+    negative) and was previously silently absorbed by an unrelated hardcoded
+    floor on the FINAL match lambda three steps downstream (core.poisson_model.
+    analyse_match_wc's `max(lambda, 0.1)`), not caught at its actual source.
+    Found via 1. FC Koeln, whose real player pool (thinned further by BUG-013)
+    produced exactly this shape.
+
+    Scenario: TeamA plays 10 real matches with zero goals across its whole
+    player-rating window (a genuinely toothless attack, not just a thin
+    sample -- shrinkage alone isn't enough to protect it here). TeamB has one
+    high-scoring outlier match that pulls the league-wide mean up hard. TeamA's
+    shrunk rate ends up under half the resulting mean, so the locked-in 2.0x
+    stretch overshoots past zero -- confirmed BEFORE this fix lands
+    (lambda_attack_player_home == -0.1444...), which is exactly the defect this
+    test locks in a fix for."""
+    team_a, _, _ = _seed_match(conn, "WeakAttack", "WeakAttackOpp0", date="2025-01-01")
+    for i in range(10):
+        opp = sports_db.ensure_soccer_team(f"WeakAttackOpp{i}", "Serie A")
+        match_id = sports_db.add_soccer_match("Serie A", 2025, team_a, opp, f"2025-{(i % 8) + 1:02d}-01")
+        if i == 0:
+            player_a = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+        sports_db.add_player_match_stats(player_a, match_id, season=2025, venue="home",
+                                         minutes_played=90, goals=0, conn=conn)
+
+    team_b, _, match_b = _seed_match(conn, "StrongAttack", "StrongAttackOpp", date="2025-09-01")
+    player_b = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(player_b, match_b, season=2025, venue="home",
+                                     minutes_played=300, goals=10, conn=conn)
+
+    result = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                              xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                              player_spread_stretch_attack=2.0, player_spread_stretch_defense=1.0,
+                              player_recency_half_life_days=1.0e12, player_recency_cutoff_days=1.0e12)
+    assert result[team_a]["lambda_attack_player_home"] >= 0.0
+    assert result[team_a]["lambda_attack_player_home"] is not None
+
+
+def test_compute_player_spread_stretch_cannot_push_defense_negative(db_path, conn):
+    """Defense-side sibling of test_compute_player_spread_stretch_cannot_push_
+    attack_negative -- same defect, mirrored: a team with an exceptionally LOW
+    (strong) raw defense rate, pulled far enough below the league mean by a
+    high-conceding outlier team, overshoots past zero under stretch. Uses an
+    EXPLICIT player_spread_stretch_defense=2.0 rather than the production
+    default (currently 1.0, a true no-op) -- this test protects the formula
+    itself for whenever that constant is ever tuned away from 1.0, not just
+    today's shipped (inert) value.
+
+    TeamB needs >=300 WEIGHTED minutes (minutes * DEF's 0.8 position weight)
+    to even join the league-wide defense_mean at all
+    (PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE) -- 375
+    raw minutes clears that (375*0.8=300); 300 raw minutes (the attack test's
+    number) does NOT (300*0.8=240), which was tried first and silently made
+    defense_mean equal TeamA's own value (a guaranteed no-op regardless of
+    stretch mode) -- caught by manually re-deriving why an early version of
+    this test passed even under still-additive code, not by assuming."""
+    team_a, _, _ = _seed_match(conn, "StrongDefense", "StrongDefenseOpp0", date="2025-01-01")
+    for i in range(10):
+        opp = sports_db.ensure_soccer_team(f"StrongDefenseOpp{i}", "Serie A")
+        match_id = sports_db.add_soccer_match("Serie A", 2025, team_a, opp, f"2025-{(i % 8) + 1:02d}-01")
+        if i == 0:
+            player_a = sports_db.add_player(team_a, "DefenderA", position="D", conn=conn)
+        sports_db.add_player_match_stats(player_a, match_id, season=2025, venue="home",
+                                         minutes_played=90, goals=0, club_ga_per90=0.0, conn=conn)
+
+    team_b, _, match_b = _seed_match(conn, "WeakDefense", "WeakDefenseOpp", date="2025-09-01")
+    player_b = sports_db.add_player(team_b, "DefenderB", position="D", conn=conn)
+    sports_db.add_player_match_stats(player_b, match_b, season=2025, venue="home",
+                                     minutes_played=375, goals=0, club_ga_per90=10.0, conn=conn)
+
+    result = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                              xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                              player_spread_stretch_attack=1.0, player_spread_stretch_defense=2.0,
+                              player_recency_half_life_days=1.0e12, player_recency_cutoff_days=1.0e12)
+    assert result[team_a]["lambda_defense_player_home"] >= 0.0
+    assert result[team_a]["lambda_defense_player_home"] is not None
 
 
 # ── load_team_players: rolling window (FEATURE-011 Follow-up B, 2026-08-06) ──────
@@ -1017,24 +1521,127 @@ def _seed_match_league(conn, league, home_name, away_name, season, date):
     return home, away, match_id
 
 
-def test_candidate_narrowing_excludes_a_player_absent_from_the_teams_own_recent_matches(db_path, conn):
-    """2026-08-11 (performance + correctness, found validating BUG-010): a player
-    whose most recent appearance for `team` is still their global most-recent
-    appearance overall, but falls OUTSIDE team's own last `window_size` matches
-    (the team has played on without them since), must be excluded entirely -- not
-    just have a stale rating. They're not plausibly part of what the team's doing
-    now, e.g. a long-term injury, so their old stats shouldn't dilute the rating."""
-    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-09-01")   # player's only match
-    _, _, m2 = _seed_match(conn, "Home", "OppB", date="2025-09-08")
-    _, _, m3 = _seed_match(conn, "Home", "OppC", date="2025-09-15")        # most recent
-    injured = sports_db.add_player(team, "Long-Term Injury", position="F", conn=conn)
-    sports_db.add_player_match_stats(injured, m1, season=2025, venue="home",
+def test_candidate_narrowing_excludes_a_player_outside_the_cutoff_window(db_path, conn):
+    """BUG-012 root cause #3 (2026-08-15, v4_3): the candidate-narrowing gate is now
+    calendar-bound (cutoff_days), replacing the old count-based "team's last
+    window_size matches" rule. A player whose only appearance for `team` is further
+    back than cutoff_days is excluded -- genuinely stale, not just off the count."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-01-01")
+    stale = sports_db.add_player(team, "Genuinely Stale", position="F", conn=conn)
+    sports_db.add_player_match_stats(stale, m1, season=2025, venue="home",
                                      minutes_played=90, goals=1, conn=conn)
-    # No stats for the injured player in m2/m3 -- team played on without them.
 
-    # window_size=2: team's own "recent" matches are m2+m3, NOT m1.
-    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=2, decay=1.0)
-    assert injured not in {p["player_id"] for p in by_team[team]}
+    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=180.0)
+    assert stale not in {p["player_id"] for p in by_team[team]}
+
+
+def test_candidate_narrowing_includes_a_player_within_cutoff_even_if_team_played_many_matches_since(db_path, conn):
+    """The actual bug root cause #3 fixes: the OLD count-based gate ("team's last
+    window_size matches") was fixture-density-sensitive -- a team squeezing many
+    matches into a short calendar span could exclude a player who's still
+    genuinely recent in real elapsed time. The NEW gate doesn't care how many
+    matches the team has played since, only how long ago (in calendar time) the
+    player's own appearance was."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-09-01")
+    recent = sports_db.add_player(team, "Recent But Bypassed", position="F", conn=conn)
+    sports_db.add_player_match_stats(recent, m1, season=2025, venue="home",
+                                     minutes_played=90, goals=1, conn=conn)
+    # Team plays on WITHOUT this player -- 10 more matches in the following days (a
+    # dense fixture stretch) -- would push m1 outside a window_size=10 count-based
+    # gate even though only ~2 weeks have actually elapsed.
+    for i in range(10):
+        opp_i = sports_db.ensure_soccer_team(f"Opp{i}", "Serie A")
+        sports_db.add_soccer_match("Serie A", 2025, team, opp_i, f"2025-09-{2 + i:02d}")
+
+    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=180.0)
+    assert recent in {p["player_id"] for p in by_team[team]}
+
+
+def test_candidate_narrowing_excludes_a_player_below_the_minimum_weighted_minutes_floor(db_path, conn):
+    """Real, recent appearance, but too thin to plausibly matter --
+    PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_TO_BE_A_CANDIDATE (10.0) is a sanity
+    floor against single-minute-cameo noise, not a meaningful calibration target
+    (per the user's own reasoning: apply_shrinkage already handles thin samples
+    that DO clear the gate, so the gate itself can stay deliberately low)."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-09-01")
+    cameo = sports_db.add_player(team, "Fleeting Cameo", position="F", conn=conn)
+    sports_db.add_player_match_stats(cameo, m1, season=2025, venue="home", minutes_played=5, conn=conn)
+
+    by_team = strength.load_team_players(conn, [team], "2025-09-02", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=180.0)
+    assert cameo not in {p["player_id"] for p in by_team[team]}
+
+
+def test_candidate_narrowing_includes_a_player_at_the_minimum_weighted_minutes_floor(db_path, conn):
+    """Inclusive floor: exactly the minimum weighted minutes still clears the gate.
+    Uses same-calendar-day timestamps (elapsed_days == 0, a real, common case --
+    see calendar_recency_weight's own docstring) so the decay weight is EXACTLY
+    1.0, not a floating-point-near-1.0 value that could tip either side of the
+    boundary depending on half_life_days -- isolates the floor's own >= semantics
+    from decay-precision noise."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-09-01T08:00:00")
+    just_enough = sports_db.add_player(team, "Just Enough", position="F", conn=conn)
+    sports_db.add_player_match_stats(just_enough, m1, season=2025, venue="home", minutes_played=10, conn=conn)
+
+    by_team = strength.load_team_players(conn, [team], "2025-09-01T20:00:00", window_size=10,
+                                         half_life_days=90.0, cutoff_days=180.0)
+    assert just_enough in {p["player_id"] for p in by_team[team]}
+
+
+def test_candidate_narrowing_sums_weighted_minutes_across_multiple_matches_for_the_same_team(db_path, conn):
+    """Two short appearances that individually wouldn't clear the floor, but
+    together do -- the gate sums weighted minutes across every qualifying match
+    for that team within the cutoff, not just a single match."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-08-25")
+    _, _, m2 = _seed_match(conn, "Home", "OppB", date="2025-09-01")
+    two_cameos = sports_db.add_player(team, "Two Cameos", position="F", conn=conn)
+    sports_db.add_player_match_stats(two_cameos, m1, season=2025, venue="home", minutes_played=6, conn=conn)
+    sports_db.add_player_match_stats(two_cameos, m2, season=2025, venue="home", minutes_played=6, conn=conn)
+
+    by_team = strength.load_team_players(conn, [team], "2025-09-02", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=180.0)
+    assert two_cameos in {p["player_id"] for p in by_team[team]}
+
+
+def test_candidate_narrowing_gate_is_scoped_to_the_players_actual_current_team(db_path, conn):
+    """The floor is checked against weighted minutes AT THE TEAM the player is
+    actually attributed to (their single most recent appearance), not against
+    minutes summed across every team they've recently touched -- a genuine thin
+    (5-minute) debut at a new team shouldn't get "unlocked" by a big substantial
+    history at the OLD team the player just left."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", date="2025-08-01")
+    team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")   # more recent -- the transfer
+    p1 = _transfer(conn, team_a, "Thin Debut", "ext_thin_debut")
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home",
+                                     minutes_played=900, conn=conn)   # big history at OLD team
+    _transfer(conn, team_b, "Thin Debut", "ext_thin_debut")           # transfer to team_b
+    sports_db.add_player_match_stats(p1, m2, season=2025, venue="home",
+                                     minutes_played=5, conn=conn)     # thin debut at NEW team
+
+    by_team = strength.load_team_players(conn, [team_a, team_b], "2025-09-02", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=180.0)
+    # Most recent appearance was for team_b, so that's who they'd be attributed to
+    # -- but 5 weighted minutes there doesn't clear the floor. NOT rescued by
+    # team_a's big history either -- that's not their current team anymore.
+    assert p1 not in {p["player_id"] for p in by_team[team_a]}
+    assert p1 not in {p["player_id"] for p in by_team[team_b]}
+
+
+def test_candidate_narrowing_handles_near_infinite_cutoff_without_overflow(db_path, conn):
+    """cutoff_days can be an intentionally huge near-no-op sentinel (Stage 1
+    back-compat / other tests' explicit near-no-op overrides, e.g. 1e12) --
+    timedelta can't represent that many days, so the SQL-level date bound must be
+    skipped in that regime rather than raising OverflowError."""
+    team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2020-01-01")
+    veteran = sports_db.add_player(team, "Ancient History", position="F", conn=conn)
+    sports_db.add_player_match_stats(veteran, m1, season=2020, venue="home",
+                                     minutes_played=90, goals=1, conn=conn)
+
+    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=10,
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert veteran in {p["player_id"] for p in by_team[team]}
 
 
 def test_window_size_limits_to_most_recent_n_appearances(db_path, conn):
@@ -1052,16 +1659,19 @@ def test_window_size_limits_to_most_recent_n_appearances(db_path, conn):
     sports_db.add_player_match_stats(player, m3, season=2025, venue="home",
                                      minutes_played=90, goals=3, conn=conn)   # most recent
 
-    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=2, decay=1.0)
+    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=2,
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
     p = by_team[team][0]
     assert p["attack_minutes"] == pytest.approx(180)          # only m2+m3, not m1's 90 too
     assert p["attack_rate"] == pytest.approx((2 + 3) / 180 * 90)
 
 
-def test_decay_downweights_older_appearances_in_window(db_path, conn):
-    """Within the window, decay**rank (rank 0 = most recent) applies to both the
-    goal/xg numerator and the minutes denominator -- decay < 1.0 pulls the rate
-    toward the more recent game, not just a flat average of what's in the window."""
+def test_calendar_decay_downweights_older_appearances_in_window(db_path, conn):
+    """BUG-012 (2026-08-14): within the window, calendar_recency_weight(match_date,
+    before_date) applies to both the goal/xg numerator and the minutes denominator
+    -- an older match (more elapsed calendar days) gets pulled down, same shape as
+    the old rank-based decay**rank this replaced, but driven by actual elapsed
+    time rather than list position."""
     team, opp, m1 = _seed_match(conn, "Home", "OppA", date="2025-09-08")
     _, _, m2 = _seed_match(conn, "Home", "OppB", date="2025-09-15")   # more recent
     player = sports_db.add_player(team, "Striker", position="F", conn=conn)
@@ -1070,13 +1680,20 @@ def test_decay_downweights_older_appearances_in_window(db_path, conn):
     sports_db.add_player_match_stats(player, m2, season=2025, venue="home",
                                      minutes_played=90, goals=3, conn=conn)
 
-    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=2, decay=0.5)
+    by_team = strength.load_team_players(conn, [team], "2025-09-16", window_size=2,
+                                         half_life_days=7.0, cutoff_days=365.0)
     p = by_team[team][0]
-    # rank0 (m2, goals=3) weight 1.0, rank1 (m1, goals=2) weight 0.5.
-    expected_num = 1.0 * 3 + 0.5 * 2
-    expected_den = 1.0 * 90 + 0.5 * 90
+    w_m2 = strength.calendar_recency_weight("2025-09-15", "2025-09-16",
+                                            half_life_days=7.0, cutoff_days=365.0)
+    w_m1 = strength.calendar_recency_weight("2025-09-08", "2025-09-16",
+                                            half_life_days=7.0, cutoff_days=365.0)
+    expected_num = w_m2 * 3 + w_m1 * 2
+    expected_den = w_m2 * 90 + w_m1 * 90
     assert p["attack_minutes"] == pytest.approx(expected_den)
     assert p["attack_rate"] == pytest.approx(expected_num / expected_den * 90)
+    # And the more recent game's weight really is larger -- the actual behavior
+    # being tested, not just an arithmetic identity against the same formula.
+    assert w_m2 > w_m1
 
 
 def test_season_blind_reaches_across_a_season_boundary(db_path, conn):
@@ -1095,7 +1712,8 @@ def test_season_blind_reaches_across_a_season_boundary(db_path, conn):
     sports_db.add_player_match_stats(player, m_cur, season=2025, venue="home",
                                      minutes_played=90, goals=0, conn=conn)
 
-    season_blind = strength.load_team_players(conn, [cur_team], "2025-09-02", window_size=10)
+    season_blind = strength.load_team_players(conn, [cur_team], "2025-09-02", window_size=10,
+                                               half_life_days=1.0e12, cutoff_days=1.0e12)
     assert season_blind[cur_team][0]["attack_minutes"] == pytest.approx(990)   # both games
     assert season_blind[cur_team][0]["attack_rate"] == pytest.approx(10 / 990 * 90)
     assert season_blind[cur_team][0]["attack_rate"] > 0.0
@@ -1116,7 +1734,8 @@ def test_min_date_reproduces_a_season_scoped_window_for_comparison(db_path, conn
                                      minutes_played=90, goals=0, conn=conn)
 
     season_scoped = strength.load_team_players(conn, [cur_team], "2025-09-02",
-                                               window_size=10, min_date="2025-08-01")
+                                               window_size=10, min_date="2025-08-01",
+                                               half_life_days=1.0e12, cutoff_days=1.0e12)
     assert season_scoped[cur_team][0]["attack_minutes"] == pytest.approx(90)   # only m_cur
     assert season_scoped[cur_team][0]["attack_rate"] == pytest.approx(0.0)
 
@@ -1141,7 +1760,8 @@ def test_uncalibrated_league_game_excluded_from_both_attack_and_defense(db_path,
                                      minutes_played=90, goals=5, club_ga_per90=3.0, conn=conn)
 
     by_team = strength.load_team_players(conn, [team], "2025-09-09",
-                                         league_strength={"Serie A": 1.0})
+                                         league_strength={"Serie A": 1.0},
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
     p = by_team[team][0]
     assert p["attack_minutes"] == pytest.approx(90)             # only the Serie A game
     assert p["attack_rate"] == pytest.approx(1.0)                # only the Serie A goal
@@ -1161,10 +1781,36 @@ def test_calibrated_league_defense_is_unscaled_by_the_attack_factor(db_path, con
                                      minutes_played=90, goals=0, club_ga_per90=2.0, conn=conn)
 
     by_team = strength.load_team_players(conn, [team], "2025-09-08",
-                                         league_strength={"Serie B": 0.663})
+                                         league_strength={"Serie B": 0.663},
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
     p = by_team[team][0]
     assert p["defense_minutes"] == pytest.approx(90)
     assert p["club_ga_per90"] == pytest.approx(2.0)   # NOT 2.0 * 0.663
+
+
+def test_every_registered_feeder_division_has_a_cross_league_adjustment_entry():
+    """BUG-013 (2026-08-14): a league with no PLAYER_RATING_CROSS_LEAGUE_GOAL_
+    ADJUSTMENT entry has its games EXCLUDED ENTIRELY from a player's rating (see
+    load_team_players' docstring/gate) -- not scaled, not discounted, just
+    dropped. When 2. Bundesliga/Championship/LaLiga 2/Ligue 2 were added to
+    core.leagues.LEAGUES as feeder divisions (multi-league expansion) they were
+    never added here, so a promoted team's real recent history was silently
+    thrown out -- found via 1. FC Koeln (promoted from 2. Bundesliga) having its
+    player-level attack rating collapse to a single 90-minute, scoreless sample.
+    This generic check (every league.lower_division in LEAGUES must have an
+    entry here) would have caught that gap immediately, and catches it again for
+    any future league added the same way -- not hardcoded to today's specific 4
+    divisions."""
+    missing = [
+        league for league, cfg in LEAGUES.items()
+        if cfg["lower_division"] is not None
+        and cfg["lower_division"] not in strength.PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT
+    ]
+    assert missing == [], (
+        f"These leagues' feeder divisions have no PLAYER_RATING_CROSS_LEAGUE_"
+        f"GOAL_ADJUSTMENT entry, so that promotion history is silently excluded: "
+        f"{[LEAGUES[league]['lower_division'] for league in missing]}"
+    )
 
 
 def test_apply_shrinkage_pulls_low_minutes_player_toward_position_prior(db_path, conn):
@@ -1182,7 +1828,8 @@ def test_apply_shrinkage_pulls_low_minutes_player_toward_position_prior(db_path,
     sports_db.add_player_match_stats(p_high, m2, season=2025, venue="home",
                                      minutes_played=9000, goals=200, conn=conn)  # rate 2.0, thick sample
 
-    by_team = strength.load_team_players(conn, [team], "2025-09-09")
+    by_team = strength.load_team_players(conn, [team], "2025-09-09",
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
     prior = strength.positional_priors(by_team, "attack_rate", weight_field="attack_minutes")["FWD"]
     assert prior == pytest.approx((90 * 0.0 + 9000 * 2.0) / (90 + 9000))
 
@@ -1249,7 +1896,8 @@ def test_defense_recentering_scales_by_ratio_to_league_average(db_path, conn):
     team_a = _seed_mirrored_team(conn, "TeamA", 2025, "2025-09-01", minutes=1200, rate=1.5)
     team_b = _seed_mirrored_team(conn, "TeamB", 2025, "2025-09-02", minutes=1200, rate=1.0)
 
-    results = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-03")
+    results = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-03",
+                               player_recency_half_life_days=1.0e12, player_recency_cutoff_days=1.0e12)
     r = results[team_a]
     assert r["avg_home"] == pytest.approx(1.3)
     assert r["avg_away"] == pytest.approx(1.1)
@@ -1287,7 +1935,8 @@ def test_attack_recentering_scales_by_ratio_to_league_average(db_path, conn):
     team_b = _seed_mirrored_team(conn, "TeamB", 2025, "2025-09-02", minutes=1200, rate=1.0)
 
     results = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-03",
-                               player_spread_stretch_attack=1.0, player_spread_stretch_defense=1.0)
+                               player_spread_stretch_attack=1.0, player_spread_stretch_defense=1.0,
+                               player_recency_half_life_days=1.0e12, player_recency_cutoff_days=1.0e12)
     r = results[team_a]
 
     prior = (1200 * 1.5 + 1200 * 1.0) / (1200 + 1200)

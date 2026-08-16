@@ -24,7 +24,7 @@ Usage:
 
 import argparse
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from statistics import mean
 
 from core.sports_db import DATABASE_PATH, set_player_team_strength
@@ -47,18 +47,126 @@ PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE = 900.0
 
 # Player-level rolling window (2026-08-06, MODEL_TUNING_PARAMETERS.md/BUGS.md FEATURE-
 # 011 Follow-up B) -- replaces the old flat season-to-date sum load_team_players used
-# to compute. Mirrors TEAM_PAST_MATCH_WINDOW_SIZE/_DECAY's shape exactly, one level
-# down (player instead of team): a player's attack/defense rate is built from their
-# last N appearances, decay-weighted by recency, SEASON-BLIND -- the window reaches
-# back across a season boundary (and across a team/league change, following the
-# PLAYER not the roster slot) the same way it reaches back across a matchday, with no
-# special-cased "prior season" discount layered on top. This replaces the old
+# to compute. Mirrors TEAM_PAST_MATCH_WINDOW_SIZE's shape, one level down (player
+# instead of team): a player's attack/defense rate is built from their last N
+# appearances, recency-weighted (see PLAYER_RATING_RECENCY_HALF_LIFE_DAYS/_CUTOFF_DAYS
+# below -- BUG-012, 2026-08-14, replaced this window's original rank-based decay
+# constant with calendar-time decay), SEASON-BLIND -- the window reaches back across a
+# season boundary (and across a team/league change, following the PLAYER not the
+# roster slot) the same way it reaches back across a matchday, with no special-cased
+# "prior season" discount layered on top. This replaces the old
 # blend_prior_season_attack/PRIOR_SEASON_DISCOUNT mechanism entirely (retired the same
 # day this was added) -- that mechanism was a cruder, season-boundary-shaped version of
-# exactly this same idea. Starting values match TEAM_PAST_MATCH_WINDOW_SIZE/_DECAY
-# (10 games, decay=1.0/off) -- not yet independently tuned.
+# exactly this same idea. Starting value matches TEAM_PAST_MATCH_WINDOW_SIZE (10 games)
+# -- not yet independently tuned.
 PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
-PLAYER_RATING_PAST_MATCH_WINDOW_DECAY = 1.0
+
+# BUG-012 (2026-08-14) Stage 1: calendar-time-based recency, replacing the
+# rank/count-based windowing above project-wide -- load_team_players' decay**rank
+# (a match's weight depended on its POSITION in a top-N list, not its actual age)
+# and player_trust_score's flat last-N-appearance minute sums (no decay at all).
+# Both let a player out for months still read as fully "recent" just by being
+# inside the top-N, which is the bug (see BUGS.md). Stage 1 shipped near-no-op
+# defaults (~2.7 billion years) as a verified structural no-op. Stage 2
+# (2026-08-15, shipped as poisson_v4_2) tightened these to real, swept values --
+# half_life=120d (~4mo), cutoff=180d (~6mo), exponential shape -- picked from a
+# multi-league sweep pooled across all 5 leagues x 2 seasons (60/90, 80/120,
+# 120/180, 150/225, 200/300, 300/450 all tried; 120/180 gave the best EV>10%
+# ROI improvement of any candidate, +1.8pp pooled, for a modest Brier cost).
+# Real per-league impact (vs poisson_v4_1_1, the BUG-016-corrected baseline):
+# net positive for Serie A/Premier League/La Liga, net negative for Bundesliga
+# (already a known-noisy 2-season sample, BUG-015) and Ligue 1 (traced to the
+# trust-score/blend-weight mechanism below getting starved of roster-coverage
+# data right at a new season's start -- see BUG-012 in BUGS.md). Full sweep +
+# validation detail: BUGS.md BUG-012, MODEL_VERSION_LOG.md poisson_v4_2 entry.
+PLAYER_RATING_RECENCY_HALF_LIFE_DAYS = 120.0
+PLAYER_RATING_RECENCY_CUTOFF_DAYS = 180.0
+
+
+def calendar_recency_weight(match_date, before_date, half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                            cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS, shape="exponential"):
+    """How much a match played on `match_date` still counts as of `before_date`
+    (BUG-012) -- the one centralized function every calendar-time-decay call
+    site routes through, replacing each one's own count/rank-based "recency"
+    proxy (see the constants above for which call sites and why).
+
+    Hard floor common to both shapes: exactly 0.0 once elapsed_days >
+    cutoff_days (a real cutoff a caller can use to stop counting a match at
+    all, not just near-zero-weight it).
+
+    shape="exponential" (default): 1.0 at elapsed_days == 0, halving every
+    half_life_days below the cutoff -- decays fastest right away, then tapers.
+
+    shape="linear" (added 2026-08-14, Stage 2 calibration -- explored because
+    exponential's early-days drop-off felt too aggressive relative to a
+    several-month cutoff): a straight ramp from 1.0 at elapsed_days == 0 down
+    to 0.0 exactly AT elapsed_days == cutoff_days -- `half_life_days` is unused
+    in this shape, cutoff_days alone defines the whole ramp.
+
+    shape="flat" (added 2026-08-14, Stage 2 calibration -- isolates the "count-
+    window -> calendar-window" swap from adding any decay curve at all): 1.0
+    for any match within cutoff_days, no decay whatsoever inside that boundary
+    -- the SAME flatness the old count-based `window_size` mechanism shipped
+    with (its own decay constant was 1.0, a no-op), just bounded by calendar
+    days instead of by game count. `half_life_days` is unused, same as linear.
+
+    match_date, before_date: ISO date strings, plain ('YYYY-MM-DD') or a full
+    timestamp ('YYYY-MM-DDTHH:MM:SS.sssZ') -- soccer_matches.match_date carries
+    either depending on data source, so only the first 10 characters are parsed
+    (same truncate-then-fromisoformat convention already used elsewhere in this
+    codebase, e.g. import_wc_match_xg.py). before_date must not be earlier than
+    match_date's own CALENDAR DAY -- every caller already enforces
+    `match_date < before_date` at the full-timestamp SQL level (the project's
+    no-lookahead discipline), but two matches on the same calendar day with
+    different kickoff times (a real, common case -- an early and a late kickoff
+    on the same matchday) truncate to elapsed_days == 0, not an error: that
+    match is exactly as "recent" as it gets, weight 1.0. Only a genuinely
+    NEGATIVE gap (before_date's calendar day earlier than match_date's) signals
+    a real caller bug -- a lookahead -- and raises rather than silently
+    returning a meaningless weight."""
+    elapsed_days = (date.fromisoformat(str(before_date)[:10]) - date.fromisoformat(str(match_date)[:10])).days
+    if elapsed_days < 0:
+        raise ValueError(
+            f"calendar_recency_weight: before_date ({before_date}) must not be "
+            f"earlier than match_date's calendar day ({match_date})"
+        )
+    if elapsed_days > cutoff_days:
+        return 0.0
+    if shape == "exponential":
+        return 0.5 ** (elapsed_days / half_life_days)
+    if shape == "linear":
+        return 1.0 - elapsed_days / cutoff_days
+    if shape == "flat":
+        return 1.0
+    raise ValueError(f"calendar_recency_weight: unknown shape {shape!r}")
+
+
+def match_calendar_date(match_date):
+    """Calendar-date portion ('YYYY-MM-DD') of a match_date value -- same
+    truncate-then-parse convention as calendar_recency_weight, factored out
+    so callers grouping matches by day don't each reimplement `str(x)[:10]`."""
+    return str(match_date)[:10]
+
+
+def matches_on_date(rows, date):
+    """rows (soccer_matches-shaped, from a query ordered by match_date) whose
+    calendar date equals `date` ('YYYY-MM-DD'), regardless of kickoff time-of-
+    day -- BUG-016, 2026-08-15. Backfill/card scripts previously grouped by
+    the exact match_date string (itertools.groupby), which for full-timestamp
+    leagues meant two same-day matches at different kickoff times landed in
+    separate groups and triggered two redundant full-league compute() calls
+    instead of one -- up to a ~2x blowup in some leagues. Grouping by calendar
+    date instead restores one compute() call per real matchday. Pass `date`
+    itself (not a same-day match's own timestamp) as compute()'s before_date:
+    every match_date < before_date comparison in this codebase already
+    happens on ISO strings, and a bare 'YYYY-MM-DD' is a strict-prefix, so it
+    correctly excludes EVERY match that calendar day (even an earlier same-
+    day kickoff) rather than the old per-timestamp grouping's asymmetric
+    behavior, where an earlier same-day match's already-finished result could
+    leak into a later same-day match's prediction. Matches the live-card
+    convention `compute()`'s own __main__ already uses (date.today().
+    isoformat(), no time component)."""
+    return [r for r in rows if match_calendar_date(r["match_date"]) == date]
 
 # Split 2026-08-06 (MODEL_TUNING_PARAMETERS.md) -- these used to be one constant each
 # (MIN_ATTACK_WEIGHT/MIN_DEFENSE_WEIGHT) doing double duty: gating both whether a team
@@ -72,6 +180,25 @@ PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
 PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
 PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING = 300.0
 PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
+
+# BUG-012 root cause #3 (2026-08-15, v4_3): the candidate-narrowing gate in
+# load_team_players used to be count-based ("was this player in the team's own
+# last window_size matches") -- fixture-density-sensitive, since "last window_size
+# matches" stretches or shrinks in calendar time depending on how densely a team's
+# been playing (a dense cup stretch could exclude a player out just 6-7 weeks;
+# a sparse early-season schedule could still include one who hasn't played in
+# months). Replaced with a calendar-bound check: a player clears the gate for a
+# team if their calendar_recency_weight-weighted minutes AT THAT TEAM specifically
+# (summed across every qualifying appearance within cutoff_days) meet this floor.
+# Deliberately low (per the user's own reasoning, 2026-08-15): this is JUST a
+# gate, not a calibration target -- a player who clears it with a thin sample
+# still gets pulled toward the positional prior by apply_shrinkage, and toward
+# zero further still by calendar_recency_weight if they're old-but-inside-cutoff,
+# so the gate doesn't need to protect against thin/stale data itself, only against
+# literal single-minute-cameo data-artifact noise. 10.0 ~= a genuine late
+# substitute appearance, not swept/calibrated (no meaningful calibration target
+# exists for "how thin is too thin to even try").
+PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_TO_BE_A_CANDIDATE = 10.0
 
 # Blend-weight resolution (FEATURE-011_REQUIREMENTS.md, Blend, resolved 2026-07-30;
 # window made season-blind 2026-08-11, BUG-010). Minutes a player needs, across their
@@ -131,15 +258,7 @@ PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
 #
 # 2026-08-10 (multi-league expansion): Premier League/Bundesliga/La Liga/Ligue 1
 # added at 1.0 -- an ASSUMPTION (peer top-5 leagues, same default as Serie A's own
-# entry), not an empirical derivation like Serie B's 0.663 above. Flagged in BUGS.md
-# as a claim to validate once enough players have tracked minutes in more than one
-# of these leagues to run the same "compare a player to themselves across leagues"
-# methodology. Their feeder divisions (Championship, 2. Bundesliga, LaLiga 2,
-# Ligue 2) deliberately have NO entry yet, same as any league with no entry here --
-# a promoted player's time in one of those divisions is excluded from the attack
-# blend, not assumed equal to its top-flight, until a real Serie-B-style measurement
-# exists for each (needs the player-stats backfill for those divisions to finish
-# first -- also tracked in BUGS.md).
+# entry), not an empirical derivation like Serie B's 0.663 above.
 #
 # 2026-08-12 (BUG-010 continued): the GATE (exclude a league with no entry here,
 # rather than assume Serie-A-equivalent) now also applies to defense in
@@ -148,6 +267,29 @@ PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE = {}
 # only scales attack (it's an attack-specific measurement); defense from a
 # league that DOES have an entry is included unscaled. See load_team_players'
 # docstring for the full mechanism.
+#
+# BUG-013 (2026-08-14): the four new leagues' feeder divisions (Championship,
+# 2. Bundesliga, LaLiga 2, Ligue 2) had NO entry at all -- not even a 1.0
+# placeholder -- so every game a promoted team's players had played in their
+# feeder division was excluded ENTIRELY (not scaled, dropped), collapsing some
+# players' rating input to a single-match sample. Found via 1. FC Koeln
+# (promoted from 2. Bundesliga), whose player-level attack rating went so low it
+# tripped BUG-014's unguarded spread-stretch negative. Fixed the same way Serie
+# B's 0.663 was measured (not guessed): players with >=300 minutes in BOTH the
+# top-flight league and its feeder division (any season), own goals/90 in each,
+# pooled by minutes, ratio = top-flight rate / feeder rate. All four land in a
+# tight, plausible band consistent with Serie B's own 0.663 -- a reasonable
+# cross-check that the methodology itself is sound:
+#   Bundesliga/2. Bundesliga:      152 qualifying players, 0.1143/0.1906 = 0.5999
+#   Premier League/Championship:   162 qualifying players, 0.0931/0.1402 = 0.6643
+#   La Liga/LaLiga 2:              196 qualifying players, 0.0842/0.1294 = 0.6512
+#   Ligue 1/Ligue 2:               159 qualifying players, 0.1016/0.1372 = 0.7408
+# (sample sizes here are larger than Serie B's original 82-player measurement.)
+# See test_every_registered_feeder_division_has_a_cross_league_adjustment_entry
+# in tests/test_compute_club_player_strength.py -- a generic regression test
+# (keyed off core.leagues.LEAGUES' lower_division field, not hardcoded to these
+# 4) that would have caught this gap immediately and catches it for any future
+# league added the same way.
 PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {
     "Serie A": 1.0,
     "Serie B": 0.663,
@@ -155,6 +297,10 @@ PLAYER_RATING_CROSS_LEAGUE_GOAL_ADJUSTMENT = {
     "Bundesliga": 1.0,
     "La Liga": 1.0,
     "Ligue 1": 1.0,
+    "Championship": 0.6643,
+    "2. Bundesliga": 0.5999,
+    "LaLiga 2": 0.6512,
+    "Ligue 2": 0.7408,
 }
 
 # Team-level attack/defense blend between actual-goals-based and xG-based sources
@@ -199,6 +345,28 @@ TEAM_RATING_XG_V_GOALS_BLEND = 1.0
 # original 1.0/1.3/1.66/2.0 sweep, before either value should move.
 TEAM_RATING_XG_SPREAD_STRETCH_ATTACK = 1.3
 TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE = 1.3
+
+# Team-xG lookback structure (2026-08-12, BUG-010 home-bet / Pattern A work).
+# Defaults keep today's shipped behavior (flat last-N mean, no schedule adjust).
+# Live poisson_v4 still uses these defaults until a method-tagged backfill proves
+# the structural change on home-bet calib / gap_bf / bias — do NOT flip production
+# defaults from a single case study.
+#
+# TEAM_RATING_XG_WINDOW_DECAY: recency weights on get_team_xg_ratings, same
+# convention as core.poisson_model.get_team_ratings (most recent weight 1.0, then
+# decay, decay^2, ...). 1.0 = plain average (shipped). Note: goals-path
+# TEAM_PAST_MATCH_WINDOW_DECAY is separate and already 1.0; v4 is pure xG so only
+# THIS constant matters for team form until team_xg_v_goals_blend leaves 1.0.
+TEAM_RATING_XG_WINDOW_DECAY = 1.0
+#
+# TEAM_RATING_XG_OPPONENT_ADJUST: when True, each past match's team xG / xGA is
+# scaled by opponent quality *as of that past match date* (point-in-time raw
+# opponent rating, never the post-adjust rating — avoids circularity):
+#   attack_adj = xG_for * (league_mean_opp_defense / opp_defense)
+#   defense_adj = xGA    * (league_mean_opp_attack  / opp_attack)
+# So 0.4 xG at a stingy defense counts for more than 0.4 xG at a sieve. False
+# (default) = raw xG averages, today's behavior.
+TEAM_RATING_XG_OPPONENT_ADJUST = False
 
 # Player-level counterpart to the team-level stretch above (2026-08-12, BUG-010
 # continued): player-level attack/defense ratings show the SAME kind of compression
@@ -249,7 +417,8 @@ def normalize_position(pos):
 def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg",
                       defense_xg_v_goals_source="xga",
                       window_size=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
-                      decay=PLAYER_RATING_PAST_MATCH_WINDOW_DECAY,
+                      half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                      cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS,
                       league_strength=None, min_date=None):
     """Build one per-player-per-TEAM rating entry from each player's own last
     `window_size` appearances (2026-08-06, FEATURE-011 Follow-up B) -- replaces the
@@ -276,10 +445,12 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     unbuilt; see BUGS.md FEATURE-011). A player whose most recent appearance wasn't
     for a team in `team_ids` doesn't appear in the result at all (e.g. they left the
     league, or their most recent team isn't one being computed for right now) --
-    NOR does a player whose most recent appearance for team_ids happened longer ago
-    than team_ids' own last `window_size` matches (2026-08-11, performance +
-    correctness -- see the candidate-narrowing step above): they haven't featured
-    recently enough to still be part of what the team's actually been doing.
+    NOR does a player whose calendar-decayed weighted minutes at their attributed
+    team (within cutoff_days) fall below PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_
+    TO_BE_A_CANDIDATE (2026-08-11, performance; converted from count-based to
+    calendar-based 2026-08-15, BUG-012 root cause #3/v4_3 -- see the candidate-
+    narrowing step below): they haven't featured recently enough, in real elapsed
+    time, to still be part of what the team's actually been doing.
 
     min_date: optional ISO date lower bound -- when given, the window additionally
     can't reach earlier than this (e.g. a season's start date), for A/B-comparing a
@@ -290,7 +461,17 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     by averaging each match's own per-90 rate -- same "sum before rate" reasoning as
     before (a single sub appearance of a few minutes would otherwise produce a wildly
     noisy per-match rate that a simple average wouldn't smooth out), now with each
-    game additionally weighted by decay**rank (rank 0 = most recent in the window).
+    game additionally weighted by calendar_recency_weight(match_date, before_date) --
+    an actual elapsed-time decay (BUG-012, 2026-08-14), not decay**rank (a game's
+    position in the top-`window_size` list) as this used to work: two games equally
+    "recent" by rank could be months apart in reality (e.g. a team just promoted, or
+    a player back from injury), which decay**rank couldn't tell apart. `half_life_days`/
+    `cutoff_days` default to PLAYER_RATING_RECENCY_HALF_LIFE_DAYS/_CUTOFF_DAYS, set
+    now the real, shipped Stage 2 values (v4_2, 2026-08-15 -- half_life=120d,
+    cutoff=180d). The candidate-narrowing gate below (v4_3, same day) is ALSO
+    calendar-bound now, via these same parameters -- see PLAYER_RATING_MIN_TEAM_
+    WEIGHTED_MINUTES_TO_BE_A_CANDIDATE's own comment for why that gate was
+    converted from the old count-based "team's last window_size matches" rule.
 
     attack_xg_v_goals_source: "xg" (default) uses real xG when at least one game in
     the window has it, falling back to goals for every game in the window otherwise
@@ -339,25 +520,40 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     # every single call, which became the dominant backfill cost once the
     # multi-league expansion grew that table well past what this was originally
     # written against, 15+ of ~23 seconds per 30 compute() calls in a live
-    # profile). Not just a speed shortcut: a player who hasn't appeared in ANY of
-    # team_ids' own last `window_size` matches hasn't plausibly been part of what
-    # this team's been doing lately, so excluding them is more correct, not a
-    # lossy approximation -- the old unbounded reach-back could pull in a player
-    # out injured far longer than the team's own recent form window, diluting the
-    # rating with a contribution that's no longer representative of anything.
+    # profile). Calendar-bound now (2026-08-15, BUG-012 root cause #3/v4_3) --
+    # was "team's own last window_size matches" (count-based, fixture-density-
+    # sensitive: a team squeezing many matches into a short calendar span could
+    # exclude a player who's still genuinely recent in real elapsed time; a sparse
+    # early-season schedule could still reach back months). Everything within
+    # cutoff_days of before_date is a cheap, wide candidate net for this query's
+    # own performance purpose only -- the ACTUAL gate (weighted minutes at the
+    # player's attributed team) is applied below, once each candidate's real
+    # current team is known.
     team_placeholders = ",".join("?" * len(team_ids))
+    team_id_set = set(team_ids)
+    params = [before_date] + list(team_ids) + list(team_ids)
+    date_filter = ""
+    # cutoff_days can be an intentionally huge near-no-op sentinel (Stage 1
+    # back-compat, other tests/callers' explicit near-no-op overrides) --
+    # timedelta can't represent that many days, so skip the SQL-level lower bound
+    # in that regime; calendar_recency_weight's own 0.0-past-cutoff floor still
+    # applies below regardless, this only affects whether the DB query itself is
+    # narrowed early.
+    if cutoff_days < 1_000_000:
+        cutoff_date = (date.fromisoformat(str(before_date)[:10]) - timedelta(days=cutoff_days)).isoformat()
+        date_filter = " AND match_date >= ?"
+        params.append(cutoff_date)
     cur.execute(f"""
-        SELECT match_id, home_team_id, away_team_id FROM soccer_matches
-        WHERE match_date < ?
+        SELECT match_id, home_team_id, away_team_id, match_date FROM soccer_matches
+        WHERE match_date < ?{date_filter}
           AND (home_team_id IN ({team_placeholders}) OR away_team_id IN ({team_placeholders}))
-        ORDER BY match_date DESC
-    """, [before_date] + list(team_ids) + list(team_ids))
-    matches_by_team = {tid: [] for tid in team_ids}
-    for match_id, home_id, away_id in cur.fetchall():
-        for tid in (home_id, away_id):
-            if tid in matches_by_team and len(matches_by_team[tid]) < window_size:
-                matches_by_team[tid].append(match_id)
-    candidate_match_ids = {mid for mids in matches_by_team.values() for mid in mids}
+    """, params)
+    candidate_match_ids = set()
+    match_date_by_id = {}
+    for match_id, home_id, away_id, match_date_val in cur.fetchall():
+        if home_id in team_id_set or away_id in team_id_set:
+            candidate_match_ids.add(match_id)
+            match_date_by_id[match_id] = match_date_val
     if not candidate_match_ids:
         return {tid: [] for tid in team_ids}
 
@@ -369,6 +565,29 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
     candidate_player_ids = [row[0] for row in cur.fetchall()]
     if not candidate_player_ids:
         return {tid: [] for tid in team_ids}
+
+    # The real gate (BUG-012 root cause #3/v4_3): each candidate's calendar-decayed
+    # weighted minutes AT EACH of team_ids specifically, summed across every
+    # qualifying (within-cutoff) appearance for that team -- checked below against
+    # the team the player is actually attributed to, not against whichever team's
+    # floor they happen to clear (a thin debut at a new team isn't "rescued" by a
+    # big history at the old one -- see PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_
+    # TO_BE_A_CANDIDATE's own comment).
+    cur.execute(f"""
+        SELECT s.player_id, s.match_id, s.minutes_played, s.venue,
+               m.home_team_id, m.away_team_id
+        FROM soccer_player_stats s
+        JOIN soccer_matches m ON m.match_id = s.match_id
+        WHERE s.match_id IN ({match_placeholders}) AND s.venue IS NOT NULL
+    """, list(candidate_match_ids))
+    weighted_minutes_at_team = {}
+    for player_id, match_id, minutes, venue, home_id, away_id in cur.fetchall():
+        match_team_id = home_id if venue == "home" else away_id
+        if match_team_id not in team_id_set:
+            continue
+        w = calendar_recency_weight(match_date_by_id[match_id], before_date, half_life_days, cutoff_days)
+        key = (match_team_id, player_id)
+        weighted_minutes_at_team[key] = weighted_minutes_at_team.get(key, 0.0) + w * (minutes or 0)
 
     player_placeholders = ",".join("?" * len(candidate_player_ids))
     sql = f"""
@@ -397,12 +616,16 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
             "team_id": match_team_id, "match_date": match_date, "league": m_league,
         })
 
-    team_id_set = set(team_ids)
     by_team = {tid: [] for tid in team_ids}
     for player_id, games in by_player.items():
         # SQL already ORDER BY match_date DESC per player -- games[0] is most recent.
         current_team = games[0]["team_id"]
         if current_team not in team_id_set:
+            continue
+        # The actual candidate gate (BUG-012 root cause #3/v4_3): checked against
+        # weighted minutes at THIS specific (attributed) team, not just "cleared
+        # some team's floor" -- see weighted_minutes_at_team's own comment above.
+        if weighted_minutes_at_team.get((current_team, player_id), 0.0) < PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_TO_BE_A_CANDIDATE:
             continue
         window = games[:window_size]
         has_xg = attack_xg_v_goals_source == "xg" and any(g["xg"] is not None for g in window)
@@ -410,8 +633,10 @@ def load_team_players(conn, team_ids, before_date, attack_xg_v_goals_source="xg"
         attack_num = attack_den = 0.0
         ga_num = ga_den = 0.0
         xga_num = xga_den = 0.0
-        for rank, g in enumerate(window):
-            w = decay ** rank
+        for g in window:
+            w = calendar_recency_weight(g["match_date"], before_date, half_life_days, cutoff_days)
+            if w == 0.0:
+                continue
             factor = league_strength.get(g["league"])
             if factor is None:
                 # BUG-010, 2026-08-12: this gate now excludes the game from BOTH
@@ -495,6 +720,38 @@ def apply_shrinkage(by_team, k_minutes=PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_R
                     p[field] = (mins * val + k_minutes * prior[pos]) / (mins + k_minutes)
 
 
+def spread_around_mean(raw, mean, factor, mode):
+    """Single shared implementation for "stretch raw's distance from mean by
+    factor" -- BUG-014 (2026-08-14): every call site used to duplicate this
+    formula inline (team_level_lambda's xg_spread_stretch_attack/_defense,
+    compute()'s player_spread_stretch_attack/_defense), and all shared the same
+    defect: additive mode has no floor and can push a rate-like quantity (which
+    can't be negative) past zero on an extreme input. Centralizing it here means
+    the fix (switching a call site to multiplicative) happens in exactly one
+    place per caller, not by hunting down every inline copy.
+
+    mode="additive" (today's shipped behavior, a straight port of the old inline
+    formula, not yet a bug fix on its own): `mean + (raw - mean) * factor`. Can
+    go negative -- kept only so wiring every call site through this function is
+    a verified no-op before any call site's actual behavior changes.
+
+    mode="multiplicative" (the fix, rolled out one call site at a time to
+    measure impact rather than all at once): `mean * (raw / mean) ** factor`.
+    Structurally cannot go negative -- raw/mean stays positive whenever raw and
+    mean are both positive, and any power of a positive number is positive.
+    Only reaches exactly 0 if raw itself is already 0.
+
+    raw/mean of None, or mean <= 0, returns raw unchanged (matches the None-
+    guards every existing call site already had before this refactor)."""
+    if raw is None or mean is None or mean <= 0:
+        return raw
+    if mode == "additive":
+        return mean + (raw - mean) * factor
+    if mode == "multiplicative":
+        return mean * (raw / mean) ** factor
+    raise ValueError(f"spread_around_mean: unknown mode {mode!r}")
+
+
 def raw_team_strength(players):
     a_num = a_w = d_num = d_w = 0.0
     for p in players:
@@ -561,48 +818,77 @@ def team_roster_minutes(conn, team_id, season, before_date=None):
     return {pid: mins or 0 for pid, mins in cur.fetchall()}
 
 
-def team_aggregated_recent_roster_minutes(conn, team_id, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
-    """{player_id: minutes played AT team_id, summed across team_id's own last `n`
-    matches (season-blind, strictly before before_date)} -- the season-blind
-    replacement (BUG-010, 2026-08-11) for team_roster_minutes(team_id, season - 1)
-    as player_trust_score's "prior roster" reference. Same window size/style as
-    load_team_players' own rating window (not a separately-tuned constant) -- the
-    point is comparing roster continuity over the SAME horizon the team-level and
-    player-level ratings themselves already use, not an arbitrary different one.
+def team_aggregated_recent_roster_minutes(conn, team_id, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
+                                          half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                                          cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS):
+    """{player_id: calendar_recency_weight-decayed minutes played AT team_id,
+    across team_id's own last `n` matches (season-blind, strictly before
+    before_date)} -- the season-blind replacement (BUG-010, 2026-08-11) for
+    team_roster_minutes(team_id, season - 1) as player_trust_score's "prior
+    roster" reference. Same window size/style as load_team_players' own rating
+    window (not a separately-tuned constant) -- the point is comparing roster
+    continuity over the SAME horizon the team-level and player-level ratings
+    themselves already use, not an arbitrary different one.
+
+    Each match's minutes are weighted by calendar_recency_weight(match_date,
+    before_date) (BUG-012, 2026-08-14) rather than summed flat -- a match from
+    5 months ago no longer counts the same as one from last week just because
+    both fall inside the same last-`n`-matches window. half_life_days/
+    cutoff_days default to the Stage 1 near-no-op constants (see their own
+    comment); a weight of exactly 0.0 (past cutoff_days) drops that match's
+    minutes from the sum entirely, same shape as load_team_players' own
+    per-game gate.
 
     Team-scoped, same reasoning as team_roster_minutes: answers "how much of
     team_id's own recent production is this player part of.\""""
     cur = conn.cursor()
     cur.execute("""
-        SELECT match_id FROM soccer_matches
+        SELECT match_id, match_date FROM soccer_matches
         WHERE match_date < ? AND (home_team_id = ? OR away_team_id = ?)
         ORDER BY match_date DESC LIMIT ?
     """, (before_date, team_id, team_id, n))
-    match_ids = [row[0] for row in cur.fetchall()]
-    if not match_ids:
+    rows = cur.fetchall()
+    if not rows:
         return {}
+    match_date_by_id = dict(rows)
+    match_ids = list(match_date_by_id)
     placeholders = ",".join("?" * len(match_ids))
     cur.execute(f"""
-        SELECT s.player_id, SUM(s.minutes_played)
+        SELECT s.match_id, s.player_id, s.minutes_played
         FROM soccer_player_stats s
         JOIN soccer_matches m ON m.match_id = s.match_id
         WHERE s.match_id IN ({placeholders}) AND s.venue IS NOT NULL
           AND ((s.venue = 'home' AND m.home_team_id = ?)
                OR (s.venue = 'away' AND m.away_team_id = ?))
-        GROUP BY s.player_id
     """, match_ids + [team_id, team_id])
-    return {pid: mins or 0 for pid, mins in cur.fetchall()}
+    result = {}
+    for match_id, player_id, minutes in cur.fetchall():
+        w = calendar_recency_weight(match_date_by_id[match_id], before_date, half_life_days, cutoff_days)
+        if w == 0.0:
+            continue
+        result[player_id] = result.get(player_id, 0.0) + w * (minutes or 0)
+    return result
 
 
-def players_aggregated_recent_minutes(conn, player_ids, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
-    """{player_id: total minutes across THAT player's own last `n` appearances,
-    ANY team/league (season-blind, strictly before before_date)} -- the season-
-    blind replacement (BUG-010, 2026-08-11) for player_season_minutes(season) as
-    player_trust_score's team-agnostic per-player signal. Deliberately NOT team-
-    scoped, same reasoning as player_season_minutes: a just-transferred player's
-    minutes at their previous club count in full toward their data-coverage
-    signal. Only computes for the given player_ids (not every player in the DB),
-    for efficiency -- callers already know which players they need this for."""
+def players_aggregated_recent_minutes(conn, player_ids, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
+                                      half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                                      cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS):
+    """{player_id: calendar_recency_weight-decayed minutes across THAT player's own
+    last `n` appearances, ANY team/league (season-blind, strictly before
+    before_date)} -- the season-blind replacement (BUG-010, 2026-08-11) for
+    player_season_minutes(season) as player_trust_score's team-agnostic
+    per-player signal. Deliberately NOT team-scoped, same reasoning as
+    player_season_minutes: a just-transferred player's minutes at their
+    previous club count in full toward their data-coverage signal. Only
+    computes for the given player_ids (not every player in the DB), for
+    efficiency -- callers already know which players they need this for.
+
+    Each match's minutes are weighted by calendar_recency_weight(match_date,
+    before_date) (BUG-012, 2026-08-14) rather than summed flat -- same
+    reasoning and half_life_days/cutoff_days defaults as
+    team_aggregated_recent_roster_minutes above (the two must decay
+    consistently, since roster_change_score's ratio compares them against each
+    other)."""
     if not player_ids:
         return {}
     placeholders = ",".join("?" * len(player_ids))
@@ -617,8 +903,15 @@ def players_aggregated_recent_minutes(conn, player_ids, before_date, n=PLAYER_RA
     """, list(player_ids) + [before_date])
     by_player = {}
     for player_id, match_date, minutes in cur.fetchall():
-        by_player.setdefault(player_id, []).append(minutes or 0)
-    return {pid: sum(mins_list[:n]) for pid, mins_list in by_player.items()}
+        by_player.setdefault(player_id, []).append((match_date, minutes or 0))
+    result = {}
+    for pid, games in by_player.items():
+        window = games[:n]
+        result[pid] = sum(
+            calendar_recency_weight(match_date, before_date, half_life_days, cutoff_days) * minutes
+            for match_date, minutes in window
+        )
+    return result
 
 
 def current_roster_player_ids(conn, team_id):
@@ -658,7 +951,17 @@ def roster_as_of_date(conn, team_id, season, before_date):
     this_season = team_roster_minutes(conn, team_id, season, before_date=before_date)
     if this_season:
         return set(this_season.keys())
-    return set(team_aggregated_recent_roster_minutes(conn, team_id, before_date).keys())
+    # Deliberately near-no-op half_life/cutoff here (2026-08-15, BUG-012 follow-up):
+    # this fallback's whole purpose is reaching back into the PREVIOUS season when
+    # the current one has no matches yet -- exactly the moment a real, tightened
+    # cutoff would otherwise return an empty roster (found while re-validating
+    # tests after Stage 2 shipped real values). An empty roster here reads to
+    # player_trust_score as "we know nothing about the current squad," collapsing
+    # trust toward team-level right when this function's whole job is to say
+    # "assume roster continuity." This call intentionally does NOT inherit the
+    # shipped PLAYER_RATING_RECENCY_HALF_LIFE_DAYS/_CUTOFF_DAYS defaults.
+    return set(team_aggregated_recent_roster_minutes(
+        conn, team_id, before_date, half_life_days=1.0e12, cutoff_days=1.0e12).keys())
 
 
 def _memoized(cache, key, fn):
@@ -705,7 +1008,9 @@ def team_prior_window_cutoff_date(conn, team_id, before_date, n=PLAYER_RATING_PA
 
 
 def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cache=None,
-                       window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
+                       window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
+                       half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                       cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS):
     """1.0 = fully trust the player-level lambda for this team; 0.0 = fully trust
     team-level. Two factors, BOTH required (product, not sum/average) -- a stable,
     well-tracked squad has nothing to gain from the player signal even with great
@@ -764,6 +1069,11 @@ def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cach
     season must pass a point-in-time squad instead (e.g. from roster_as_of_date), since
     the live default has no history.
 
+    half_life_days, cutoff_days: passed through to both aggregation functions above
+    (BUG-012, 2026-08-14) -- must be the SAME values for both, since roster_change_
+    score's ratio compares them against each other (see the design note in BUGS.md).
+    Default to the Stage 1 near-no-op constants.
+
     cache: optional dict (BUG-011) memoizing team_aggregated_recent_roster_minutes/
     players_aggregated_recent_minutes within a single compute() call (this function is called
     once per component -- attack, defense -- with identical inputs, so caching still
@@ -785,8 +1095,9 @@ def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cach
     if prior_cutoff is None:
         return 0.0
     aggregated_recent_roster_minutes = _memoized(
-        cache, ("team_aggregated_recent_roster_minutes", team_id, prior_cutoff, window),
-        lambda: team_aggregated_recent_roster_minutes(conn, team_id, prior_cutoff, n=window))
+        cache, ("team_aggregated_recent_roster_minutes", team_id, prior_cutoff, window, half_life_days, cutoff_days),
+        lambda: team_aggregated_recent_roster_minutes(conn, team_id, prior_cutoff, n=window,
+                                                       half_life_days=half_life_days, cutoff_days=cutoff_days))
     team_total_minutes = sum(aggregated_recent_roster_minutes.values())
     if team_total_minutes <= 0:
         return 0.0
@@ -795,8 +1106,9 @@ def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cach
     aggregated_recent_roster = set(aggregated_recent_roster_minutes.keys())
 
     current_roster_minutes = _memoized(
-        cache, ("players_aggregated_recent_minutes", team_id, before_date, window),
-        lambda: players_aggregated_recent_minutes(conn, current_roster, before_date, n=window))
+        cache, ("players_aggregated_recent_minutes", team_id, before_date, window, half_life_days, cutoff_days),
+        lambda: players_aggregated_recent_minutes(conn, current_roster, before_date, n=window,
+                                                  half_life_days=half_life_days, cutoff_days=cutoff_days))
 
     qualifying = {p for p in current_roster if current_roster_minutes.get(p, 0) >= PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW}
     coverage_minutes = sum(current_roster_minutes.get(p, 0) for p in qualifying)
@@ -813,7 +1125,9 @@ def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cach
 
 def resolve_blend_weight(conn, team_id, league, component, before_date,
                          current_roster_ids=None, cache=None,
-                         window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
+                         window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
+                         half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                         cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS):
     """Default per-team weight (`w`; 0=pure player, 1=pure team), with a league-wide
     override taking precedence per component (FEATURE-011_REQUIREMENTS.md, Blend).
     before_date: passed straight through to player_trust_score -- season-blind
@@ -823,26 +1137,47 @@ def resolve_blend_weight(conn, team_id, league, component, before_date,
     player_trust_score (BUG-011). window: see player_trust_score -- compute()
     threads its own player_window_size through here so the churn comparison stays
     pinned to the SAME horizon as the ratings it's gating, per player_trust_score's
-    own docstring (not independently tunable from a call site)."""
+    own docstring (not independently tunable from a call site). half_life_days,
+    cutoff_days: passed straight through to player_trust_score (BUG-012,
+    2026-08-14) -- compute() threads its own player_recency_half_life_days/
+    player_recency_cutoff_days through here too, so the trust-score computation
+    decays on the SAME calendar-time basis as load_team_players' rating itself,
+    not an independently-set one."""
     override = PLAYER_RATING_LEAGUE_WIDE_BLEND_WEIGHT_OVERRIDE.get(league, {}).get(component)
     if override is not None:
         return override
     return 1.0 - player_trust_score(conn, team_id, before_date,
                                     current_roster_ids=current_roster_ids, cache=cache,
-                                    window=window)
+                                    window=window, half_life_days=half_life_days,
+                                    cutoff_days=cutoff_days)
 
 
-def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZE, league="Serie A"):
+def _decay_weighted_mean(values, decay):
+    """values[0] is most recent. decay=1.0 => plain mean. Skips None entries."""
+    total_v = 0.0
+    total_w = 0.0
+    k = 0
+    for v in values:
+        if v is None:
+            continue
+        w = decay ** k
+        total_v += v * w
+        total_w += w
+        k += 1
+    if total_w <= 0:
+        return None
+    return total_v / total_w
+
+
+def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZE, league="Serie A",
+                        decay=None, opponent_adjust=None, league_raw_means=None, cache=None):
     """xG-based counterpart to core.poisson_model.get_team_ratings -- same shape
-    (home/away_attack, home/away_defense, home/away_n), same last-N-matches/no-decay
-    convention, but derived from soccer_player_stats (this project's own xG/xGA data)
-    instead of soccer_matches' actual scores.
+    (home/away_attack, home/away_defense, home/away_n), derived from
+    soccer_player_stats (this project's own xG/xGA data) instead of soccer_matches'
+    actual scores.
 
-    Comparison/debugging use only (2026-08-02) -- lives entirely in this file, not
-    core.poisson_model, so poisson_v3 and the rest of the team-level system are
-    completely untouched; this is an alternate data source for THIS file's own
-    team_level_lambda, nothing else. See FEATURE-011_BUILD_TRACKER.md before making
-    this (or anything derived from it) a real default anywhere.
+    Lives entirely in this file, not core.poisson_model, so poisson_v3 is untouched;
+    this is the team-form data source for THIS file's team_level_lambda / poisson_v4.
 
     A team's xG in a match = sum of that team's players' xg that match. A team's xGA
     in a match = the opposing team's xG that match -- already stored per player row
@@ -853,77 +1188,181 @@ def get_team_xg_ratings(conn, team_id, before_date, n=TEAM_PAST_MATCH_WINDOW_SIZ
     2023+ as of 2026-08-02) -- soccer_matches itself goes back to season 2022, so an
     early-season match's N-game lookback can hit a real, silent gap before that.
 
-    Team-filtered directly in SQL, not in Python (2026-08-12, performance -- the
-    same bug class BUG-010's 2026-08-11 load_team_players fix already addressed:
-    this query had no team filter at all, aggregating the ENTIRE league's player-
-    stats history on every single call, then discarding all but one team's rows in
-    Python. Became the dominant backfill cost once the multi-league expansion grew
-    this table -- 179 of 326 seconds in a live profile, 55% of one league-season's
-    runtime, made worse by being called TWICE per team per matchday with no
-    caching between callers. Two separate venue-scoped queries, each with its own
-    ORDER BY/LIMIT, mirror team_aggregated_recent_roster_minutes' own pattern)."""
-    cur = conn.cursor()
+    Team-filtered directly in SQL, not in Python (2026-08-12, performance).
 
-    def venue_rows(venue, team_col):
-        cur.execute(f"""
-            SELECT m.match_date, SUM(s.xg) AS team_xg, MAX(s.club_xga_per90) AS team_xga
-            FROM soccer_player_stats s
-            JOIN soccer_matches m ON m.match_id = s.match_id
-            WHERE m.league = ? AND s.venue = ? AND m.{team_col} = ? AND m.match_date < ?
-            GROUP BY s.match_id
-            ORDER BY m.match_date DESC
-            LIMIT ?
-        """, (league, venue, team_id, before_date, n))
-        return cur.fetchall()
+    decay (default TEAM_RATING_XG_WINDOW_DECAY): recency weights, most-recent-first.
+    1.0 preserves the historical flat last-N mean.
 
-    home_rows = venue_rows("home", "home_team_id")
-    away_rows = venue_rows("away", "away_team_id")
+    opponent_adjust (default TEAM_RATING_XG_OPPONENT_ADJUST): schedule-strength
+    correction using the opponent's RAW (unadjusted) xG rating as of each past
+    match_date — point-in-time, no lookahead. league_raw_means supplies the
+    league-mean baselines for the four fields; if omitted, baselines fall back to
+    the mean of the opponents actually faced in this team's window (still
+    well-defined for unit tests / single-team calls). Opponent ratings always use
+    opponent_adjust=False so this cannot recurse into a circular definition.
+    """
+    if decay is None:
+        decay = TEAM_RATING_XG_WINDOW_DECAY
+    if opponent_adjust is None:
+        opponent_adjust = TEAM_RATING_XG_OPPONENT_ADJUST
 
-    def avg(rows, idx):
-        vals = [r[idx] for r in rows if r[idx] is not None]
-        return (sum(vals) / len(vals)) if vals else None
+    cache_key = ("get_team_xg_ratings", team_id, before_date, league, n, decay,
+                 bool(opponent_adjust),
+                 None if league_raw_means is None else
+                 tuple(league_raw_means.get(f) for f in
+                       ("home_attack", "home_defense", "away_attack", "away_defense")))
 
-    return {
-        "home_attack":  avg(home_rows, 1), "home_defense": avg(home_rows, 2),
-        "away_attack":  avg(away_rows, 1), "away_defense": avg(away_rows, 2),
-        "home_n": len(home_rows), "away_n": len(away_rows),
-    }
+    def _compute():
+        cur = conn.cursor()
+
+        # home rows: we are home_team_id, opponent is away_team_id
+        # away rows: we are away_team_id, opponent is home_team_id
+        def venue_rows(venue, team_col, opp_col):
+            cur.execute(f"""
+                SELECT m.match_id, m.match_date, m.{opp_col} AS opp_id,
+                       SUM(s.xg) AS team_xg, MAX(s.club_xga_per90) AS team_xga
+                FROM soccer_player_stats s
+                JOIN soccer_matches m ON m.match_id = s.match_id
+                WHERE m.league = ? AND s.venue = ? AND m.{team_col} = ?
+                  AND m.match_date < ?
+                GROUP BY s.match_id
+                ORDER BY m.match_date DESC
+                LIMIT ?
+            """, (league, venue, team_id, before_date, n))
+            return cur.fetchall()
+
+        home_rows = venue_rows("home", "home_team_id", "away_team_id")
+        away_rows = venue_rows("away", "away_team_id", "home_team_id")
+
+        if not opponent_adjust:
+            return {
+                "home_attack":  _decay_weighted_mean([r[3] for r in home_rows], decay),
+                "home_defense": _decay_weighted_mean([r[4] for r in home_rows], decay),
+                "away_attack":  _decay_weighted_mean([r[3] for r in away_rows], decay),
+                "away_defense": _decay_weighted_mean([r[4] for r in away_rows], decay),
+                "home_n": len(home_rows), "away_n": len(away_rows),
+            }
+
+        # Opponent quality as of each past match: RAW ratings only (no adjust).
+        def opp_raw(opp_id, match_date):
+            return get_team_xg_ratings(
+                conn, opp_id, match_date, n=n, league=league,
+                decay=decay, opponent_adjust=False, cache=cache,
+            )
+
+        # Baselines: prefer league-wide raw means at the rating date; else mean of
+        # opponents faced in-window (per field).
+        def baseline(field, collected):
+            if league_raw_means is not None and league_raw_means.get(field) is not None:
+                return league_raw_means[field]
+            vals = [v for v in collected if v is not None and v > 0]
+            return (sum(vals) / len(vals)) if vals else None
+
+        def adjust_side(rows, opp_def_field, opp_att_field):
+            """rows: (match_id, date, opp_id, xg, xga). Attack uses opp defense;
+            defense (xGA) uses opp attack."""
+            att_vals, def_vals = [], []
+            opp_defs, opp_atts = [], []
+            for _mid, mdate, opp_id, xg, xga in rows:
+                o = opp_raw(opp_id, mdate)
+                od = o.get(opp_def_field)
+                oa = o.get(opp_att_field)
+                opp_defs.append(od)
+                opp_atts.append(oa)
+                att_vals.append((xg, od))
+                def_vals.append((xga, oa))
+
+            b_def = baseline(opp_def_field, opp_defs)
+            b_att = baseline(opp_att_field, opp_atts)
+
+            def scale(pairs, base):
+                out = []
+                for actual, opp_q in pairs:
+                    if actual is None:
+                        out.append(None)
+                        continue
+                    if base is None or opp_q is None or opp_q <= 1e-9:
+                        out.append(actual)
+                    else:
+                        out.append(actual * (base / opp_q))
+                return out
+
+            return (
+                _decay_weighted_mean(scale(att_vals, b_def), decay),
+                _decay_weighted_mean(scale(def_vals, b_att), decay),
+            )
+
+        # Home: faced away-side opponent => opp's away_defense / away_attack
+        h_att, h_def = adjust_side(home_rows, "away_defense", "away_attack")
+        # Away: faced home-side opponent => opp's home_defense / home_attack
+        a_att, a_def = adjust_side(away_rows, "home_defense", "home_attack")
+        return {
+            "home_attack": h_att, "home_defense": h_def,
+            "away_attack": a_att, "away_defense": a_def,
+            "home_n": len(home_rows), "away_n": len(away_rows),
+        }
+
+    return _memoized(cache, cache_key, _compute)
 
 
-def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_PAST_MATCH_WINDOW_SIZE, cache=None):
+def league_xg_field_means(conn, team_ids, before_date, league="Serie A", n=TEAM_PAST_MATCH_WINDOW_SIZE,
+                          cache=None, decay=None, opponent_adjust=None):
     """League-wide mean of each of get_team_xg_ratings' four fields across
-    team_ids, at the same (league, before_date, n) every team_ids member will
-    be rated at -- the recentering point TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/
-    _DEFENSE stretch around. Depends only on (league, before_date, n), not on which team is
-    currently being rated, so compute() calls this ONCE per call and passes the
-    result to every team's team_level_lambda call, rather than each team
-    re-deriving the whole league's snapshot itself.
+    team_ids, at the same (league, before_date, n, decay, opponent_adjust) every
+    team_ids member will be rated at -- the recentering point
+    TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE stretch around. Depends only on
+    those rating knobs + the team set, not on which team is currently being rated,
+    so compute() calls this ONCE per call and passes the result to every team's
+    team_level_lambda call.
 
-    cache: optional dict (BUG-011 pattern), memoizing get_team_xg_ratings by
-    (team_id, before_date, league, n) -- team_level_lambda queries the SAME
-    team's rating again independently right after this function runs for the
-    whole league, so without a shared cache every team gets queried twice per
-    matchday for no reason (2026-08-12, found in the same profile that surfaced
-    get_team_xg_ratings' missing team filter). None (default) is a plain
-    passthrough, identical to pre-2026-08-12 behavior."""
+    When opponent_adjust is on, this is a two-pass mean: first the RAW (unadjusted)
+    league means (used as schedule baselines inside each team's adjusted rating),
+    then the mean of the adjusted ratings themselves (what stretch recenters on).
+
+    cache: optional dict (BUG-011 pattern) shared with get_team_xg_ratings /
+    team_level_lambda. None is a plain passthrough."""
+    if decay is None:
+        decay = TEAM_RATING_XG_WINDOW_DECAY
+    if opponent_adjust is None:
+        opponent_adjust = TEAM_RATING_XG_OPPONENT_ADJUST
+
     fields = ("home_attack", "home_defense", "away_attack", "away_defense")
-    sums = {f: 0.0 for f in fields}
-    counts = {f: 0 for f in fields}
-    for tid in team_ids:
-        ratings = _memoized(cache, ("get_team_xg_ratings", tid, before_date, league, n),
-                            lambda tid=tid: get_team_xg_ratings(conn, tid, before_date, n=n, league=league))
-        for f in fields:
-            if ratings[f] is not None:
-                sums[f] += ratings[f]
-                counts[f] += 1
-    return {f: (sums[f] / counts[f] if counts[f] else None) for f in fields}
+
+    def mean_of(get_ratings):
+        sums = {f: 0.0 for f in fields}
+        counts = {f: 0 for f in fields}
+        for tid in team_ids:
+            ratings = get_ratings(tid)
+            for f in fields:
+                if ratings[f] is not None:
+                    sums[f] += ratings[f]
+                    counts[f] += 1
+        return {f: (sums[f] / counts[f] if counts[f] else None) for f in fields}
+
+    raw_means = mean_of(
+        lambda tid: get_team_xg_ratings(
+            conn, tid, before_date, n=n, league=league,
+            decay=decay, opponent_adjust=False, cache=cache,
+        )
+    )
+    if not opponent_adjust:
+        return raw_means
+
+    return mean_of(
+        lambda tid: get_team_xg_ratings(
+            conn, tid, before_date, n=n, league=league,
+            decay=decay, opponent_adjust=True, league_raw_means=raw_means, cache=cache,
+        )
+    )
 
 
 def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=TEAM_PAST_MATCH_WINDOW_SIZE,
                       team_xg_v_goals_blend=TEAM_RATING_XG_V_GOALS_BLEND,
                       xg_spread_stretch_attack=TEAM_RATING_XG_SPREAD_STRETCH_ATTACK,
                       xg_spread_stretch_defense=TEAM_RATING_XG_SPREAD_STRETCH_DEFENSE,
-                      league_xg_means=None, cache=None):
+                      league_xg_means=None, cache=None,
+                      xg_window_decay=None, xg_opponent_adjust=None,
+                      league_raw_xg_means=None):
     """Home/away-split intrinsic attack/defense for a team from the EXISTING team-level
     system, mirroring estimate_lambdas()'s own fallback/shrink logic exactly
     (TEAM_RATING_MIN_MATCHES_TO_TRUST_TEAM_RATING_OVER_LEAGUE_AVERAGE/TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES, and now TEAM_PAST_MATCH_WINDOW_SIZE -- the old n=25 default here didn't match
@@ -991,11 +1430,20 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
     calling this function once per team, so without a shared cache this team's
     own get_team_xg_ratings gets queried a second, redundant time here. None
     (default) is a plain passthrough, identical to pre-2026-08-12 behavior."""
+    if xg_window_decay is None:
+        xg_window_decay = TEAM_RATING_XG_WINDOW_DECAY
+    if xg_opponent_adjust is None:
+        xg_opponent_adjust = TEAM_RATING_XG_OPPONENT_ADJUST
+
     goals_ratings = (get_team_ratings(conn, team_id, before_date, n=n, league=league, decay=1.0)
                      if team_xg_v_goals_blend < 1.0 else None)
-    xg_ratings = (_memoized(cache, ("get_team_xg_ratings", team_id, before_date, league, n),
-                            lambda: get_team_xg_ratings(conn, team_id, before_date, n=n, league=league))
-                 if team_xg_v_goals_blend > 0.0 else None)
+    # get_team_xg_ratings memoizes itself via cache; do not double-wrap with a
+    # shorter key that would ignore decay/opponent_adjust.
+    xg_ratings = (get_team_xg_ratings(
+                      conn, team_id, before_date, n=n, league=league,
+                      decay=xg_window_decay, opponent_adjust=xg_opponent_adjust,
+                      league_raw_means=league_raw_xg_means, cache=cache)
+                  if team_xg_v_goals_blend > 0.0 else None)
     if (xg_ratings is not None and league_xg_means is not None
             and (xg_spread_stretch_attack != 1.0 or xg_spread_stretch_defense != 1.0)):
         xg_ratings = dict(xg_ratings)
@@ -1003,7 +1451,7 @@ def team_level_lambda(conn, team_id, league, before_date, avg_home, avg_away, n=
             v, m = xg_ratings[field], league_xg_means.get(field)
             if v is not None and m is not None:
                 factor = xg_spread_stretch_attack if "attack" in field else xg_spread_stretch_defense
-                xg_ratings[field] = m + (v - m) * factor
+                xg_ratings[field] = spread_around_mean(v, m, factor, mode="multiplicative")
 
     def blend(field, n_field):
         g = goals_ratings[field] if goals_ratings is not None else None
@@ -1047,8 +1495,10 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
            player_spread_stretch_attack=PLAYER_RATING_SPREAD_STRETCH_ATTACK,
            player_spread_stretch_defense=PLAYER_RATING_SPREAD_STRETCH_DEFENSE,
            player_window_size=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
-           player_window_decay=PLAYER_RATING_PAST_MATCH_WINDOW_DECAY,
-           player_window_min_date=None, cache=None):
+           player_recency_half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+           player_recency_cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS,
+           player_window_min_date=None, cache=None,
+           xg_window_decay=None, xg_opponent_adjust=None):
     """w_attack/w_defense: force this weight for EVERY team, bypassing per-team
     resolution -- a manual debugging/comparison override, not the normal path. Leave
     as None (default) to use resolve_blend_weight() per team, per component.
@@ -1082,9 +1532,19 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     (defaults) are a true no-op -- unlike the team-level pair, these have no
     calibrated non-1.0 value yet.
 
-    player_window_size, player_window_decay: passed through to load_team_players --
-    see that function's docstring. Not yet independently tuned (starting values match
-    the team-level system's own TEAM_PAST_MATCH_WINDOW_SIZE/_DECAY).
+    player_window_size: passed through to load_team_players -- see that function's
+    docstring. Not yet independently tuned (starting value matches the team-level
+    system's own TEAM_PAST_MATCH_WINDOW_SIZE).
+
+    player_recency_half_life_days, player_recency_cutoff_days: passed through to
+    BOTH load_team_players (as half_life_days/cutoff_days, the rating computation)
+    AND resolve_blend_weight/player_trust_score (the trust-score computation
+    deciding how much to lean on that rating) -- BUG-012, 2026-08-14, see those
+    functions' docstrings and PLAYER_RATING_RECENCY_HALF_LIFE_DAYS/_CUTOFF_DAYS'
+    own comment. One shared value for both, not two independently-tunable ones --
+    the design's whole point (BUGS.md) is a single centralized notion of recency
+    used uniformly everywhere, not a rating-side decay and a trust-side decay that
+    could drift apart. Defaults are Stage 1's near-no-op values, not yet calibrated.
 
     player_window_min_date: passed through to load_team_players as `min_date` --
     comparison/validation only (e.g. pass a season's start date to reproduce a
@@ -1111,13 +1571,43 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     by_team = load_team_players(conn, team_ids, before_date,
                                 attack_xg_v_goals_source=attack_xg_v_goals_source,
                                 defense_xg_v_goals_source=defense_xg_v_goals_source,
-                                window_size=player_window_size, decay=player_window_decay,
+                                window_size=player_window_size,
+                                half_life_days=player_recency_half_life_days,
+                                cutoff_days=player_recency_cutoff_days,
                                 min_date=player_window_min_date)
     apply_shrinkage(by_team)
 
-    league_xg_means = (league_xg_field_means(conn, team_ids, before_date, league=league, cache=cache)
-                       if (xg_spread_stretch_attack != 1.0 or xg_spread_stretch_defense != 1.0)
-                       and team_xg_v_goals_blend > 0.0 else None)
+    if xg_window_decay is None:
+        xg_window_decay = TEAM_RATING_XG_WINDOW_DECAY
+    if xg_opponent_adjust is None:
+        xg_opponent_adjust = TEAM_RATING_XG_OPPONENT_ADJUST
+
+    # Stretch recentering and opponent-adjust baselines both need league-wide
+    # snapshots. When opponent_adjust is on we always build them (two-pass);
+    # otherwise only when stretch is active (historical path).
+    need_league_xg = (
+        team_xg_v_goals_blend > 0.0
+        and (
+            xg_opponent_adjust
+            or xg_spread_stretch_attack != 1.0
+            or xg_spread_stretch_defense != 1.0
+        )
+    )
+    league_raw_xg_means = None
+    league_xg_means = None
+    if need_league_xg:
+        # Raw means: always available for opponent_adjust baselines.
+        league_raw_xg_means = league_xg_field_means(
+            conn, team_ids, before_date, league=league, cache=cache,
+            decay=xg_window_decay, opponent_adjust=False,
+        )
+        if xg_opponent_adjust:
+            league_xg_means = league_xg_field_means(
+                conn, team_ids, before_date, league=league, cache=cache,
+                decay=xg_window_decay, opponent_adjust=True,
+            )
+        else:
+            league_xg_means = league_raw_xg_means
 
     raw = {}
     for tid, players in by_team.items():
@@ -1149,21 +1639,30 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     if player_spread_stretch_attack != 1.0 and attack_mean is not None:
         for r in raw.values():
             if r["ra"] is not None:
-                r["ra"] = attack_mean + (r["ra"] - attack_mean) * player_spread_stretch_attack
+                r["ra"] = spread_around_mean(r["ra"], attack_mean, player_spread_stretch_attack, mode="multiplicative")
     if player_spread_stretch_defense != 1.0 and defense_mean is not None:
         for r in raw.values():
             if r["rd"] is not None:
-                r["rd"] = defense_mean + (r["rd"] - defense_mean) * player_spread_stretch_defense
+                r["rd"] = spread_around_mean(r["rd"], defense_mean, player_spread_stretch_defense, mode="multiplicative")
 
     results = {}
     for tid, players in by_team.items():
         r = raw[tid]
+        # attack_mean/defense_mean > 0, not just "is not None" (found live, BUG-012
+        # Stage 2 calibration sweep, 2026-08-14): a tight recency cutoff can leave
+        # so few qualifying teams early in a window that the league-wide average
+        # itself lands on EXACTLY 0.0 (e.g. the only qualifying team's own raw
+        # rate happened to be 0), which used to reach the avg_home/attack_mean
+        # division below and raise ZeroDivisionError. A mean of exactly 0.0 carries
+        # no real dimensional information to normalize against (same reasoning as
+        # every other "not enough real signal yet" gate in this function) -- treat
+        # it the same as no mean at all and fall back to team-level.
         has_attack = (r["ra"] is not None
                       and r["aw"] >= PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING
-                      and attack_mean is not None)
+                      and attack_mean is not None and attack_mean > 0)
         has_defense = (r["rd"] is not None
                        and r["dw"] >= PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING
-                       and defense_mean is not None)
+                       and defense_mean is not None and defense_mean > 0)
 
         # No fixed target spread (unlike WC's ATTACK_LAMBDA_SD) -- the single-league
         # sample here is too small to set one responsibly. Just re-center to baseline
@@ -1187,7 +1686,10 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                               team_xg_v_goals_blend=team_xg_v_goals_blend,
                               xg_spread_stretch_attack=xg_spread_stretch_attack,
                               xg_spread_stretch_defense=xg_spread_stretch_defense,
-                              league_xg_means=league_xg_means, cache=cache)
+                              league_xg_means=league_xg_means, cache=cache,
+                              xg_window_decay=xg_window_decay,
+                              xg_opponent_adjust=xg_opponent_adjust,
+                              league_raw_xg_means=league_raw_xg_means)
 
         def blend(player_val, team_val, w):
             # team_val is always defined now (team_level_lambda falls back to the
@@ -1199,10 +1701,12 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
         roster_ids = current_roster_ids_by_team.get(tid) if current_roster_ids_by_team is not None else None
         w_att = w_attack if w_attack is not None else resolve_blend_weight(
             conn, tid, league, "attack", before_date,
-            current_roster_ids=roster_ids, cache=cache, window=player_window_size)
+            current_roster_ids=roster_ids, cache=cache, window=player_window_size,
+            half_life_days=player_recency_half_life_days, cutoff_days=player_recency_cutoff_days)
         w_def = w_defense if w_defense is not None else resolve_blend_weight(
             conn, tid, league, "defense", before_date,
-            current_roster_ids=roster_ids, cache=cache, window=player_window_size)
+            current_roster_ids=roster_ids, cache=cache, window=player_window_size,
+            half_life_days=player_recency_half_life_days, cutoff_days=player_recency_cutoff_days)
         attack_home_blend, w_a_used = blend(la_player_home, team_home_attack, w_att)
         attack_away_blend, _ = blend(la_player_away, team_away_attack, w_att)
         defense_home_blend, w_d_used = blend(ld_player_home, team_home_defense, w_def)

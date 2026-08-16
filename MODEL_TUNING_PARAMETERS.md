@@ -169,6 +169,29 @@ long docstring on the constants themselves plus `team_level_lambda`'s own docstr
 see BUGS.md, BUG-009 (2026-08-07 addendum) for the original sweep and BUG-010
 (2026-08-12 entries) for the split and the defense sweep.*
 
+### `TEAM_RATING_XG_WINDOW_DECAY` (`get_team_xg_ratings` / `compute()`)
+Recency weights on the **team xG** lookback (most recent match weight 1.0, then
+`decay`, `decay²`, …). **Default 1.0 = flat last-N mean** (shipped poisson_v4
+behavior). This is separate from goals-path `TEAM_PAST_MATCH_WINDOW_DECAY` (also
+1.0); v4 is pure xG, so only this constant moves team-form recency until
+`TEAM_RATING_XG_V_GOALS_BLEND` leaves 1.0. Not yet calibrated — wire-up only
+(2026-08-12). Pass via `compute(..., xg_window_decay=...)`.
+
+### `TEAM_RATING_XG_OPPONENT_ADJUST` (`get_team_xg_ratings` / `compute()`)
+When **True**, each past match’s team xG / xGA is scaled by opponent quality
+*as of that past match date* (point-in-time **raw** opponent rating — never the
+post-adjust rating, so no circular definition):
+
+- attack: `xG_for * (league_mean_opp_defense / opp_defense)`
+- defense: `xGA * (league_mean_opp_attack / opp_attack)`
+
+So creating 0.4 xG against a stingy defense counts for more than 0.4 xG against
+a sieve. **Default False** = raw xG averages (shipped). Structural prototype for
+BUG-010 Pattern A “dead away attack” / schedule-blind lookback (2026-08-12) —
+first case-level A/B was mixed (helps some gaps, hurts others); needs a full
+method-tagged backfill before any default flip. Pass via
+`compute(..., xg_opponent_adjust=True)`.
+
 ### `PLAYER_RATING_SPREAD_STRETCH_ATTACK` / `_DEFENSE` (`compute()`)
 Same mechanism one level down — recenters each team's raw player-level attack/defense
 rate around the league's own player-level mean, before the home/away unit conversion

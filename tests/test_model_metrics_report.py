@@ -203,7 +203,11 @@ def test_pooled_roi_across_markets_sums_both_markets_staked_and_profit(db_path, 
     assert r["bets"] == 2
 
 
-# ── console-only preview mode (2026-08-11): zero args -> print, never persist ──
+# ── console-only preview mode: governed by --note, not argument count ──────────
+# (2026-08-11: originally zero-args-only; 2026-08-12: broadened to "any invocation
+# missing --note", since --guardrail alone used to fall through to the persisted
+# path and error demanding --note, defeating a quick unpersisted look with a
+# non-default flag set.)
 
 def _run_main_with_argv(argv, monkeypatch):
     monkeypatch.setattr(sys, "argv", argv)
@@ -223,9 +227,29 @@ def test_no_args_prints_a_report_and_writes_no_file(db_path, conn, tmp_path, mon
     assert not (tmp_path / "model_snapshots").exists()  # dir never even created
 
 
-def test_note_only_still_persists_a_file(db_path, conn, tmp_path, monkeypatch, capsys):
-    """Passing ANY flag, even --note alone, must fall through to the normal
-    persisted path -- the console-only mode is strictly the zero-argument case."""
+def test_flag_without_note_still_previews_and_does_not_persist(db_path, conn, tmp_path, monkeypatch, capsys):
+    """Regression test for the 2026-08-12 fix: `--guardrail` (or any flag) with no
+    --note must NOT error demanding --note and must NOT persist a file -- it's
+    still the console-only preview, just with that flag honored. Before the fix,
+    `python model_metrics_report.py --guardrail` failed argparse's required-arg
+    check instead of previewing."""
+    monkeypatch.setattr(report, "SNAPSHOT_DIR", tmp_path / "model_snapshots")
+    _seed_match(conn, home_score=2, away_score=1, over_under_line=2.5, p_over=1.0, p_under=0.0)
+
+    _run_main_with_argv(["model_metrics_report.py", "--guardrail"], monkeypatch)
+
+    out = capsys.readouterr().out
+    assert "ALL-UP" in out
+    assert "console-only preview" in out
+    assert "Guardrail: floor=" in out  # the flag was actually honored, not ignored
+    assert "Written to" not in out
+    assert not (tmp_path / "model_snapshots").exists()
+
+
+def test_note_persists_a_file_regardless_of_other_flags(db_path, conn, tmp_path, monkeypatch, capsys):
+    """--note given, alone or combined with other flags, always persists --
+    --note is what governs persistence, not argument count or which other flags
+    are set."""
     snapshot_dir = tmp_path / "model_snapshots"
     monkeypatch.setattr(report, "SNAPSHOT_DIR", snapshot_dir)
     _seed_match(conn, home_score=2, away_score=1, over_under_line=2.5, p_over=1.0, p_under=0.0)
@@ -237,3 +261,17 @@ def test_note_only_still_persists_a_file(db_path, conn, tmp_path, monkeypatch, c
     written = list(snapshot_dir.glob("*.txt"))
     assert len(written) == 1
     assert "console-only preview" not in written[0].read_text()
+
+
+def test_note_with_guardrail_persists_with_guardrail_suffix(db_path, conn, tmp_path, monkeypatch, capsys):
+    snapshot_dir = tmp_path / "model_snapshots"
+    monkeypatch.setattr(report, "SNAPSHOT_DIR", snapshot_dir)
+    _seed_match(conn, home_score=2, away_score=1, over_under_line=2.5, p_over=1.0, p_under=0.0)
+
+    _run_main_with_argv(["model_metrics_report.py", "--guardrail", "--note", "regression check"], monkeypatch)
+
+    out = capsys.readouterr().out
+    assert "Written to" in out
+    written = list(snapshot_dir.glob("*_guardrail.txt"))
+    assert len(written) == 1
+    assert "Guardrail: floor=" in written[0].read_text()

@@ -25,6 +25,8 @@ import sqlite3
 
 from core.sports_db import DATABASE_PATH
 from core.poisson_model import american_to_decimal, compute_ev
+from core.pick_guardrails import guardrail_reasons
+from generate_club_league_card import CLUB_LEAGUE_MIN_PICK_PROBABILITY
 
 DEFAULT_SPORTSBOOK = "Bet365"
 
@@ -61,13 +63,24 @@ def load_totals_predictions(conn, league, season, method, sportsbook=DEFAULT_SPO
     return cur.fetchall()
 
 
-def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK,
+              guardrail_floor=None):
     """Core 1X2 grading logic, returning the full stats dict (not just roi/bets) --
     factored out of run() so a caller pooling across many leagues/seasons (e.g.
     model_metrics_report.py's all-up view) can sum true staked/profit dollars
     directly instead of reconstructing them from a printed ROI ratio. run() itself
     is now a thin wrapper: print + return (roi, bets), unchanged for existing
-    callers."""
+    callers.
+
+    guardrail_floor: None (default) grades every EV-positive candidate, unchanged
+    from before this parameter existed -- the raw model ROI. Pass a probability
+    (e.g. CLUB_LEAGUE_MIN_PICK_PROBABILITY) to additionally reject any candidate
+    below that floor, via the SAME guardrail_reasons() check generate_club_league_
+    card.py applies to real picks -- this is "what would ROI look like for what
+    the live card generator would actually have surfaced," not a different
+    metric. No cap check: the live card generator itself only applies the floor
+    for club leagues (see its own module docstring), so this mirrors that, not a
+    simplification."""
     rows = load_predictions(conn, league, season, method, sportsbook=sportsbook)
     total_staked = total_profit = 0.0
     bets = wins = 0
@@ -84,6 +97,8 @@ def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPO
                 continue
             ev = compute_ev(p_model, ml)
             if ev <= ev_threshold:
+                continue
+            if guardrail_floor is not None and guardrail_reasons(p_model, None, guardrail_floor):
                 continue
             stake = 1.0
             won = (side == actual)
@@ -115,18 +130,25 @@ def print_grading_report(stats, label):
         print(f"    {side:>5}  n={n:<4} wins={w:<4} profit=${p:>+8.2f}  ROI={side_roi:+.1%}")
 
 
-def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
-    stats = grade_1x2(conn, league, season, method, ev_threshold, sportsbook=sportsbook)
+def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None):
+    stats = grade_1x2(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
+                      guardrail_floor=guardrail_floor)
+    guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
     label = (f"{method} | {league} season {season} | vs {sportsbook} | "
-             f"EV threshold {ev_threshold:+.1%} | {stats['n_graded']} graded matches")
+             f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
     roi = stats["profit"] / stats["staked"] if stats["staked"] else 0.0
     return roi, stats["bets"]
 
 
-def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK,
+                 guardrail_floor=None):
     """Core totals (over/under) grading logic -- same role as grade_1x2() for the
-    O/U market, factored out of run_totals() for the same pooling reason."""
+    O/U market, factored out of run_totals() for the same pooling reason.
+    guardrail_floor: see grade_1x2's docstring -- the live card generator applies
+    the same floor to OVER/UNDER candidates as it does to HOME/DRAW/AWAY
+    (build_candidates() screens both through one guardrail_reasons() call), so
+    this mirrors that rather than treating totals as ungated."""
     rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook)
     total_staked = total_profit = 0.0
     bets = wins = 0
@@ -146,6 +168,8 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
             ev = compute_ev(p_model, odds)
             if ev <= ev_threshold:
                 continue
+            if guardrail_floor is not None and guardrail_reasons(p_model, None, guardrail_floor):
+                continue
             stake = 1.0
             won = (side == actual)
             profit = stake * (american_to_decimal(odds) - 1) if won else -stake
@@ -162,16 +186,18 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
             "bets": bets, "wins": wins, "by_side": by_side}
 
 
-def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK):
+def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None):
     """Totals (over/under) market ROI -- kept as a SEPARATE report/return value from
     run()'s 1X2 numbers, not pooled together, since they're different markets and
     every existing ROI reference point in BUGS.md/model_metrics_report.py is 1X2-only.
     2026-08-07: added alongside generate_club_league_card.py's over/under support
     -- the model already computed p_over/p_under and it was already stored, but
     nothing graded it, so there was no way to tell if those picks were any good."""
-    stats = grade_totals(conn, league, season, method, ev_threshold, sportsbook=sportsbook)
+    stats = grade_totals(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
+                         guardrail_floor=guardrail_floor)
+    guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
     label = (f"{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
-             f"EV threshold {ev_threshold:+.1%} | {stats['n_graded']} graded matches")
+             f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
     roi = stats["profit"] / stats["staked"] if stats["staked"] else 0.0
     return roi, stats["bets"]
@@ -190,13 +216,22 @@ def main():
                         help="Which market to grade (default: 1x2, unchanged from before "
                              "totals support existed). 'both' prints two separate reports "
                              "-- totals ROI is never pooled into the 1x2 numbers.")
+    parser.add_argument("--guardrail", action="store_true",
+                        help="Additionally reject any candidate below "
+                             "CLUB_LEAGUE_MIN_PICK_PROBABILITY (generate_club_league_card.py's "
+                             "real, shipped guardrail floor) -- 'what would ROI look like for "
+                             "what the live card generator actually surfaces', not just every "
+                             "raw EV-positive prediction. Default off: unchanged raw-model ROI.")
     args = parser.parse_args()
+    guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
 
     conn = sqlite3.connect(DATABASE_PATH)
     if args.market in ("1x2", "both"):
-        run(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook)
+        run(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook,
+            guardrail_floor=guardrail_floor)
     if args.market in ("totals", "both"):
-        run_totals(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook)
+        run_totals(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook,
+                  guardrail_floor=guardrail_floor)
     conn.close()
 
 

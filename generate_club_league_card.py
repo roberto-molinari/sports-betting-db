@@ -29,7 +29,6 @@ Usage:
 import argparse
 import sqlite3
 from datetime import datetime, timezone, timedelta
-from itertools import groupby
 
 from core.sports_db import DATABASE_PATH
 from core.poisson_model import analyse_match_wc, american_to_implied_prob
@@ -123,11 +122,12 @@ def main():
     ranked_matches = []
     excluded_log = []
 
-    for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
-        date_rows = list(date_rows)
+    dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
+    for before_date in dates:
+        date_rows = strength.matches_on_date(rows, before_date)
         season = date_rows[0]["season"]
         team_ids = load_team_ids(conn, args.league, season)
-        results = strength.compute(conn, team_ids, args.league, season, match_date)
+        results = strength.compute(conn, team_ids, args.league, season, before_date)
 
         for row in date_rows:
             # Totals only priced when the posted line is 2.5 -- analyse_match_wc's

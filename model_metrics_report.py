@@ -12,38 +12,43 @@ rather than silently omitted.
 Renamed from model_snapshot.py 2026-08-11 -- the old name didn't say what the tool
 actually produces.
 
-Three modes:
+Persistence is governed by --note alone, not argument count (fixed 2026-08-12 --
+previously ANY other flag, e.g. --guardrail with no --note, fell through to the
+persisted path and errored demanding --note, defeating a quick unpersisted look
+with a non-default flag set):
 
-  NO ARGUMENTS AT ALL (2026-08-11) -- console-only preview: the all-up report,
-  printed and NOT persisted -- no file written under model_snapshots/, no --note
-  needed. For a quick look without adding to the permanent record. Passing ANY
-  flag at all, even --note by itself, falls through to the normal persisted modes
-  below.
+  --note OMITTED -- console-only preview: printed and NOT persisted, no file
+  written under model_snapshots/, regardless of what OTHER flags are given (e.g.
+  `--guardrail` alone still previews, it just doesn't require --note too). For a
+  quick look without adding to the permanent record.
 
-  DEFAULT persisted mode (no --league, at least one flag given) -- the all-up
-  report (2026-08-11, FEATURE-017): every league/season with real soccer_model_
-  predictions rows for --method is discovered from the database itself (not a
-  hardcoded list, so a newly-added league is picked up automatically). Three
-  views: ALL-UP (every league x every season x every market, fully pooled into
-  one Brier/Bias/ROI each), BY MARKET (pooled across leagues, split by season),
-  BY LEAGUE (pooled across seasons, split by season, both markets shown). A
-  summary view -- no compression-bucket table, no per-league constant dump
-  repeated per section.
+  --note GIVEN -- persisted mode, writes a NEW file under model_snapshots/ --
+  never overwriting a previous run, so the whole before/after sequence stays on
+  record. Two report shapes, chosen the same way either way:
 
-  --league "X" -- the original single-league deep-dive report: adds the
-  compression-bucket table (model vs sharp implied probability, bucketed by the
-  market's own p_home) on top of what the all-up view shows, scoped to one league.
+    DEFAULT (no --league) -- the all-up report (2026-08-11, FEATURE-017):
+    every league/season with real soccer_model_predictions rows for --method is
+    discovered from the database itself (not a hardcoded list, so a newly-added
+    league is picked up automatically). Three views: ALL-UP (every league x
+    every season x every market, fully pooled into one Brier/Bias/ROI each), BY
+    MARKET (pooled across leagues, split by season), BY LEAGUE (pooled across
+    seasons, split by season, both markets shown). A summary view -- no
+    compression-bucket table, no per-league constant dump repeated per section.
+    Written to {timestamp}_all_leagues_{method}.txt.
 
-Both persisted modes require --note (a free-text description of what's different
-about THIS run -- e.g. "baseline, shipped defaults"; the report auto-records every
-real committed tuning constant, see MODEL_TUNING_PARAMETERS.md, so the note only
-needs to cover what ISN'T already visible in committed code) and write a NEW file
-under model_snapshots/ -- never overwriting a previous run, so the whole before/
-after sequence stays on record. Single-league runs: {timestamp}_{league}_
-{method}.txt. All-up runs: {timestamp}_all_leagues_{method}.txt.
+    --league "X" -- the original single-league deep-dive report: adds the
+    compression-bucket table (model vs sharp implied probability, bucketed by
+    the market's own p_home) on top of what the all-up view shows, scoped to
+    one league. Written to {timestamp}_{league}_{method}.txt.
+
+--note is a free-text description of what's different about THIS run (e.g.
+"baseline, shipped defaults"; the report auto-records every real committed
+tuning constant, see MODEL_TUNING_PARAMETERS.md, so the note only needs to cover
+what ISN'T already visible in committed code).
 
 Usage:
     python3 model_metrics_report.py                     # console-only, not persisted
+    python3 model_metrics_report.py --guardrail          # still console-only -- no --note given
     python3 model_metrics_report.py --note "baseline: shipped defaults, no changes"
     python3 model_metrics_report.py --league "Serie A" --season 2024 --season 2025 \\
         --note "ad hoc xG stretch=1.3, monkeypatched, not committed"
@@ -60,6 +65,7 @@ from core.sports_db import DATABASE_PATH
 import compute_club_player_strength as strength
 import compare_model_vs_market_odds as cmvmo
 import backtest_from_predictions as bfp
+from generate_club_league_card import CLUB_LEAGUE_MIN_PICK_PROBABILITY
 
 SNAPSHOT_DIR = Path(__file__).parent / "model_snapshots"
 DEFAULT_METHOD = "poisson_v4"
@@ -81,7 +87,8 @@ KNOB_NAMES = [
     ("compute_club_player_strength", "TEAM_RATING_XG_V_GOALS_BLEND"),
     ("compute_club_player_strength", "PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE"),
     ("compute_club_player_strength", "PLAYER_RATING_PAST_MATCH_WINDOW_SIZE"),
-    ("compute_club_player_strength", "PLAYER_RATING_PAST_MATCH_WINDOW_DECAY"),
+    ("compute_club_player_strength", "PLAYER_RATING_RECENCY_HALF_LIFE_DAYS"),
+    ("compute_club_player_strength", "PLAYER_RATING_RECENCY_CUTOFF_DAYS"),
     ("compute_club_player_strength", "PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING"),
     ("compute_club_player_strength", "PLAYER_RATING_MIN_ATTACK_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE"),
     ("compute_club_player_strength", "PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_HAVE_OWN_RATING"),
@@ -180,6 +187,48 @@ def discover_seasons(conn, leagues, method):
     return [row[0] for row in cur.fetchall()]
 
 
+def discover_all_methods(conn):
+    """Every distinct soccer_model_predictions.method tag in the database, with row
+    count and the most recent generated_at timestamp under that tag -- exactly the
+    set of values --method (here and in every other model tool: backfill_player_
+    blend_predictions.py, backtest_from_predictions.py, etc.) accepts. Sorted newest-
+    generated first so "what's the latest version" is a direct read, not a guess
+    from the method NAME (poisson_v4_1_1 sorting after poisson_v4_1 alphabetically
+    is a naming-convention coincidence, not something to rely on)."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT method, COUNT(*), MAX(generated_at)
+        FROM soccer_model_predictions
+        GROUP BY method
+        ORDER BY MAX(generated_at) DESC
+    """)
+    return cur.fetchall()
+
+
+def print_methods_list(conn):
+    """2026-08-15: added after a user ran --guardrail with no --method and got
+    poisson_v4 (this file's long-standing DEFAULT_METHOD) without realizing it --
+    silently NOT the latest shipped version. Printed on a bare invocation (no args
+    at all) and on --help, so "what can I even pass to --method" and "which one is
+    actually latest" are both answered before you accidentally grade the wrong
+    version."""
+    methods = discover_all_methods(conn)
+    print("Available --method values (soccer_model_predictions.method), newest generated first:")
+    if not methods:
+        print("  (none -- no soccer_model_predictions rows in the database yet)")
+        print()
+        return
+    for i, (method, n, last_generated) in enumerate(methods):
+        tags = []
+        if i == 0:
+            tags.append("most recently generated")
+        if method == DEFAULT_METHOD:
+            tags.append("used when --method is omitted")
+        tag_str = f"   <- {', '.join(tags)}" if tags else ""
+        print(f"  {method:<24} rows={n:<6} last_generated={last_generated}{tag_str}")
+    print()
+
+
 def pooled_brier(conn, leagues, seasons, method, totals=False):
     """N-weighted pooled Brier across every (league, season) pair. Exact, not an
     approximation: Brier is itself a mean of squared errors, so a weighted sum of
@@ -211,17 +260,26 @@ def pooled_bias(conn, leagues, seasons, method, sharp_source):
     return cmvmo.summarize(all_pairs) if all_pairs else None
 
 
-def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False):
+def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False, guardrail_floor=None):
     """True pooled ROI (sum of profit / sum of staked across every (league,
     season) pair), via backtest_from_predictions' stats-dict helpers -- not a
     weighted-average of pre-computed ROI ratios (mathematically equivalent if
-    weighted by staked $, but summing the raw dollars directly is simpler)."""
+    weighted by staked $, but summing the raw dollars directly is simpler).
+
+    guardrail_floor: None (default) is today's unchanged raw-model ROI -- every
+    EV-positive prediction, regardless of how low its probability is. Pass
+    CLUB_LEAGUE_MIN_PICK_PROBABILITY (or any floor) to additionally reject
+    candidates below it, the same guardrail generate_club_league_card.py applies
+    to real picks -- see grade_1x2's docstring. Brier/bias are NEVER guardrail-
+    filtered (they're calibration checks over all games, not a betting-selection
+    question) -- this parameter only exists on the ROI path."""
     grade_fn = bfp.grade_totals if totals else bfp.grade_1x2
     staked = profit = 0.0
     bets = wins = graded = 0
     for league in leagues:
         for season in seasons:
-            stats = grade_fn(conn, league, season, method, ev_threshold, sportsbook=sportsbook)
+            stats = grade_fn(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
+                             guardrail_floor=guardrail_floor)
             staked += stats["staked"]
             profit += stats["profit"]
             bets += stats["bets"]
@@ -242,12 +300,16 @@ def compression_bucket_table(conn, league, season, method, source):
     return {b: (sum(v) / len(v) if v else None, len(v)) for b, v in by_bucket.items()}
 
 
-def build_report(conn, league, seasons, method, sharp_source, note):
+def build_report(conn, league, seasons, method, sharp_source, note, guardrail_floor=None):
     lines = []
     lines.append(f"# Model metrics report -- {method} / {league}")
     lines.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"Seasons: {seasons}")
     lines.append(f"Note: {note}")
+    lines.append(f"Guardrail: floor={guardrail_floor:g} (ROI below reflects only guardrail-clear "
+                  f"candidates)" if guardrail_floor is not None else
+                  "Guardrail: none -- ROI below is raw model ROI (unchanged from before "
+                  "--guardrail existed)")
     lines.append("")
     lines.append("## Committed model constants at run time")
     for name, val in committed_knob_values().items():
@@ -309,7 +371,7 @@ def build_report(conn, league, seasons, method, sharp_source, note):
         for ev in (0.0, 0.05, 0.10):
             buf = io.StringIO()
             with redirect_stdout(buf):
-                bfp.run(conn, league, season, method, ev, sportsbook="Bet365")
+                bfp.run(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor)
             lines.append(buf.getvalue().rstrip())
     lines.append("")
 
@@ -318,7 +380,7 @@ def build_report(conn, league, seasons, method, sharp_source, note):
         for ev in (0.0, 0.05, 0.10):
             buf = io.StringIO()
             with redirect_stdout(buf):
-                bfp.run_totals(conn, league, season, method, ev, sportsbook="Bet365")
+                bfp.run_totals(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor)
             lines.append(buf.getvalue().rstrip())
     lines.append("")
 
@@ -342,12 +404,16 @@ def pooled_brier_across_markets(conn, leagues, seasons, method):
     return (b1x2 * n1x2 + btot * ntot) / n, n
 
 
-def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, sportsbook):
+def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, sportsbook, guardrail_floor=None):
     """True cross-market ROI: every bet is staked $1 regardless of which market it
     came from, so summing profit/staked across both markets is exact -- the
-    portfolio-level return if every EV-positive bet in either market were placed."""
-    r1x2 = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False)
-    rtot = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=True)
+    portfolio-level return if every EV-positive bet in either market were placed
+    (or, with guardrail_floor set, every EV-positive AND guardrail-clear bet --
+    see pooled_roi's docstring)."""
+    r1x2 = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False,
+                      guardrail_floor=guardrail_floor)
+    rtot = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=True,
+                      guardrail_floor=guardrail_floor)
     staked = r1x2["staked"] + rtot["staked"]
     profit = r1x2["profit"] + rtot["profit"]
     roi = profit / staked if staked else 0.0
@@ -356,7 +422,7 @@ def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, spor
             "n_graded": r1x2["n_graded"] + rtot["n_graded"]}
 
 
-def _all_up_block(conn, leagues, seasons, method, sharp_source):
+def _all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None):
     """The genuine ALL-UP block -- three numbers (Brier, Bias, ROI), each pooled
     across every league, season, AND market, not shown per-market like every other
     block in this report. Bias is the one metric that can't actually be pooled
@@ -377,13 +443,14 @@ def _all_up_block(conn, leagues, seasons, method, sharp_source):
         lines.append("  Bias: no data")
 
     for ev in EV_THRESHOLDS:
-        r = pooled_roi_across_markets(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK)
+        r = pooled_roi_across_markets(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK,
+                                      guardrail_floor=guardrail_floor)
         lines.append(f"  ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  (1X2 + totals pooled; "
                       f"bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def _both_markets_block(conn, leagues, seasons, method, sharp_source):
+def _both_markets_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None):
     """Brier/bias/ROI for BOTH markets, side by side, never blended into one
     number -- the block used for the ALL-UP section and each BY LEAGUE entry."""
     lines = []
@@ -402,17 +469,19 @@ def _both_markets_block(conn, leagues, seasons, method, sharp_source):
     lines.append("  Totals Bias:    not available (no sharp-book O/U data ingested -- FEATURE-015)")
 
     for ev in EV_THRESHOLDS:
-        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=False)
+        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=False,
+                       guardrail_floor=guardrail_floor)
         lines.append(f"  1X2 ROI    @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     for ev in EV_THRESHOLDS:
-        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=True)
+        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=True,
+                       guardrail_floor=guardrail_floor)
         lines.append(f"  Totals ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def _single_market_block(conn, leagues, seasons, method, sharp_source, totals):
+def _single_market_block(conn, leagues, seasons, method, sharp_source, totals, guardrail_floor=None):
     """Brier/bias/ROI for ONE market only -- the block used inside the BY MARKET
     section, which is already scoped to a single market per subsection."""
     lines = []
@@ -431,13 +500,14 @@ def _single_market_block(conn, leagues, seasons, method, sharp_source, totals):
             lines.append(f"  Bias vs {sharp_source}: no data")
 
     for ev in EV_THRESHOLDS:
-        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=totals)
+        r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=totals,
+                       guardrail_floor=guardrail_floor)
         lines.append(f"  ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None):
+def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, guardrail_floor=None):
     """The default (no --league) report -- FEATURE-017, 2026-08-11: a summary view
     across every league/season the model has real prediction data for, discovered
     live from the database (see discover_leagues/discover_seasons), not the
@@ -468,6 +538,11 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None):
     lines.append(f"Leagues ({len(leagues)}): {', '.join(leagues)}")
     lines.append(f"Seasons ({len(seasons)}): {seasons}")
     lines.append(f"Note: {note}")
+    lines.append(f"Guardrail: floor={guardrail_floor:g} (matches generate_club_league_card.py's "
+                  f"CLUB_LEAGUE_MIN_PICK_PROBABILITY -- ROI below reflects only guardrail-clear "
+                  f"candidates)" if guardrail_floor is not None else
+                  "Guardrail: none -- ROI below is raw model ROI, every EV-positive candidate "
+                  "regardless of probability (unchanged from before --guardrail existed)")
     lines.append("")
     lines.append("## Committed model constants at run time")
     for name, val in committed_knob_values().items():
@@ -478,12 +553,15 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None):
     lines.append("pooled_roi_across_markets()'s docstrings for why). Everywhere else in this report,")
     lines.append("1X2 and totals are kept as separate numbers, never blended -- different markets,")
     lines.append("matching backtest_from_predictions.run_totals()'s own documented convention.")
+    lines.append("Brier/bias are calibration checks over ALL games and are NEVER guardrail-filtered")
+    lines.append("regardless of the Guardrail setting above -- only ROI (a betting-selection")
+    lines.append("question) is affected.")
     lines.append("")
 
     lines.append("=" * 78)
     lines.append("ALL-UP  (every league x every season x every market)")
     lines.append("=" * 78)
-    lines.extend(_all_up_block(conn, leagues, seasons, method, sharp_source))
+    lines.extend(_all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=guardrail_floor))
     lines.append("")
 
     lines.append("=" * 78)
@@ -492,10 +570,12 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None):
     for totals in (False, True):
         market_label = "TOTALS/over-under" if totals else "1X2"
         lines.append(f"\n-- {market_label}, across seasons --")
-        lines.extend(_single_market_block(conn, leagues, seasons, method, sharp_source, totals))
+        lines.extend(_single_market_block(conn, leagues, seasons, method, sharp_source, totals,
+                                          guardrail_floor=guardrail_floor))
         for season in seasons:
             lines.append(f"\n-- {market_label}, season {season} --")
-            lines.extend(_single_market_block(conn, leagues, [season], method, sharp_source, totals))
+            lines.extend(_single_market_block(conn, leagues, [season], method, sharp_source, totals,
+                                              guardrail_floor=guardrail_floor))
     lines.append("")
 
     lines.append("=" * 78)
@@ -503,33 +583,44 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None):
     lines.append("=" * 78)
     for league in leagues:
         lines.append(f"\n-- {league}, across seasons --")
-        lines.extend(_both_markets_block(conn, [league], seasons, method, sharp_source))
+        lines.extend(_both_markets_block(conn, [league], seasons, method, sharp_source,
+                                         guardrail_floor=guardrail_floor))
         for season in seasons:
             lines.append(f"\n-- {league}, season {season} --")
-            lines.extend(_both_markets_block(conn, [league], [season], method, sharp_source))
+            lines.extend(_both_markets_block(conn, [league], [season], method, sharp_source,
+                                             guardrail_floor=guardrail_floor))
     lines.append("")
 
     return "\n".join(lines)
 
 
 def main():
-    # No arguments at all (not even --note) -> console-only preview: the all-up
-    # report, printed and NOT persisted -- no file under model_snapshots/, no
-    # --note required. This is the quick-look path (see the skepticism logged in
-    # BUGS.md about whether every run needs a permanent file); passing ANY flag,
-    # even just --note by itself, falls through to the normal, persisted path
-    # below unchanged.
-    if len(sys.argv) == 1:
+    # 2026-08-15: print the available --method values before anything else, on a
+    # bare invocation (no args at all) or --help/-h -- --help exits via argparse
+    # inside parse_args() below, before any of our own code would otherwise run,
+    # so this has to happen first, not after. See print_methods_list's docstring
+    # for the confusion this fixes (a user ran --guardrail with no --method,
+    # silently got the long-standing DEFAULT_METHOD, not the latest shipped
+    # version, with no way to discover what "latest" even was).
+    if len(sys.argv) == 1 or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         conn = sqlite3.connect(DATABASE_PATH)
-        report = build_all_up_report(conn, DEFAULT_METHOD, DEFAULT_SHARP_SOURCE,
-                                      note="(console-only preview -- not persisted)")
+        print_methods_list(conn)
         conn.close()
-        print(report)
-        return
 
+    # Console-only preview: whenever --note is omitted, print the report and don't
+    # persist it -- no file under model_snapshots/. This governs regardless of
+    # what OTHER flags are given (2026-08-12 fix: previously ANY flag at all,
+    # even just --guardrail with no --note, fell through to the persisted path
+    # and errored demanding --note, which defeated the point of a quick unpersisted
+    # look with a non-default flag set -- see test_flag_without_note_still_previews_
+    # and_does_not_persist). --note is the actual signal for "this is a real,
+    # permanent record," not argument count.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--note", required=True,
-                        help="What's different about this run (required -- this is the whole point of the log).")
+    parser.add_argument("--note", default=None,
+                        help="What's different about this run. Persists a snapshot file under "
+                             "model_snapshots/ when given (this is the whole point of the log). "
+                             "Omit for a console-only preview -- printed, not persisted, no file "
+                             "written, regardless of what other flags are given.")
     parser.add_argument("--method", default=DEFAULT_METHOD)
     parser.add_argument("--league",
                          help="Single-league deep-dive report for this league (adds the compression-"
@@ -539,22 +630,38 @@ def main():
                         help="Repeatable. Single-league mode default: 2024 and 2025. "
                              "All-up mode default: every season discovered in the data.")
     parser.add_argument("--sharp-source", default=DEFAULT_SHARP_SOURCE)
+    parser.add_argument("--guardrail", action="store_true",
+                        help="Report ROI with CLUB_LEAGUE_MIN_PICK_PROBABILITY (generate_club_"
+                             "league_card.py's real, shipped floor) applied on top of the EV "
+                             "threshold -- 'what would ROI look like for what the live card "
+                             "generator actually surfaces', not just every raw EV-positive "
+                             "prediction. Brier/bias are unaffected either way (calibration "
+                             "checks over all games, not a betting-selection question). Default "
+                             "off: today's unchanged raw-model ROI.")
     args = parser.parse_args()
+    guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
+    note = args.note if args.note is not None else "(console-only preview -- not persisted)"
 
-    SNAPSHOT_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DATABASE_PATH)
     if args.league:
         seasons = args.seasons or DEFAULT_SEASONS
-        report = build_report(conn, args.league, seasons, args.method, args.sharp_source, args.note)
+        report = build_report(conn, args.league, seasons, args.method, args.sharp_source, note,
+                              guardrail_floor=guardrail_floor)
         league_slug = "".join(c if c.isalnum() else "_" for c in args.league.lower()).strip("_")
     else:
-        report = build_all_up_report(conn, args.method, args.sharp_source, args.note,
-                                      seasons_filter=args.seasons)
+        report = build_all_up_report(conn, args.method, args.sharp_source, note,
+                                      seasons_filter=args.seasons, guardrail_floor=guardrail_floor)
         league_slug = "all_leagues"
     conn.close()
 
+    if args.note is None:
+        print(report)
+        return
+
+    SNAPSHOT_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = SNAPSHOT_DIR / f"{timestamp}_{league_slug}_{args.method}.txt"
+    guardrail_suffix = "_guardrail" if args.guardrail else ""
+    out_path = SNAPSHOT_DIR / f"{timestamp}_{league_slug}_{args.method}{guardrail_suffix}.txt"
     out_path.write_text(report)
 
     print(report)

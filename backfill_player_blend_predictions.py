@@ -14,10 +14,16 @@ why the live signal can't be used for a past season), and the league baseline
 strictly before that match. Team-level ratings reuse the existing, already-safe
 get_team_ratings via compute_club_player_strength.team_level_lambda.
 
-Matches are processed one matchday (exact match_date) at a time: compute_club_player_
-strength.compute() re-derives the WHOLE field's player-level ratings for every unique
-before_date anyway (the cross-team normalization step needs the full field), so
-grouping same-date matches avoids redundant recomputation without changing the result.
+Matches are processed one matchday (calendar date, via compute_club_player_strength.
+matches_on_date -- BUG-016, 2026-08-15) at a time: compute_club_player_strength.compute()
+re-derives the WHOLE field's player-level ratings for every unique before_date anyway
+(the cross-team normalization step needs the full field), so grouping same-day matches
+avoids redundant recomputation without changing the result. Grouping by calendar date
+rather than the exact match_date timestamp matters for leagues whose match_date carries
+a real kickoff time (two Saturday matches at 15:00 and 17:30 previously landed in
+separate groups, triggering two full-league compute() calls for what's really one
+matchday). before_date passed to compute() is the bare calendar date, not any single
+match's own timestamp -- see matches_on_date's docstring for why that's safe.
 
 Usage:
     python backfill_player_blend_predictions.py --league "Serie A" --season 2025
@@ -26,7 +32,6 @@ Usage:
 import argparse
 import sqlite3
 from datetime import datetime, timezone
-from itertools import groupby
 
 from core.sports_db import (
     DATABASE_PATH,
@@ -100,6 +105,17 @@ def main():
                         help="Player-level defense-rating spread multiplier -- see "
                              "--player-stretch-attack and "
                              "PLAYER_RATING_SPREAD_STRETCH_DEFENSE's comment.")
+    parser.add_argument("--recency-half-life-days", dest="player_recency_half_life_days", type=float,
+                        default=strength.PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
+                        help="Calendar-time recency half-life for BOTH the player rating "
+                             "window (load_team_players) and the blend trust score "
+                             "(player_trust_score) -- BUG-012, 2026-08-14. Default is the "
+                             "shipped Stage 1 near-no-op value; pass a real value (e.g. 30) "
+                             "for a Stage 2 calibration sweep run.")
+    parser.add_argument("--recency-cutoff-days", dest="player_recency_cutoff_days", type=float,
+                        default=strength.PLAYER_RATING_RECENCY_CUTOFF_DAYS,
+                        help="Calendar-time hard cutoff paired with --recency-half-life-days "
+                             "-- see PLAYER_RATING_RECENCY_HALF_LIFE_DAYS/_CUTOFF_DAYS's comment.")
     parser.add_argument("--player-window-min-date", default=None,
                         help="Comparison/validation only: an ISO date lower bound "
                              "(e.g. a season start date) that stops the player-level "
@@ -137,17 +153,20 @@ def main():
     inserted = 0
     cache = {}  # BUG-011: memoizes last-season aggregates across this run's matchdays
 
-    for match_date, date_rows in groupby(rows, key=lambda r: r["match_date"]):
-        date_rows = list(date_rows)
-        roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, args.season, match_date)
+    dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
+    for before_date in dates:
+        date_rows = strength.matches_on_date(rows, before_date)
+        roster_ids_by_team = {tid: strength.roster_as_of_date(conn, tid, args.season, before_date)
                              for tid in team_ids}
-        results = strength.compute(conn, team_ids, args.league, args.season, match_date,
+        results = strength.compute(conn, team_ids, args.league, args.season, before_date,
                                    w_attack=args.weight_attack, w_defense=args.weight_defense,
                                    attack_xg_v_goals_source=args.attack_xg_v_goals_source, team_xg_v_goals_blend=args.team_xg_v_goals_blend,
                                    xg_spread_stretch_attack=args.xg_spread_stretch_attack,
                                    xg_spread_stretch_defense=args.xg_spread_stretch_defense,
                                    player_spread_stretch_attack=args.player_spread_stretch_attack,
                                    player_spread_stretch_defense=args.player_spread_stretch_defense,
+                                   player_recency_half_life_days=args.player_recency_half_life_days,
+                                   player_recency_cutoff_days=args.player_recency_cutoff_days,
                                    player_window_min_date=args.player_window_min_date,
                                    current_roster_ids_by_team=roster_ids_by_team, cache=cache)
 

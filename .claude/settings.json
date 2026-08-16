@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 *)",
+      "Bash(python3 -c ' *)",
+      "Bash(PYTHONPATH=/Users/robertomolinari/code/sports-betting-db python /tmp/late_season_compression.py)",
+      "Bash(python -m pytest tests/test_compute_club_player_strength.py -v)",
+      "Bash(python3 backfill_player_blend_predictions.py --league \"Serie A\" --season 2025 --method poisson_v4)",
+      "Bash(python3 backfill_player_blend_predictions.py --league \"Serie A\" --season 2024 --method poisson_v4)",
+      "Bash(python3 backfill_player_blend_predictions.py --league \"Serie A\" --season 2025 --method poisson_v4_seasonscoped --player-window-min-date 2025-08-23)",
+      "Bash(python3 -m pytest tests/test_generate_club_league_card.py -q)",
+      "Bash(git status *)",
+      "Bash(python3 backfill_player_blend_predictions.py --help)",
+      "Bash(python3 -m pytest tests/test_backtest_from_predictions.py -q)",
+      "Bash(python -m pytest tests/test_compute_club_player_strength.py -q)",
+      "Bash(git stash *)",
+      "Bash(python3 backfill_player_blend_predictions.py --league \"Serie A\" --season 2024)",
+      "Bash(python -m pytest tests/test_db_smoke.py -q)",
+      "Bash(python3 import_league_matches.py --league \"Premier League\" --season 2024 --dry-run)",
+      "Bash(python3 import_league_matches.py --league \"Premier League\" --season 2024)",
+      "Bash(python3 -c \"import import_league_betting_odds\")",
+      "Bash(python3 -c \"import import_wc_odds\")",
+      "Bash(python3 import_league_betting_odds.py --league \"Serie A\" --download --season 2025)",
+      "Bash(python3 -c \"import compare_model_vs_market_odds\")",
+      "Bash(python3 -c \"import import_league_market_odds\")",
+      "Bash(ps -p 20613 -o etime=)",
+      "Bash(.venv/bin/ruff check *)",
+      "Bash(python3 -m pytest tests/test_backtest_from_predictions.py -v)",
+      "Bash(python3 -m pytest tests/test_model_metrics_report.py -v)",
+      "Bash(PYTHONPATH=. python3 /private/tmp/claude-501/-Users-robertomolinari-code-sports-betting-db/9afb8481-d0f9-408d-ac28-772c26da74d2/scratchpad/underdog_favorite_gap_test.py)"
+    ],
+    "additionalDirectories": [
+      "/tmp",
+      "/private/tmp"
+    ]
+  }
+}
