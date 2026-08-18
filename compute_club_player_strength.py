@@ -201,32 +201,43 @@ PLAYER_RATING_MIN_DEFENSE_WEIGHTED_MINUTES_TO_JOIN_LEAGUE_AVERAGE = 300.0
 PLAYER_RATING_MIN_TEAM_WEIGHTED_MINUTES_TO_BE_A_CANDIDATE = 10.0
 
 # Blend-weight resolution (FEATURE-011_REQUIREMENTS.md, Blend, resolved 2026-07-30;
-# window made season-blind 2026-08-11, BUG-010). Minutes a player needs, across their
-# own last PLAYER_RATING_PAST_MATCH_WINDOW_SIZE appearances (recency, not career
-# totals), before they count as a strong individual signal for the data-coverage
-# score below. Was "last calendar season" until 2026-08-11 -- see BUG-010 in
-# BUGS.md: that hard-coded a literal season boundary, so a team with no data at all
-# under the specific `season - 1` label (a league's first tracked season, or the
-# feeder-division season before a team's promotion) collapsed to a hard 0.0 trust
-# regardless of how much real recent data actually existed. Same recency intent,
-# now measured the same season-blind way load_team_players' own window already is.
+# window made season-blind 2026-08-11, BUG-010; coverage-only redesign 2026-08-16,
+# BUG-012 root cause #4 v2). Minutes a player needs, across their own last
+# PLAYER_RATING_PAST_MATCH_WINDOW_SIZE appearances (recency, not career totals),
+# before they count as a FULLY-confident individual signal for the data-coverage
+# score below -- the point a per-player confidence ramp saturates to 1.0, not a
+# binary qualify/disqualify cutoff anymore (see player_trust_score). A player below
+# this contributes partial credit (their own minutes scaled by minutes/this value),
+# not zero.
 #
-# Value recalibrated 2026-08-11, same BUG-010 fix -- the OLD value (900.0) was set
-# when this compared against a whole SEASON's minutes (thousands available, trivial
-# for any regular starter to clear). Once the comparison switched to this file's
-# `window`-appearance cap (PLAYER_RATING_PAST_MATCH_WINDOW_SIZE=10 games, 900
-# minutes the theoretical MAXIMUM if a player started and played all of every one of
-# their last 10 games), 900 became unreachable in practice -- checked directly
-# against 10 real Serie A rosters (241 roster slots, 2024-09-14): only 1 player
-# (0.4%) cleared it, so data_coverage_score was ~always 0 regardless of real roster
-# quality, silently zeroing out the whole trust score no matter how well-tracked a
-# team's players actually were. No natural gap/step exists in the real distribution
-# (it's smooth, not two separated clusters) -- 300 chosen as a plain data-driven
-# read (not a fitted/optimized value): ~48% of real roster slots clear it, matching
-# "a genuine rotation regular," not just the strict best-XI (500min -> 31%; 400 ->
-# 39%; 300 -> 48%; 200 -> 61%). Revisit if real bias/ROI validation after this fix
-# suggests otherwise -- this is a starting value, not a proven-correct one.
-PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW = 300.0
+# Renamed and repurposed 2026-08-16 (was PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW,
+# a binary >= cutoff at 300.0): real backfill validation found that once
+# player_trust_score dropped its churn factor entirely (coverage-only, see BUGS.md
+# BUG-012), a binary cutoff this low meant nearly every real roster player cleared
+# it and counted at FULL value regardless of whether they had 305 or 3000 minutes --
+# mean weight_attack collapsed to ~0.07-0.11 (nearly all player-level trust) in
+# EVERY league uniformly, since coverage essentially never failed to saturate.
+# A continuous ramp fixes that by making a thin player's contribution shrink
+# TWICE over (both their raw minutes and their confidence multiplier are small),
+# so a squad of mostly fringe/rotation players lands meaningfully below full
+# trust even though every individual technically "has some data."
+#
+# Value calibrated 2026-08-17 via a real 7-candidate sweep (400/500/700/900/
+# 1200/1500/2000, 5 leagues x 2024/2025, pooled Brier/bias/ROI against
+# poisson_v4_3 -- see BUGS.md BUG-012 and MODEL_VERSION_LOG.md poisson_v4_4 for
+# full numbers). 1200 is a genuine local minimum, not a plateau stopped at
+# early: Brier improves monotonically from 400 up through 1200 (0.6075 ->
+# 0.5964), then gets WORSE again at 1500/1200 (0.5977) and 2000 (0.5998) --
+# confirmed by sweeping past the first "good enough" value, not assumed.
+# Notably exceeds the theoretical max a player can accumulate in one `window`
+# (10 games x ~90 min = 900) -- no individual player's confidence ever
+# actually reaches 1.0 at this setting (it tops out around 900/1200 = 0.75),
+# but the aggregate team-level score (summed across the whole roster) still
+# reaches 1.0 for well-tracked squads. This is unusual but was left as-is
+# once the real numbers supported it, rather than artificially capped at 900
+# to "look right" -- see the note above the constant's own docstring
+# reference in player_trust_score for the mechanism.
+PLAYER_RATING_COVERAGE_SATURATION_MINUTES = 1200.0
 
 # {league: {"attack": w, "defense": w}} -- a coarse override that forces EVERY team in
 # that league to the same weight for that component, taking precedence over each
@@ -824,11 +835,13 @@ def team_aggregated_recent_roster_minutes(conn, team_id, before_date, n=PLAYER_R
     """{player_id: calendar_recency_weight-decayed minutes played AT team_id,
     across team_id's own last `n` matches (season-blind, strictly before
     before_date)} -- the season-blind replacement (BUG-010, 2026-08-11) for
-    team_roster_minutes(team_id, season - 1) as player_trust_score's "prior
-    roster" reference. Same window size/style as load_team_players' own rating
-    window (not a separately-tuned constant) -- the point is comparing roster
-    continuity over the SAME horizon the team-level and player-level ratings
-    themselves already use, not an arbitrary different one.
+    team_roster_minutes(team_id, season - 1) as player_trust_score's coverage
+    denominator (2026-08-16: no longer a churn "prior roster" reference, just a
+    normalizing scale -- see player_trust_score's own docstring). Same window
+    size/style as load_team_players' own rating window (not a separately-tuned
+    constant) -- the point is measuring coverage over the SAME horizon the
+    team-level and player-level ratings themselves already use, not an
+    arbitrary different one.
 
     Each match's minutes are weighted by calendar_recency_weight(match_date,
     before_date) (BUG-012, 2026-08-14) rather than summed flat -- a match from
@@ -887,8 +900,8 @@ def players_aggregated_recent_minutes(conn, player_ids, before_date, n=PLAYER_RA
     before_date) (BUG-012, 2026-08-14) rather than summed flat -- same
     reasoning and half_life_days/cutoff_days defaults as
     team_aggregated_recent_roster_minutes above (the two must decay
-    consistently, since roster_change_score's ratio compares them against each
-    other)."""
+    consistently, since player_trust_score's coverage ratio compares them
+    against each other)."""
     if not player_ids:
         return {}
     placeholders = ",".join("?" * len(player_ids))
@@ -976,103 +989,77 @@ def _memoized(cache, key, fn):
     return cache[key]
 
 
-def team_prior_window_cutoff_date(conn, team_id, before_date, n=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE):
-    """match_date of the OLDEST match in team_id's CURRENT n-match window (team_id's
-    own last n matches strictly before before_date) -- the boundary between that
-    window and the n-match window immediately preceding it. Pass this as `before_date`
-    to team_aggregated_recent_roster_minutes(..., n=n) to fetch that adjacent, older,
-    non-overlapping window -- player_trust_score's "prior roster" reference.
-
-    Replaces a fixed once-per-season anchor (league_season_start_date, 2026-08-11)
-    that computed the "prior roster" ONE time at season start and then reused that
-    same stale snapshot for every matchday for the rest of the season -- illogical
-    once you notice team_level_lambda's own rating is a SLIDING last-n-matches
-    window that moves forward every matchday, while the roster-churn reference it
-    was being compared against never did (BUG-010, 2026-08-12). Two adjacent
-    n-match windows, both anchored to before_date, genuinely recompute every call
-    as before_date advances -- by design a churned-over-the-summer squad stops
-    reading as "new" once enough same-roster matches exist to fill its own window,
-    rather than staying flagged all season.
-
-    None if team_id doesn't even have n matches before before_date yet (too early
-    for a full current window, let alone a second one to compare it against) --
-    caller falls back to trust=0.0 (team-level), same as any other no-history case."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT match_date FROM soccer_matches
-        WHERE match_date < ? AND (home_team_id = ? OR away_team_id = ?)
-        ORDER BY match_date DESC LIMIT 1 OFFSET ?
-    """, (before_date, team_id, team_id, n - 1))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-
 def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cache=None,
                        window=PLAYER_RATING_PAST_MATCH_WINDOW_SIZE,
                        half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
                        cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS):
     """1.0 = fully trust the player-level lambda for this team; 0.0 = fully trust
-    team-level. Two factors, BOTH required (product, not sum/average) -- a stable,
-    well-tracked squad has nothing to gain from the player signal even with great
-    coverage, and a squad we don't know yet still can't be trusted even if it churned
-    completely (FEATURE-011_REQUIREMENTS.md, Blend):
+    team-level. Coverage-only, continuous (2026-08-16, BUG-012 root cause #4 v3):
+    of the CURRENT squad's tracked recent-window minutes, the fraction belonging
+    to well-tracked players -- where "well-tracked" is now a smooth confidence
+    ramp, not a binary cutoff. Each player's own last-`window`-appearance minutes
+    (recency, not career totals -- team-agnostic, see
+    players_aggregated_recent_minutes) get scaled by
+    min(minutes / PLAYER_RATING_COVERAGE_SATURATION_MINUTES, 1.0) before being
+    counted -- a thin player contributes little (both their raw minutes AND
+    their confidence multiplier are small), a genuine regular contributes close
+    to their full minutes. The denominator (team_total_minutes) is team_id's own
+    last `window` matches' total decayed minutes -- not a churn reference, just
+    a normalizing scale for "how much of the team's typical playing-time volume
+    is covered by players we individually trust."
 
-    - data_coverage_score: of the CURRENT squad's tracked recent-window minutes, the
-      fraction belonging to players with >= PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW in
-      their own last `window` appearances (recency, not career totals -- team-agnostic,
-      see players_aggregated_recent_minutes).
-    - roster_change_score: recent-window minutes lost to departed players (at THIS
-      team specifically) plus incoming players' recent-window minutes (wherever they
-      played), as a fraction of the team's own total recent-window minutes. High churn
-      means the reference window describes a squad that's mostly gone.
+    Went through THREE prior designs before landing here, each replaced for a
+    real, validated reason (full history: BUGS.md BUG-012):
+    (1) churn-gated via a season-start anchor, then (2) via two-adjacent-count-
+        windows -- both went stale in different ways (BUG-010; see
+        MODEL_VERSION_LOG.md).
+    (3) churn-gated via a single calendar-decayed window -- architecturally
+        correct (no more wrong-clock bug), but real backfill (poisson_v4_4,
+        2026-08-16) showed it systematically suppressed player-level trust
+        across ALL 5 leagues uniformly, not just edge cases, because "current
+        roster" and "team's own last `window` matches" are nearly the SAME
+        underlying signal, so churn became almost undetectable by construction.
+    (4) coverage-only with a BINARY per-player cutoff (drop churn entirely,
+        keep the existing >=300min qualify/disqualify test) -- real backfill
+        showed this swung the opposite way: mean weight_attack collapsed to
+        ~0.07-0.11 (nearly ALL player-level trust) in every league uniformly,
+        because a 300-minute bar is trivially cleared by nearly any real
+        roster player, so coverage almost never failed to saturate near 1.0.
+        Helped 3 leagues' Brier (Bundesliga/La Liga/Ligue 1) but hurt the two
+        largest (Serie A/Premier League) -- pooled net negative.
+    This version (a continuous ramp instead of a binary cutoff, still no churn
+    factor) is meant to restore real team-to-team variation in the coverage
+    score without reintroducing a churn mechanism, which has now caused three
+    separate bugs and one broad regression across its various forms.
 
-    Season-blind (2026-08-11, BUG-010): the "prior roster" reference is team_id's
+    Removing churn (as of design (4) above) is itself empirically supported,
+    not just a simplification for its own sake: the poisson_v4_4 churn-vs-
+    no-churn A/B (same lambdas, only the blend weight differed) showed that
+    even the OLD churn-gated mechanism's already-team-heavy blend (~80%
+    team-level on average) was still getting real value from its ~20%
+    player-level minority share -- shifting further toward team-level hurt
+    broadly. That implies coverage-driven trust (blend in player data whenever
+    we have enough of it, regardless of whether the roster looks "stable") is
+    closer to correct than the original churn-gated premise
+    (FEATURE-011_REQUIREMENTS.md, Blend) that a stable, well-tracked squad has
+    nothing to gain from the player signal.
+
+    Season-blind (2026-08-11, BUG-010): the coverage denominator is team_id's
     own last `window` matches (team_aggregated_recent_roster_minutes), reaching
     back across a season boundary the same way load_team_players' rating window
-    already does -- NOT a literal "last calendar season" lookup like before. Same
-    window size as load_team_players' default (PLAYER_RATING_PAST_MATCH_WINDOW_
-    SIZE), deliberately not a separately-tuned constant: this is comparing roster
-    continuity over the SAME horizon the ratings themselves are computed over, not
-    an arbitrary different one. Was hard-coded to `season - 1` until this date --
-    see BUG-010 in BUGS.md: a league's first-ever tracked season (nothing before it
-    in the database at all) or a specific team's top-flight debut (promoted from an
-    untracked-that-far-back feeder division) collapsed this to a hard 0.0
-    regardless of how much real recent data actually existed, discarding a real,
-    differentiating player-level signal for BOTH teams in a match (found via
-    Holstein Kiel hosting FC Bayern München, 2024-09-14: both teams' trust scores
-    were exactly 0.0, not because their player data was bad, but because the
-    DATABASE had no rows under the literal season label "2023" for either).
-
-    The "prior roster" window boundary (2026-08-12, BUG-010 continued -- see
-    team_prior_window_cutoff_date): the FIRST fix above anchored this window to end
-    at the season's own start date, computed once and reused for every matchday all
-    season -- fixed the season-label bug, but introduced a new one: by design that
-    anchor never moves, so a squad that churned hard over the summer keeps reading
-    as "all new" every single matchday, even deep into the season once team_level_
-    lambda's own last-`window`-matches rating is built entirely from real games with
-    the current roster (found live 2026-08-12: Burnley hosting Manchester City,
-    2026-04-22 -- both teams' trust scores were still ~0.75-0.98 that late in the
-    season purely from stale summer-transfer churn, discarding the team-level
-    signal exactly when it had become the MORE reliable one). Anchored instead to
-    team_prior_window_cutoff_date(before_date, window): the `window` matches
-    immediately preceding team_id's CURRENT `window`-match window (the same one
-    team_level_lambda's own rating is built from) -- two adjacent, non-overlapping
-    periods that both shift forward every matchday as before_date advances, so
-    churn measured today reflects today's roster boundary, not August's. Player-
-    level coverage (players_aggregated_recent_minutes, both for qualifying/coverage
-    and for joined_minutes) still uses before_date directly -- that check wants the
-    most current read on a player's own recent form, not the older cutoff; only the
-    TEAM-side "prior roster" reference needs it.
+    already does -- NOT a literal "last calendar season" lookup. Same window
+    size as load_team_players' default (PLAYER_RATING_PAST_MATCH_WINDOW_SIZE),
+    deliberately not a separately-tuned constant: this compares coverage over
+    the SAME horizon the ratings themselves are computed over, not an arbitrary
+    different one.
 
     current_roster_ids: optional override for "who's on the roster right now" --
     defaults to current_roster_player_ids() (the live signal). Backtesting a PAST
     season must pass a point-in-time squad instead (e.g. from roster_as_of_date), since
     the live default has no history.
 
-    half_life_days, cutoff_days: passed through to both aggregation functions above
-    (BUG-012, 2026-08-14) -- must be the SAME values for both, since roster_change_
-    score's ratio compares them against each other (see the design note in BUGS.md).
-    Default to the Stage 1 near-no-op constants.
+    half_life_days, cutoff_days: passed through to both aggregation functions
+    above (BUG-012, 2026-08-14).
 
     cache: optional dict (BUG-011) memoizing team_aggregated_recent_roster_minutes/
     players_aggregated_recent_minutes within a single compute() call (this function is called
@@ -1088,39 +1075,30 @@ def player_trust_score(conn, team_id, before_date, current_roster_ids=None, cach
     below, specifically so it isn't scattered across call sites.
 
     No recent-window history for team_id at all (e.g. backfill not run far back
-    enough yet, or fewer than `window` matches exist before before_date to even form
-    a current window, let alone a prior one to compare it against) -> 0.0 (caller
+    enough yet, or no matches exist before before_date at all) -> 0.0 (caller
     falls back fully to team-level; not a crash)."""
-    prior_cutoff = team_prior_window_cutoff_date(conn, team_id, before_date, n=window)
-    if prior_cutoff is None:
-        return 0.0
     aggregated_recent_roster_minutes = _memoized(
-        cache, ("team_aggregated_recent_roster_minutes", team_id, prior_cutoff, window, half_life_days, cutoff_days),
-        lambda: team_aggregated_recent_roster_minutes(conn, team_id, prior_cutoff, n=window,
+        cache, ("team_aggregated_recent_roster_minutes", team_id, before_date, window, half_life_days, cutoff_days),
+        lambda: team_aggregated_recent_roster_minutes(conn, team_id, before_date, n=window,
                                                        half_life_days=half_life_days, cutoff_days=cutoff_days))
     team_total_minutes = sum(aggregated_recent_roster_minutes.values())
     if team_total_minutes <= 0:
         return 0.0
 
     current_roster = current_roster_ids if current_roster_ids is not None else current_roster_player_ids(conn, team_id)
-    aggregated_recent_roster = set(aggregated_recent_roster_minutes.keys())
+    if not current_roster:
+        return 0.0
 
     current_roster_minutes = _memoized(
         cache, ("players_aggregated_recent_minutes", team_id, before_date, window, half_life_days, cutoff_days),
         lambda: players_aggregated_recent_minutes(conn, current_roster, before_date, n=window,
                                                   half_life_days=half_life_days, cutoff_days=cutoff_days))
 
-    qualifying = {p for p in current_roster if current_roster_minutes.get(p, 0) >= PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW}
-    coverage_minutes = sum(current_roster_minutes.get(p, 0) for p in qualifying)
-    data_coverage_score = min(coverage_minutes / team_total_minutes, 1.0)
-
-    departed = aggregated_recent_roster - current_roster
-    joined = current_roster - aggregated_recent_roster
-    departed_minutes = sum(aggregated_recent_roster_minutes.get(p, 0) for p in departed)
-    joined_minutes = sum(current_roster_minutes.get(p, 0) for p in joined)
-    roster_change_score = min((departed_minutes + joined_minutes) / team_total_minutes, 1.0)
-
-    return data_coverage_score * roster_change_score
+    coverage_minutes = sum(
+        m * min(m / PLAYER_RATING_COVERAGE_SATURATION_MINUTES, 1.0)
+        for m in (current_roster_minutes.get(p, 0) for p in current_roster)
+    )
+    return min(coverage_minutes / team_total_minutes, 1.0)
 
 
 def resolve_blend_weight(conn, team_id, league, component, before_date,
@@ -1135,9 +1113,10 @@ def resolve_blend_weight(conn, team_id, league, component, before_date,
     involved. current_roster_ids: see player_trust_score -- pass a point-in-time
     squad (e.g. from roster_as_of_date) when backtesting a past season. cache: see
     player_trust_score (BUG-011). window: see player_trust_score -- compute()
-    threads its own player_window_size through here so the churn comparison stays
-    pinned to the SAME horizon as the ratings it's gating, per player_trust_score's
-    own docstring (not independently tunable from a call site). half_life_days,
+    threads its own player_window_size through here so the coverage denominator
+    stays pinned to the SAME horizon as the ratings it's gating, per
+    player_trust_score's own docstring (not independently tunable from a call
+    site). half_life_days,
     cutoff_days: passed straight through to player_trust_score (BUG-012,
     2026-08-14) -- compute() threads its own player_recency_half_life_days/
     player_recency_cutoff_days through here too, so the trust-score computation

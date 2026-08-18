@@ -15,6 +15,54 @@ module's shipped defaults (see each entry below for whether that happened).
 
 ---
 
+## poisson_v4_4 — shipped 2026-08-17
+
+**Bundles:** BUG-012 root cause #4 -- `player_trust_score`'s blend-weight
+mechanism dropped its roster-churn factor entirely and switched to pure data
+coverage, scaled by a continuous per-player confidence ramp (a thin player's
+own tracked minutes count for only a fraction of their raw value, not a
+binary qualify/disqualify cutoff). New/renamed constant
+`PLAYER_RATING_COVERAGE_SATURATION_MINUTES = 1200.0` (was `PLAYER_RATING_
+MIN_MINUTES_RECENT_WINDOW = 300.0`), calibrated via a real 7-candidate sweep
+(400/500/700/900/1200/1500/2000) against pooled Brier/bias/ROI -- 1200 is a
+genuine local minimum (Brier improves monotonically up to it, then worsens
+past it), not an early stopping point. Two intermediate designs (a
+single-window churn mechanism, then a coverage-only BINARY cutoff) were built
+and real-data-tested first and explicitly rejected -- both caused broad,
+uniform regressions in opposite directions before the continuous ramp fixed
+both failure modes. Pure code/constant change, no CLI flag -- live picks
+reflect it immediately. Full design history and rejected-attempt numbers:
+BUGS.md BUG-012.
+
+**Impact (vs. `poisson_v4_3`, 5 leagues x 2024/2025 + Serie A 2022/2023):**
+- ALL-UP pooled: Brier 0.6036->0.5964 (real, meaningful improvement -- the
+  largest single-version Brier gain this session). Bias home +0.003->-0.002
+  (near-perfect recentering), draw flat (-0.016->-0.015), away +0.013->+0.017
+  (slightly worse). Raw ROI worse at 0% EV (-7.2%->-8.0%) but better at 5%/10%
+  (-7.5%->-6.1%, -7.1%->-5.8%); **with the same guardrail
+  `generate_club_league_card.py` applies to real picks
+  (`CLUB_LEAGUE_MIN_PICK_PROBABILITY=0.25`), that ROI gain mostly evaporates**
+  (-5.0%->-5.6%, -4.8%->-4.2%, -3.1%->-3.5% -- one better, two worse, all
+  small) -- net roughly neutral on ROI, not a real win.
+- Per league, Brier improved in EVERY league (unlike either rejected
+  intermediate design): Serie A 0.6061->0.6013, Premier League
+  0.6108->0.6052, Bundesliga 0.6087->0.5979, La Liga 0.5914->0.5834, Ligue 1
+  0.6019->0.5940. Guardrail ROI per league is genuinely mixed: La Liga and
+  Ligue 1 improved notably (La Liga @10% EV: -3.0%->-0.1%, near breakeven),
+  Bundesliga and Serie A got worse, Premier League stayed strongly positive
+  but reduced (@10%: +11.1%->+9.0%).
+- Serie A extended (2022-2025): Brier 0.6218->0.6177 (improved); ROI mixed,
+  slightly worse under both raw and guardrail measures at higher EV
+  thresholds.
+
+**Net read:** a real, broad-based calibration improvement (Brier down in
+every single slice checked, home bias essentially neutralized pooled) bought
+with an ROI picture that's a wash once measured the way real picks are
+actually filtered -- shipped on the strength of Brier/bias, not ROI. Resolves
+BUG-012 in full: all four root causes (count-based windows, the exponential
+recency shape, the count-based candidate-narrowing gate, and now the
+trust-score mechanism) have real, validated fixes shipped.
+
 ## poisson_v4_3 — shipped 2026-08-15
 
 **Bundles:** BUG-012 root cause #3 only -- the count-based team-attribution/

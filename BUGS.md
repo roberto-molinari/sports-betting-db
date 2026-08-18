@@ -572,7 +572,7 @@ disappears on its own once the sample size problem is fixed.
 
 ---
 
-## BUG-012 — Player-recency windows are count-based ("last N appearances"), not calendar-based, so a player out for months can still count as fully "recent" — **STAGE 1 DONE 2026-08-14; STAGE 2 SHIPPED 2026-08-15 as `poisson_v4_2`; ROOT CAUSE #3 SHIPPED 2026-08-15 as `poisson_v4_3`; trust-score windowing (root cause #4, found during v4_3 validation) scoped but not built**
+## BUG-012 — Player-recency windows are count-based ("last N appearances"), not calendar-based, so a player out for months can still count as fully "recent" — **STAGE 1 DONE 2026-08-14; STAGE 2 SHIPPED 2026-08-15 as `poisson_v4_2`; ROOT CAUSE #3 SHIPPED 2026-08-15 as `poisson_v4_3`; ROOT CAUSE #4 SHIPPED 2026-08-17 as `poisson_v4_4` (continuous coverage ramp, after two rejected intermediate designs)**
 
 - **Type:** bug (design agreed, implementation deferred) · **Status:** open. Found
   2026-08-13 while walking through `player_trust_score`'s `data_coverage_score`
@@ -974,6 +974,112 @@ checks, both real data:
    Reinforces the read that this is real season-to-season variance in which
    teams the (normally-behaving) team-level fallback happens to fit well,
    not a mechanism defect -- same flavor of conclusion as BUG-015.
+
+**Root cause #4 SHIPPED 2026-08-17 as `poisson_v4_4`, after building and real-
+data-testing THREE designs, two of which were rejected on real evidence before
+landing on the one that shipped.** The scoped-but-not-built prototype above
+(single calendar-decayed window, still churn-gated) was picked back up, built
+for real, and put through this project's actual calibration-sweep discipline
+(real backfill + Brier/bias/ROI, not intuition) -- which is exactly what
+caught both rejected designs before either could ship.
+
+**Attempt 1 — single calendar-decayed window (still churn-gated), matches the
+prototype above:** replaced the two-adjacent-count-windows design with ONE
+window (team's own last `window` matches, anchored directly to the real
+`before_date`) -- fixes the wrong-clock bug (BUG-012 root cause #3 section
+above) with no second reference date left to get wrong. Real backfill (5
+leagues x 2024/2025 + Serie A 2022/2023) showed a genuine, uniform Brier
+regression: pooled 0.6036 -> 0.6071 (+0.0035), and EVERY league got worse, not
+a mixed bag (Serie A +0.0006, Premier League +0.0019, Bundesliga +0.0034, La
+Liga +0.0057, Ligue 1 +0.0060) -- a materially different, non-noise-like
+profile from every other fix this session. Mechanism, confirmed by comparing
+weight_attack under the old vs. new mechanism across every 2025 team-match in
+all 5 leagues (not just the flagged teams): mean weight_attack shifted +0.09
+to +0.14 toward team-level, affecting 66-73% of all team-matches, uniformly
+across leagues. Root cause: "current roster" (built from recent match
+appearances, via `roster_as_of_date`) and "team's own last `window` matches"
+(the new single reference window) are nearly the SAME underlying signal, so
+genuine roster churn became almost structurally undetectable -- the OLD
+design's stale, much-older reference window had, by accident, been providing
+the temporal separation needed to detect churn at all. **Not shipped.**
+
+**Attempt 2 — coverage-only, binary cutoff:** given churn detection had now
+caused three separate bugs (the original season-anchor staleness, the
+two-window anchor bug, and this uniform-suppression failure) and the
+poisson_v4_4 A/B above showed even the OLD mechanism's already-team-heavy
+blend (~80% team-level on average) was still extracting real value from its
+~20% player-level minority share, the churn factor was dropped entirely --
+trust becomes pure data coverage (how much of the current squad's minutes
+belong to players with a real recent track record), no roster-change
+comparison at all. Real backfill showed a DIFFERENT problem: the existing
+binary >=300min qualify/disqualify cutoff (`PLAYER_RATING_MIN_MINUTES_
+RECENT_WINDOW`) is trivially cleared by nearly any real roster player, so
+once it was the SOLE gate (not multiplied against a churn factor anymore),
+coverage almost never failed to saturate near 1.0. Mean weight_attack
+collapsed to ~0.07-0.11 (nearly ALL player-level trust) in every league
+uniformly -- an even more extreme, equally uniform swing in the opposite
+direction. Pooled Brier: 0.6036 -> 0.6052 (still worse), but per-league this
+version was genuinely mixed rather than uniform: Bundesliga/La Liga/Ligue 1
+improved (these are exactly the leagues `poisson_v4_2` had flagged as hurt by
+leaning MORE team-level), while Serie A/Premier League (the two largest
+leagues in the pool) got meaningfully worse, dragging the pooled number
+negative. Squad rotation depth (32-40 distinct players/team) and player-stats
+completeness (99.7-100%) were checked and ruled out as the explanation --
+neither correlates with which leagues improved. **Not shipped**, but this
+result is what pointed at the real fix: since the blend weight barely
+differed by league (all ~90% player-level) yet outcomes still diverged by
+league, the split isn't about HOW MUCH player data gets used -- the coverage
+score's SHAPE (a flat, trivially-cleared cutoff) just wasn't discriminating
+between squads at all.
+
+**Shipped design — coverage-only, continuous ramp:** replaced the binary
+cutoff with a smooth per-player confidence multiplier, `min(minutes /
+PLAYER_RATING_COVERAGE_SATURATION_MINUTES, 1.0)`, applied to each player's own
+tracked minutes before summing into the coverage score -- a thin player is
+discounted TWICE (both raw minutes and confidence are small), so a squad of
+mostly fringe/rotation players lands meaningfully below full trust even though
+every individual technically "has some data." The constant itself (renamed
+from `PLAYER_RATING_MIN_MINUTES_RECENT_WINDOW`) was calibrated via a real
+7-candidate sweep (400/500/700/900/1200/1500/2000, 5 leagues x 2024/2025,
+pooled against `poisson_v4_3`) rather than picked from the first value tried:
+
+| Saturation | Brier | Δ | Home bias | Draw bias | Away bias | ROI@0% | ROI@5% | ROI@10% |
+|---|---|---|---|---|---|---|---|---|
+| Baseline | 0.6036 | — | +0.003 | -0.016 | +0.013 | -7.2% | -7.5% | -7.1% |
+| 400 | 0.6075 | +0.0038 | -0.008 | -0.016 | +0.024 | -11.1% | -12.1% | -11.6% |
+| 500 | 0.6057 | +0.0021 | -0.008 | -0.016 | +0.023 | -10.5% | -11.5% | -11.5% |
+| 700 | 0.6003 | -0.0033 | -0.006 | -0.015 | +0.021 | -9.5% | -8.9% | -9.7% |
+| 900 | 0.5966 | -0.0071 | -0.004 | -0.015 | +0.019 | -9.4% | -9.3% | -7.4% |
+| **1200** | **0.5964** | **-0.0072** | **-0.002** | -0.015 | +0.017 | -8.0% | -6.1% | -5.8% |
+| 1500 | 0.5977 | -0.0060 | -0.001 | -0.015 | +0.016 | -6.4% | -7.6% | -6.8% |
+| 2000 | 0.5998 | -0.0038 | +0.000 | -0.015 | +0.015 | -7.4% | -6.5% | -6.2% |
+
+1200 is a genuine local minimum, not an early plateau -- Brier improves
+monotonically from 400 through 1200, then gets WORSE again at 1500/2000,
+confirming the ceiling rather than assuming it. At 1200, ALL FIVE leagues
+improved on Brier (unlike either rejected design), and home bias moved
+closest to zero among the strong performers. Draw bias barely moves across
+the whole sweep (-0.015/-0.016 everywhere) -- this parameter doesn't touch
+draw calibration, only the attack/defense player-vs-team blend.
+
+Raw ROI at 1200 looked like a clean win at the 5%/10% EV thresholds, but
+**checking with the same guardrail `generate_club_league_card.py` applies to
+real picks** (`CLUB_LEAGUE_MIN_PICK_PROBABILITY=0.25`) moderated that: baseline
+guardrail ROI -5.0%/-4.8%/-3.1% vs. 1200's -5.6%/-4.2%/-3.5% -- one threshold
+improves, two get slightly worse, all small moves, net roughly neutral rather
+than a real gain. **The ROI case for shipping is a wash, not a win; the case
+for shipping rests on Brier and bias, both of which improved for real.**
+
+Notably, 1200 exceeds the theoretical maximum minutes a player can accumulate
+in one `window` (10 games x ~90 min = 900) -- no individual player's
+confidence ever actually reaches 1.0 at this setting (tops out around
+900/1200 = 0.75), but the aggregate team-level score, summed across a whole
+roster, still reaches 1.0 for well-tracked squads. Left as the real,
+validated value rather than artificially capped at 900 to "look right."
+
+Shipped as `poisson_v4_4`: full production backfill (5 leagues x 2024/2025 +
+Serie A 2022/2023) vs. `poisson_v4_3` -- see MODEL_VERSION_LOG.md for the
+final numbers.
 
 ---
 

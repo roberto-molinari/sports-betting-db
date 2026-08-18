@@ -367,32 +367,30 @@ def test_players_recent_minutes_empty_for_no_player_ids(db_path, conn):
     assert strength.players_aggregated_recent_minutes(conn, set(), "2026-01-01") == {}
 
 
-def test_player_trust_high_when_full_coverage_and_full_churn(db_path, conn):
-    """The headline case this whole mechanism exists for: the prior-roster window
-    left entirely, replaced by well-tracked players (>=300 min in their own last
-    window elsewhere) -- the prior-roster reference describes a squad that's gone,
-    and we have real signal on the new one. Both factors strong -> trust close to
-    1.0. window=1 keeps the synthetic setup small: team_a's prior window is its
-    single 2025-09-01 match (P1/P2); the later 2025-10-15 match only exists to
-    push the CURRENT 1-match window past it, so the two windows the comparison
-    uses are genuinely adjacent and non-overlapping (BUG-010, 2026-08-12 -- see
-    team_prior_window_cutoff_date)."""
+def test_player_trust_high_when_current_roster_has_full_coverage(db_path, conn):
+    """The headline case this mechanism exists for (coverage-only design,
+    BUG-012 root cause #4 v2, 2026-08-16): the current roster is well-tracked
+    (>=300 min in each player's own last `window` appearances, wherever they
+    played) relative to the team's own recent-match volume -> trust close to
+    1.0, regardless of whether that roster overlaps with who played team_a's
+    own recent matches."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
     team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", season=2025, date="2025-10-01")
     away_team = sports_db.ensure_soccer_team("MovedOn", "Serie A")
-    _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-10-15")   # boundary only
 
+    saturation = int(strength.PLAYER_RATING_COVERAGE_SATURATION_MINUTES)
     p1 = _transfer(conn, team_a, "P1", "ext_p1")
     p2 = _transfer(conn, team_a, "P2", "ext_p2")
-    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
 
     p3 = _transfer(conn, team_b, "P3", "ext_p3")
     p4 = _transfer(conn, team_b, "P4", "ext_p4")
-    sports_db.add_player_match_stats(p3, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
-    sports_db.add_player_match_stats(p4, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+    sports_db.add_player_match_stats(p3, m2, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    sports_db.add_player_match_stats(p4, m2, season=2025, venue="home", minutes_played=saturation, conn=conn)
 
-    # Departures: P1/P2 leave TeamA. Arrivals: P3/P4 join TeamA (from TeamB).
+    # P1/P2 leave TeamA. P3/P4 join TeamA (from TeamB) -- churn no longer matters,
+    # but P3/P4's own real minutes (from TeamB) are what drives coverage here.
     _transfer(conn, away_team, "P1", "ext_p1")
     _transfer(conn, away_team, "P2", "ext_p2")
     _transfer(conn, team_a, "P3", "ext_p3")
@@ -401,94 +399,88 @@ def test_player_trust_high_when_full_coverage_and_full_churn(db_path, conn):
     trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
                                          half_life_days=1.0e12, cutoff_days=1.0e12)
     assert trust == pytest.approx(1.0)
+    # abs= needed here (not just the default rel=): the confidence ramp squares
+    # calendar_recency_weight's near-1.0-but-not-exactly decay factor (0.5 **
+    # (elapsed/1e12) isn't exactly 1.0 in floating point), so the residual is
+    # tiny (~1e-10) but non-zero, and pytest.approx(0.0)'s default tolerance is
+    # too strict for a comparison against exactly zero.
     assert strength.resolve_blend_weight(
         conn, team_a, "Serie A", "attack", "2026-09-14", window=1,
-        half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0)
+        half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0, abs=1e-6)
 
 
-def test_player_trust_low_when_roster_is_stable_despite_full_coverage(db_path, conn):
-    """Same players, same team -- the prior-roster reference still describes THIS
-    squad, so there's nothing to gain from the player signal even though the data
-    coverage is excellent. Guards the AND (product), not OR/average."""
+def test_player_trust_high_even_when_roster_is_completely_stable(db_path, conn):
+    """The deliberate behavior change from the old churn-gated design (BUG-012
+    root cause #4 v2, 2026-08-16): a roster with ZERO turnover, but good
+    coverage, now gets real player-level trust. Previously this was forced to
+    exactly 0.0 on the theory that a stable, well-tracked squad has nothing to
+    gain from the player signal (FEATURE-011_REQUIREMENTS.md, Blend). Real data
+    didn't support that theory: a poisson_v4_4 A/B (same lambdas, only the
+    blend weight changed) showed that even the old, already-team-heavy
+    mechanism was getting real value from its player-level minority share --
+    shifting further toward team-level (which is what stability-gating does)
+    hurt Brier broadly across every league. See BUG-012 in BUGS.md."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
-    _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-10-15")   # boundary only
+    saturation = int(strength.PLAYER_RATING_COVERAGE_SATURATION_MINUTES)
     p1 = sports_db.add_player(team_a, "Stalwart One", api_player_id="ext_s1", conn=conn)
     p2 = sports_db.add_player(team_a, "Stalwart Two", api_player_id="ext_s2", conn=conn)
-    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    # No roster changes -- p1/p2 remain on team_a (current roster == prior roster).
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    # No roster changes at all -- p1/p2 are both the reference AND the live current roster.
 
-    trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1)
-    assert trust == pytest.approx(0.0)
+    trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
+                                         half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert trust == pytest.approx(1.0)
+    # abs= needed here -- see the sibling "full coverage" test above for why.
     assert strength.resolve_blend_weight(
-        conn, team_a, "Serie A", "defense", "2026-09-14", window=1) == pytest.approx(1.0)
+        conn, team_a, "Serie A", "defense", "2026-09-14", window=1,
+        half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0, abs=1e-6)
 
 
-def test_player_trust_low_when_churn_is_high_but_new_players_are_unproven(db_path, conn):
-    """The edge case flagged in FEATURE-011_REQUIREMENTS.md: heavy churn INTO players
-    with no usable recent-window track record. The prior-roster reference is stale
-    (squad mostly gone) AND we don't know the new squad either -- falls back to
-    team-level as the least-bad option, not because it's trusted."""
+def test_player_trust_scales_continuously_with_a_players_own_minutes(db_path, conn):
+    """Continuous coverage ramp (BUG-012 root cause #4 v3, 2026-08-16): a player's
+    contribution scales smoothly with their own tracked minutes relative to
+    PLAYER_RATING_COVERAGE_SATURATION_MINUTES, not a binary qualify/disqualify
+    cutoff. A player at exactly the saturation point contributes their full
+    minutes; a player at HALF the saturation point contributes only a QUARTER of
+    their raw minutes (0.5 confidence x 0.5 of raw minutes) -- a binary cutoff at
+    any point below the saturation minutes would have credited them in full."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
-    _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-10-15")   # boundary only
-    away_team = sports_db.ensure_soccer_team("MovedOn2", "Serie A")
+    saturation = strength.PLAYER_RATING_COVERAGE_SATURATION_MINUTES
+    reference_player = sports_db.add_player(team_a, "Reference Player", conn=conn)
+    sports_db.add_player_match_stats(reference_player, m1, season=2025, venue="home",
+                                     minutes_played=int(saturation), conn=conn)
 
-    p1 = _transfer(conn, team_a, "P1b", "ext_p1b")
-    p2 = _transfer(conn, team_a, "P2b", "ext_p2b")
-    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    _transfer(conn, away_team, "P1b", "ext_p1b")
-    _transfer(conn, away_team, "P2b", "ext_p2b")
+    half_tracked = sports_db.add_player(team_a, "Half Tracked", conn=conn)
+    team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", season=2025, date="2025-09-08")
+    sports_db.add_player_match_stats(half_tracked, m2, season=2025, venue="home",
+                                     minutes_played=int(saturation / 2), conn=conn)
 
-    # Newcomers have NO tracked minutes anywhere in their own recent window (debutants/reserves).
-    sports_db.add_player(team_a, "Rookie One", conn=conn)
-    sports_db.add_player(team_a, "Rookie Two", conn=conn)
+    # team_total_minutes = saturation (reference_player's own match at team_a).
+    # coverage_minutes = (saturation/2 raw minutes) * (0.5 confidence) = saturation/4.
+    trust = strength.player_trust_score(
+        conn, team_a, "2026-09-14", current_roster_ids={half_tracked}, window=1,
+        half_life_days=1.0e12, cutoff_days=1.0e12)
+    assert trust == pytest.approx(0.25)
 
-    trust = strength.player_trust_score(conn, team_a, "2026-09-14", window=1)
+
+def test_player_trust_low_when_current_roster_has_no_usable_track_record(db_path, conn):
+    """Low/no coverage -> low trust, regardless of whether the roster looks
+    "new" or not -- the edge case flagged in FEATURE-011_REQUIREMENTS.md (heavy
+    churn into unproven players) still holds, just via coverage alone now
+    rather than a churn-AND-coverage product."""
+    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
+    reference_player = sports_db.add_player(team_a, "Reference Player", conn=conn)
+    sports_db.add_player_match_stats(reference_player, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+
+    # Current roster is two rookies with NO tracked minutes anywhere (debutants/reserves).
+    rookie_one = sports_db.add_player(team_a, "Rookie One", conn=conn)
+    rookie_two = sports_db.add_player(team_a, "Rookie Two", conn=conn)
+
+    trust = strength.player_trust_score(
+        conn, team_a, "2026-09-14", current_roster_ids={rookie_one, rookie_two}, window=1,
+        half_life_days=1.0e12, cutoff_days=1.0e12)
     assert trust == pytest.approx(0.0)
-
-
-def test_prior_window_shifts_forward_as_more_matches_are_played(db_path, conn):
-    """The exact bug found live 2026-08-12, after the season-blind fix above
-    landed: that fix anchored the "prior roster" reference to the SEASON's own
-    start date, computed once and reused for every matchday for the rest of the
-    season -- so a squad overhaul stayed flagged as "brand new" all season long,
-    even once the team-level rating itself was built entirely from real games
-    with the current roster (found live: Burnley hosting Manchester City,
-    2026-04-22, ~8 months after Burnley's summer signings, trust was still
-    ~0.98-1.0 purely from stale summer-transfer churn). BUG-010's continuation:
-    the reference must be TWO ADJACENT windows, both anchored to before_date
-    (team_prior_window_cutoff_date), so the comparison itself shifts forward
-    every matchday.
-
-    Same team, same eventual roster (new_player), checked at two points in time:
-    right after the churn (still flagged, high trust) and two matchdays later
-    once BOTH adjacent windows sit entirely within the new era (no longer
-    flagged -- team-level is trusted again, correctly, since it now reflects
-    real games with this exact roster)."""
-    team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
-    _, _, m2 = _seed_match(conn, "TeamA", "OppB", season=2025, date="2025-09-08")
-    _, _, m3 = _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-09-15")
-    _, _, m4 = _seed_match(conn, "TeamA", "OppD", season=2025, date="2025-09-22")
-
-    old_player = sports_db.add_player(team_a, "Old Guard", conn=conn)
-    new_player = sports_db.add_player(team_a, "New Signing", conn=conn)
-    sports_db.add_player_match_stats(old_player, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    for m in (m2, m3, m4):
-        sports_db.add_player_match_stats(new_player, m, season=2025, venue="home", minutes_played=900, conn=conn)
-
-    # Right after the churn: current (last 1 match) window is m2 (new signing's
-    # debut), prior window is m1 (old guard) -- genuinely different rosters.
-    just_after = strength.player_trust_score(
-        conn, team_a, "2025-09-09", current_roster_ids={new_player}, window=1)
-    assert just_after == pytest.approx(1.0)   # full coverage, full churn
-
-    # Two matchdays later: current window is m4, prior window is m3 -- BOTH
-    # already inside the new era, so the SAME roster comparison now reports zero
-    # churn. This is the behavior the season_start_date anchor could never produce.
-    later = strength.player_trust_score(
-        conn, team_a, "2025-09-23", current_roster_ids={new_player}, window=1)
-    assert later == pytest.approx(0.0)
 
 
 def test_player_trust_zero_when_no_recent_window_history(db_path, conn):
@@ -505,28 +497,29 @@ def test_player_trust_score_half_life_and_cutoff_thread_through_to_aggregations(
     """BUG-012 (2026-08-14): half_life_days/cutoff_days must actually reach
     team_aggregated_recent_roster_minutes/players_aggregated_recent_minutes
     inside player_trust_score, not just sit accepted-but-unused. Reproduces
-    test_player_trust_high_when_full_coverage_and_full_churn's exact setup
+    test_player_trust_high_when_current_roster_has_full_coverage's exact setup
     (trust=1.0 under explicit near-no-op values -- Stage 2, 2026-08-15, shipped
     real module defaults, so this test pins its own no-op baseline explicitly
     rather than relying on the module's) and shows a real, tight cutoff_days
-    collapses it: the "prior roster" reference match (2025-09-01) falls outside
-    a 30-day cutoff from its own window boundary (2025-10-15), so its minutes
-    are excluded entirely and team_total_minutes hits the same zero-history
-    fallback the true no-data case uses."""
+    collapses it: the coverage denominator's reference match (2025-09-01), now
+    decayed directly against the real evaluation date (2026-09-14, over a year
+    later), falls outside a 30-day cutoff, so its minutes are excluded entirely
+    and team_total_minutes hits the same zero-history fallback the true
+    no-data case uses."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
     team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppB", season=2025, date="2025-10-01")
     away_team = sports_db.ensure_soccer_team("MovedOn", "Serie A")
-    _seed_match(conn, "TeamA", "OppC", season=2025, date="2025-10-15")   # boundary only
+    saturation = int(strength.PLAYER_RATING_COVERAGE_SATURATION_MINUTES)
 
     p1 = _transfer(conn, team_a, "P1", "ext_p1")
     p2 = _transfer(conn, team_a, "P2", "ext_p2")
-    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    sports_db.add_player_match_stats(p2, m1, season=2025, venue="home", minutes_played=saturation, conn=conn)
 
     p3 = _transfer(conn, team_b, "P3", "ext_p3")
     p4 = _transfer(conn, team_b, "P4", "ext_p4")
-    sports_db.add_player_match_stats(p3, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
-    sports_db.add_player_match_stats(p4, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+    sports_db.add_player_match_stats(p3, m2, season=2025, venue="home", minutes_played=saturation, conn=conn)
+    sports_db.add_player_match_stats(p4, m2, season=2025, venue="home", minutes_played=saturation, conn=conn)
 
     _transfer(conn, away_team, "P1", "ext_p1")
     _transfer(conn, away_team, "P2", "ext_p2")
@@ -605,20 +598,25 @@ def test_roster_as_of_date_only_sees_matches_strictly_before_the_date(db_path, c
 
 def test_player_trust_score_accepts_current_roster_ids_override(db_path, conn):
     """The override parameter actually changes the result -- confirms it's wired
-    through, not just accepted and ignored. Same setup as the full-churn headline
-    test, but passing an explicit (different) squad instead of the live default."""
+    through, not just accepted and ignored. Live default here is a rookie with
+    zero tracked minutes (zero coverage, trust 0); overriding with a
+    well-tracked player instead flips it to full trust."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
-    _seed_match(conn, "TeamA", "OppE", season=2025, date="2025-10-15")   # boundary only
-    p1 = sports_db.add_player(team_a, "Stayed Player", api_player_id="ext_stay", conn=conn)
-    sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
-    # Live default: current_roster_player_ids(team_a) == {p1} -- roster unchanged, trust 0.
+    old_starter = _transfer(conn, team_a, "Old Starter", "ext_old")
+    sports_db.add_player_match_stats(old_starter, m1, season=2025, venue="home", minutes_played=900, conn=conn)
+    away_team = sports_db.ensure_soccer_team("MovedOn", "Serie A")
+    _transfer(conn, away_team, "Old Starter", "ext_old")   # no longer on team_a's LIVE roster
+    sports_db.add_player(team_a, "Rookie", conn=conn)   # team_a's only current player, no minutes
+
+    # Live default: current_roster_player_ids(team_a) == {rookie}, zero coverage.
     assert strength.player_trust_score(conn, team_a, "2026-09-14", window=1,
                                         half_life_days=1.0e12, cutoff_days=1.0e12) == pytest.approx(0.0)
 
-    # Override with a squad that looks completely different from the prior-roster reference.
+    # Override with a well-tracked player instead -- full coverage, full trust.
     p2 = sports_db.add_player(team_a, "Hypothetical New Player", api_player_id="ext_hyp", conn=conn)
     team_b, opp_b, m2 = _seed_match(conn, "TeamB", "OppC", season=2025, date="2025-09-08")
-    sports_db.add_player_match_stats(p2, m2, season=2025, venue="home", minutes_played=1000, conn=conn)
+    sports_db.add_player_match_stats(p2, m2, season=2025, venue="home",
+                                     minutes_played=int(strength.PLAYER_RATING_COVERAGE_SATURATION_MINUTES), conn=conn)
     overridden_trust = strength.player_trust_score(
         conn, team_a, "2026-09-14", current_roster_ids={p2}, window=1,
         half_life_days=1.0e12, cutoff_days=1.0e12)
@@ -633,7 +631,6 @@ def test_player_trust_score_cache_avoids_recomputing_recent_window_aggregates(db
     dict should still hit the underlying SQL aggregates once each across repeated
     calls at the SAME inputs."""
     team_a, opp_a, m1 = _seed_match(conn, "TeamA", "OppA", season=2025, date="2025-09-01")
-    _seed_match(conn, "TeamA", "OppE", season=2025, date="2025-10-15")   # boundary only
     p1 = _transfer(conn, team_a, "P1", "ext_p1")
     sports_db.add_player_match_stats(p1, m1, season=2025, venue="home", minutes_played=900, conn=conn)
 
@@ -653,13 +650,15 @@ def test_player_trust_score_cache_avoids_recomputing_recent_window_aggregates(db
     monkeypatch.setattr(strength, "players_aggregated_recent_minutes", counting_players_aggregated_recent_minutes)
 
     cache = {}
-    results = [strength.player_trust_score(conn, team_a, "2026-09-14", cache=cache, window=1)
+    results = [strength.player_trust_score(conn, team_a, "2026-09-14", cache=cache, window=1,
+                                             half_life_days=1.0e12, cutoff_days=1.0e12)
               for _ in range(3)]
 
     assert calls["team_aggregated_recent_roster_minutes"] == 1
     assert calls["players_aggregated_recent_minutes"] == 1
     assert results[0] == results[1] == results[2]
-    assert results[0] == pytest.approx(strength.player_trust_score(conn, team_a, "2026-09-14", window=1))
+    assert results[0] == pytest.approx(strength.player_trust_score(
+        conn, team_a, "2026-09-14", window=1, half_life_days=1.0e12, cutoff_days=1.0e12))
 
 
 def test_load_team_players_before_date_excludes_later_matches(db_path, conn):
