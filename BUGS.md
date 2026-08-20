@@ -1389,9 +1389,9 @@ cost/effort — deliberately left as a future decision, not defaulted into this 
 
 ---
 
-## FEATURE-016 — `generate_club_league_card.py` doesn't persist its picks anywhere, so they can't be scored later
+## FEATURE-016 — `generate_club_league_card.py` doesn't persist its picks anywhere, so they can't be scored later — **SHIPPED 2026-08-19**
 
-- **Type:** enhancement · **Status:** PROPOSED, not started. Logged 2026-08-10 —
+- **Type:** enhancement · **Status:** SHIPPED 2026-08-19. Logged 2026-08-10 —
   noticed while answering a question about what `generate_club_league_card.py` writes
   to the database (answer: nothing at all, confirmed by reading the script).
 
@@ -1417,6 +1417,27 @@ entries (FEATURE-012, FEATURE-013, FEATURE-015 above, and this one), plus
 `docs/STATUS-08-08-2026.md`'s Feature Backlog section (more markets, line shopping,
 Kelly staking) which explicitly defers to this file as the canonical source. This is
 another item for that same list, not something scoped to build immediately.
+
+**Shipped 2026-08-19, ahead of an upcoming weekend where the club-league card was
+about to actually get used.** Built as its own small table rather than folded into
+FEATURE-012 (still not started) — that stayed the right call once actually built:
+FEATURE-012's lineage/traceability scope is broader than just "can this get graded
+later." New table `soccer_club_league_picks` (`core/sports_db.py`) — `pick_id`,
+`match_id`, `league` (denormalized, matching every other multi-league table),
+`generated_at`, `side` (1X2 or totals — one match can produce up to
+`MAX_PICKS_PER_MATCH` picks across different markets, unlike `soccer_wc_picks`'
+one-pick-per-match shape), `odds`, `model_prob`, `ev`, `stars`, `result`. Two new
+functions: `replace_club_league_picks_for_match()` (deletes+reinserts a WHOLE
+match's ungraded picks in one call, not per-pick — a per-pick delete would wipe out
+a same-match pick just inserted a moment earlier) and
+`set_club_league_pick_result()`. `generate_club_league_card.py` stores by default,
+new `--dry-run` flag to print without storing (same flag/behavior as
+`generate_wc_card.py`). 7 new tests (`tests/test_db_smoke.py`,
+`tests/test_generate_club_league_card.py`): multi-pick storage, replace-supersedes-
+ungraded, replace-preserves-graded, grade round-trip, store-by-default, dry-run,
+re-run-doesn't-duplicate. Full suite green (472 passed). Verified end-to-end against
+the real database (a past matchday with real odds, since no future fixtures were
+loaded yet) before being reset to empty for real use.
 
 ---
 
@@ -1489,15 +1510,16 @@ this fix is CPU-bound `compute()` work itself, not further redundant queries.
 
 - **Type:** model calibration (tail behavior) · **Severity:** high (this is the concrete
   lead behind poisson_v4/poisson_v4_teamxg's negative ROI at every EV threshold, both
-  seasons tested) · **Status:** OPEN -- THREE real contributing mechanisms found and
-  fixed 2026-08-11/12 (two in the trust-score window that gates player-vs-team-level
-  blending -- a season-label lookup bug, then a static once-per-season anchor -- and a
-  third, a cross-league defense-gating asymmetry), plus a structural player-level
-  rating-compression issue found with a fix mechanism now partially calibrated
-  (attack-side stretch locked in at 2.0, defense-side sweep pending). Confirmed to
-  meaningfully help but NOT to be the full root cause (ROI still mixed/flat, aggregate
-  home bias now ~eliminated but Brier ticked up). Logged 2026-08-02, see progress
-  notes below.
+  seasons tested) · **Status:** PARTIALLY FIXED — same underlying phenomenon as
+  BUG-009 (see that entry's dollar-impact quantification for why this stays worth
+  revisiting). THREE real contributing mechanisms found and fixed 2026-08-11/12
+  (two in the trust-score window that gates player-vs-team-level blending, one
+  cross-league defense-gating asymmetry), one real calibration lever shipped
+  (`PLAYER_RATING_SPREAD_STRETCH_ATTACK=2.0`), and every remaining candidate in
+  this investigation's own hypothesis list has now been tested and correctly left
+  off (player/team defense stretch, opponent-adjust — see 2026-08-19 below). No
+  further untested candidate remains here; next progress needs a structurally
+  different idea, same as BUG-009. Logged 2026-08-02, see progress notes below.
 
 **Context.** FEATURE-011's player-level blend (`compute_club_player_strength.py`,
 method `poisson_v4`/`poisson_v4_teamxg`) cleared the Model Calibration success
@@ -1886,7 +1908,42 @@ production default): **mixed** — e.g. Milan–Roma gap_bf improved with opp_ad
 away attack correctly rose under SOS but home p gap worsened. Takeaway: the
 plumbing is the right layer to attack, but opponent-adjust alone is not a
 free lunch — needs method-tagged season backfill + home-bet calib / bias /
-ROI before flipping defaults. Status stays OPEN.
+ROI before flipping defaults.
+
+**2026-08-19: the deferred full backfill run — validated, NOT shipped.** Added a
+`--xg-opponent-adjust` CLI flag to `backfill_player_blend_predictions.py` (didn't
+exist before; this candidate had never actually been backfilled) and ran it
+across the full standard scope (5 leagues x 2024/2025 + Serie A 2022/2023) vs.
+`poisson_v4_4` baseline, Brier/bias as the primary signal per this session's
+established discipline (see BUG-009: ROI is a weak validation signal here).
+
+Pooled: Brier worse (0.5964→0.5980), draw/away bias both widen, away breaches
+the ±0.02 target (+0.017→+0.024). Per league, genuinely split rather than a
+uniform win or loss: Bundesliga improves clearly (Brier 0.5979→0.5930, guardrail
+ROI roughly halves its loss), Premier League improves slightly; Serie A and
+Ligue 1 both get meaningfully worse (Serie A Brier 0.6013→0.6069, guardrail ROI
+-3.7%→-11.0% at EV>0%); La Liga near-flat. Same shape as every BUG-009 candidate
+tested this session (constant-family fixes: real in some slices, costly in
+others, net negative on Brier/bias pooled) — **not promoted to default.** Flag
+stays in the codebase (`--xg-opponent-adjust`, `TEAM_RATING_XG_OPPONENT_ADJUST`
+default `False`), tested, available if a future investigation wants to build on
+it, same treatment as BUG-009's team-credibility de-shrink.
+
+**This was the last unvalidated candidate in this bug's investigation.** BUG-010
+and BUG-009 are very likely the same underlying compression phenomenon studied
+from two angles (BUG-010 found it via "overconfident home underdogs," BUG-009
+via pooled bias buckets) — they share the exact same tunable constants
+(`PLAYER_RATING_SPREAD_STRETCH_ATTACK/_DEFENSE`, `TEAM_RATING_XG_SPREAD_STRETCH_
+ATTACK/_DEFENSE`) and every fix attempted in either investigation shows the same
+trade-off shape. **Status: PARTIALLY FIXED, same as BUG-009** — three real
+mechanisms found and fixed (trust-score window x2, cross-league defense gating),
+one real calibration lever shipped (`PLAYER_RATING_SPREAD_STRETCH_ATTACK=2.0`),
+several candidates tested and correctly left at their no-op defaults with real
+evidence behind that choice (player/team defense stretch, opponent-adjust). No
+further untested candidate remains in this investigation's own hypothesis list.
+See BUG-009 for the current best estimate of the dollar value in fixing the
+shared underlying problem, and for why "no further lever found" is a reason to
+change approach on the next attempt, not a reason to deprioritize it.
 
 ---
 
@@ -2120,423 +2177,141 @@ found **false** rather than assumed true.
 
 ---
 
-## BUG-009 — Model systematically undervalues home teams / overvalues away teams (confirmed via CLV + ROI; one contributing cause found + partially fixed; SECOND cause found 2026-08-04: spread compression on large mismatches, worsened by FEATURE-011's xG team-metric switch AND player-level blend)
+## BUG-009 — Model compresses extreme mismatches toward a coin flip (favorite underrated, underdog overrated); pooled home/away bias fixed, compression partially addressed
 
-- **Severity:** high (touches every match, every season; a material driver of negative
-  backtest ROI, not a cosmetic calibration footnote) · **Status:** OPEN. Goal agreed
-  2026-07-27. Two contributing causes now confirmed: (1) stale league-average baseline,
-  partially fixed 2026-07-27; (2) spread compression on large mismatches, found
-  2026-08-04 while investigating FEATURE-011's promoted-team ROI failure -- root cause
-  identified (see below), not yet fixed. `SHRINKAGE_K` (the prior "next candidate") is
-  RULED OUT -- confirmed at 0 in `core/poisson_model.py`, i.e. already a no-op.
+- **Severity:** high (touches every match; drives negative backtest ROI specifically on
+  the model's most confident bets, not a cosmetic footnote) · **Status:** PARTIALLY
+  FIXED, real remaining value, worth continued investment. Two independent causes
+  confirmed and both safely addressed (real shipped fixes below); a
+  further-improving candidate exists but is intentionally not promoted (see
+  2026-08-18/19).
 
-**Finding.** Comparing the model's 1X2 probabilities (`soccer_model_predictions`,
-`poisson_v2`) against sharp closing lines (Pinnacle, Betfair Exchange) and a soft book
-(Bet365), at both opening and closing, across three full Serie A seasons (2023-24,
-2024-25, 2025-26 -- `soccer_market_odds`, `compare_model_vs_market_odds.py`): the model
-shows a consistent, same-direction bias in 2024-25 and 2025-26 -- mean signed diff on
-home win probability is negative (model reads home teams as less likely to win than the
-market, roughly -0.035 to -0.05 depending on season/source) and positive on away
-(roughly +0.04 to +0.05). Present at **both** opening and closing lines (near-identical
-numbers) and consistent across **both** sharp and soft books -- so it isn't a
-late-line-movement artifact or one book's pricing quirk.
+- **Quantified dollar impact of the residual (2026-08-19, current model,
+  `poisson_v4_4`, 5 leagues x 2024/2025, EV>0% picks vs. Bet365):** the segment where
+  the market prices the picked side below 25% loses -10.9% ROI (1,779 bets, -194
+  profit units) vs. -4.4% ROI (2,036 bets, -88.6 profit units) for everything else.
+  If that segment performed as well as the rest, total portfolio loss over this
+  sample would shrink from -282.6 units to about -166.6 — **a ~41% reduction in
+  total losses, real money, not a rounding error.** The portfolio would still be net
+  negative even at that ceiling (the non-compressed segment is *also* currently
+  unprofitable, a separate/broader issue) — this is a meaningful partial fix, not a
+  path to overall profitability by itself. A closing-line-value check on the same
+  split shows the compressed segment drifting slightly AWAY from the model's picks
+  by closing (-0.0019) while the rest drifts slightly TOWARD them (+0.0022) —
+  small in magnitude but directionally consistent with a real, fixable defect
+  specific to this segment, not just generic noise. **Re-run and update this number
+  whenever a candidate fix is tested or shipped**, so the headline stays current
+  rather than going stale like the rest of this entry did before the 2026-08-19
+  cleanup.
 
-**Confirmed costly, not just a calibration curiosity.** Full-season backtest ROI
-(`backtest.py`, all bets clearing EV threshold) is negative in all three seasons
-(-15.1% / -12.7% / -5.2% at EV>0%) and does **not** improve monotonically as the EV
-threshold is raised (2024: -12.7% → -14.9% → -14.6% at 0/5/10%) -- the miscalibration
-isn't confined to the low-confidence tail, it's present in the model's most confident
-bets too. By-side breakdown: away bets are the single worst-performing bucket in most
-seasons (2023: -33.2% ROI on 164 away bets), consistent with the model overvaluing away
-win probability and generating false-positive-EV away bets.
+  The constant-tuning family of fixes (shrinkage `k_minutes`, spread stretch, the
+  team-credibility de-shrink) is exhausted — two dedicated searches this session
+  found no further improvement inside it (see below). That's a reason to change
+  *approach* on the next attempt, not a reason to deprioritize the problem — the
+  value case above stands regardless of which specific lever gets there.
 
-**Goal (agreed 2026-07-27).** Not "match the market exactly" -- a model that exactly
-reproduces market probability has zero edge by construction, and some model/closing gap
-is structurally irreducible (closing lines price in late information -- injury/lineup/
-money -- the model can't have at generation time). The target is the **signed** bias
-specifically, not raw distance: get mean signed diff on home and away to within roughly
-±0.01-0.02 of zero, leaving the unbiased/idiosyncratic spread alone (that's where
-genuine edge, if any, should come from). Full-season ROI is the validation check for
-this goal over a multi-season horizon, not the tuning target itself -- ROI is noisy
-(raising the EV threshold didn't reliably move it here), a lesson already learned once
-in this log (see the knockout-ROI **WATCH** entry's "coin flip" finding).
+**Finding.** Model probabilities vs. sharp closing lines (Pinnacle, Betfair Exchange)
+showed two related but distinct problems:
 
-**Diagnosis #1, confirmed: stale league-average baseline (partial cause).**
-`get_league_averages()`'s `avg_home`/`avg_away` blended all history with no recency
-weighting (DESIGN-002), and `avg_home` enters `estimate_lambdas()` as a bare divisor
-(`lambda_H = h_att * (a_def / avg_h)`) that -- with `SHRINKAGE_K` at 0, i.e. shrinkage
-fully disabled -- was one of the only live channels through which the league average
-affected a prediction. Confirmed directly: per-season `avg_home - avg_away` (the
-league's home-scoring edge) is ~0.257-0.258 in 2022-23 and ~0.118-0.126 in 2024-25 --
-home advantage genuinely roughly halved -- while the old unweighted all-history blend
-sat at 0.190, overstating today's home advantage by ~0.06-0.07 goals of edge.
+1. **Pooled home/away signed bias** (model underrated home, overrated away, averaged
+   across all matches) — **fixed 2026-07-27**: `get_league_averages()` gained a
+   recency window (`LEAGUE_AVG_WINDOW=100`, ~10 matchdays) instead of an unweighted
+   all-history blend. Confirmed across seasons/books; residual bias shrank but didn't
+   fully close on its own (~-0.02 to -0.03 home / +0.03-0.04 away remained).
+2. **Spread compression on extreme mismatches** (found 2026-08-04, invisible to the
+   pooled metric above): bucketing model p(home) by market implied probability shows
+   the model pulls big favorites down and big underdogs up, growing with mismatch
+   size. Two additive causes, both from FEATURE-011's 2026-08-02 work: (a) switching
+   team-level ratings from goals to xG (xG has genuinely less natural spread than
+   goals — a property of the data, not a bug), (b) the player-level blend layer on
+   top of that.
 
-**Fix shipped 2026-07-27 (partial).** `get_league_averages()` gained `window`/`decay`
-params (see `core/poisson_model.py`); `analyse_match()` exposes them as
-`league_avg_window`/`league_avg_decay` overrides, same single-entry-point pattern as
-BUG-008's fix. Tested window sizes (10/20/30/40 matchdays, ~100-400 matches) and decay
-values directly against the signed-bias metric on 2025-26 vs. Betfair closing: **all
-converge on the same plateau** (signed home ≈ -0.025, signed away ≈ +0.031) regardless
-of whether a short window, a long window, or continuous decay is used -- confirming this
-mechanism has a hard ceiling, not a tuning problem. Shipped the simplest option that
-reaches the plateau: `LEAGUE_AVG_WINDOW = 100` (~10 matchdays), `LEAGUE_AVG_DECAY = 1.0`
-(off -- adds no benefit over the window alone). New model version `poisson_v3`,
-backfilled to `soccer_model_predictions` for all three seasons. Tests: `test_get_league_
-averages_window_limits_to_recent_matches`, `test_get_league_averages_default_window_is_
-100`, `test_get_league_averages_decay_weights_recent_matches_more` (`tests/test_poisson_
-model.py`).
+**Fixes shipped from this investigation:**
+- `TEAM_RATING_XG_V_GOALS_BLEND` param added (2026-08-05), tunable goals/xG mix —
+  default unchanged (pure xG) since ROI didn't track the calibration gain cleanly.
+- `CLUB_LEAGUE_MIN_PICK_PROBABILITY=0.25` floor guardrail ported from the World Cup
+  pipeline into `core.pick_guardrails`, wired into live picks (2026-08-07) — real
+  ROI improvement in most slices, though its marginal value shrank once the xG-stretch
+  fix below also shipped (overlapping symptoms).
+- Player-level attack recentering switched additive→multiplicative (2026-08-09) — a
+  real correctness fix (additive could drive a rating negative); improved compression
+  in every bucket/season, Brier ~0.6% better pooled. Shipped on correctness/calibration
+  grounds despite season-inconsistent ROI (see recurring lesson below).
+- `TEAM_RATING_XG_SPREAD_STRETCH_ATTACK/_DEFENSE=1.3` shipped (2026-08-07) — flat
+  multiplicative re-widening of team-level xG ratings around the league mean, partially
+  restoring spread lost to pure-xG's lower variance. Real compression/Brier
+  improvement; ROI improved in *both* seasons at this value (unusual for this
+  investigation). 1.66 (the literal goals/xG stdev ratio) was tested and overcorrects
+  (breaches the bias target) — 1.3 is the calibrated safe ceiling.
 
-**Result, validated across all seasons/books, not just the diagnosis slice:**
+**Recurring lesson: ROI does not reliably track calibration improvements** at the
+1-2 season sample sizes available here — several well-evidenced calibration fixes
+(xG/goals blend sweep, additive→multiplicative, post-hoc recalibration) moved ROI in
+*opposite* directions across the two backtest seasons, or not at all. Brier/bias, not
+ROI, has been the primary signal for shipping decisions since.
 
-| | signed home | signed away | favored agree |
-|---|---|---|---|
-| 2023 vs Pinnacle | +0.0109 → +0.0093 | +0.0074 → +0.0064 | 78.2% → 77.9% |
-| 2024 vs Pinnacle | -0.0353 → -0.0175 | +0.0520 → +0.0374 | 74.5% → 77.4% |
-| 2024 vs Betfair | -0.0361 → -0.0183 | +0.0531 → +0.0385 | 73.9% → 76.8% |
-| 2025 vs Betfair | -0.0423 → -0.0252 | +0.0396 → +0.0309 | 70.2% → 73.8% |
+**Dead end, tried and dropped (2026-08-07):** a post-hoc output-recalibration curve
+(`recalibrate_output.py`) tightened calibration in-sample but made ROI worse in both
+seasons and didn't generalize out-of-sample (fit on one season, applied to the other,
+flipped the bias sign). Not pursued further.
 
-Full-season backtest ROI (validation check, not the tuning target): 2023 -15.1% →
--9.1%, 2024 -12.7% → -12.3% (barely moved), 2025 -5.2% → -3.9%. Still negative
-everywhere, consistent with a partial fix -- no surprises between the CLV and ROI reads.
+**2026-08-18/19 follow-up session — three more angles, all real, none a clean fix, and
+ROI itself found to be a weaker validation signal than treated so far:**
 
-**Still open (as of the 2026-07-27 fix).** A real residual bias remains (~-0.02 to -0.03
-signed home, ~+0.03-0.04 signed away in 2024/2025), well outside the ±0.01-0.02 target.
-2023 was already near-zero before this fix and stayed there -- worth noting the bias may
-not be uniform across seasons/eras, another thread to pull on.
+- **Isolated the player-blend layer's specific mechanism.** `apply_shrinkage()`'s
+  `k_minutes` (currently 900 — the minutes-based half-trust point pulling every
+  player toward their position's league average) is a real, isolated contributor to
+  the compression bug; lowering it toward ~100-150 nearly zeroed the favorite/underdog
+  compression in a small-sample probe. But a full grid sweep of `k_minutes` ×
+  `PLAYER_RATING_SPREAD_STRETCH_ATTACK` (12 combinations, full 5-league backfill)
+  found a clean, monotonic Pareto trade-off: every combination that meaningfully
+  improves compression also degrades pooled Brier and reopens the away-bias target.
+  The current shipped values (k=900, stretch=2.0) are Pareto-best on Brier — no free
+  lunch inside this constant family.
+- **Built and shipped, opt-in only: team-specific credibility de-shrink.**
+  `apply_shrinkage()` now retains each player's shrink weight (previously discarded);
+  `team_credibility()` aggregates it per team the same way `raw_team_strength()`
+  weights the value itself; `compute()` gained `player_use_team_credibility_deshrink`
+  (default `False`) to replace the flat stretch with a team-specific linear correction
+  sized to that team's own actual shrinkage, instead of one constant for every team.
+  Nearly matches the constant grid's best compression result (-0.053→-0.012 favorite
+  delta) at ~60% of the Brier cost — a real improvement to the trade-off, not an
+  escape from it. Full backfill: pooled ROI modestly better, but Brier worse in
+  **every single league**, and per-league ROI is genuinely mixed (Bundesliga roughly
+  halves its loss; La Liga gets worse across the board). **Kept off by default** —
+  real, tested (10 new unit tests, full suite green), documented, not promoted.
+- **Found ROI itself is close to uninformative for validating any of this.** The
+  model's positive-EV picks are worse-calibrated (higher Brier) than its whole-season
+  average, and get *more* overconfident as the EV threshold rises — true for baseline
+  AND team-deshrink, worse for team-deshrink. A closing-line-value check (does the
+  sharp market move toward the model's picks between opening and closing?) showed
+  **zero average movement** (essentially a 50/50 coin flip toward vs. away) at every
+  EV threshold — the model's "positive EV" picks carry no detectable real information
+  edge; EV-threshold selection on a noisy model mechanically selects for overconfident
+  noise, not skill. **ROI comparisons throughout this file's history should be read
+  with real skepticism** — Brier/bias (unbiased, no selection filter) remain the
+  trustworthy signal.
+- **Checked the team-level side for the same class of fix — ruled out, not just
+  deprioritized.** `TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES=0` (team-level shrinkage
+  is already fully disabled). There's no team-level shrinkage to de-shrink, so the
+  player-level mechanism doesn't transfer. Checked whether the flat
+  `TEAM_RATING_XG_SPREAD_STRETCH` constant should instead vary by team or league:
+  per-team xG/goals variance ratio is dominated by sampling noise (individual team
+  ratios swing from -3.5 to +3.7 at realistic sample sizes); per-league ratios are
+  more stable within a season but swing 0.11-0.34 across seasons — larger than the
+  spread between leagues in any one season. **Neither is a stable enough signal to
+  calibrate against** — the current flat constant is a reasonably defensible choice.
+  Closed, no further lever identified.
 
-**Diagnosis #2, confirmed 2026-08-04: spread compression on large mismatches (the
-"residual bias" root cause) -- discovered investigating why FEATURE-011's poisson_v4
-fails the ROI success criterion despite passing Model Calibration.** The signed home/
-away split (above) only measures average bias pooled across ALL matches -- it can't see
-a bias that changes SIGN and MAGNITUDE with how lopsided a match is, which is exactly
-what's happening. Bucketing model p_home vs. Betfair Exchange closing p_home by the
-market's own implied probability (`poisson_v4_priorblend`, Serie A 2025-26, n=359):
-
-| Market p(home) | poisson_v3 (2026-07-27 fix) | pureteamxg (xG team-level, no player blend) | poisson_v4_priorblend (full v4) |
-|---|---|---|---|
-| 0.00-0.15 | +0.013 | +0.069 | +0.108 |
-| 0.15-0.25 | -0.011 | +0.055 | +0.094 |
-| 0.25-0.35 | +0.010 | +0.039 | +0.051 |
-| 0.35-0.45 | -0.020 | -0.017 | -0.014 |
-| 0.45-0.55 | -0.062 | -0.032 | -0.045 |
-| 0.55-1.00 | -0.056 | -0.071 | -0.125 |
-
-The model systematically pulls extreme probabilities toward the middle relative to the
-market -- overrating big underdogs AND underrating big favorites, growing with the size
-of the mismatch. NOT specific to any one team (confirmed identical in matches between
-two "team-dominated" teams, i.e. resolve_blend_weight >= 0.5 on both sides, vs. matches
-involving a "player-dominated" team -- ruling out compute_club_player_strength.py's
-K_SHRINK_MINUTES/positional-shrinkage pipeline as the SOLE cause, since the pattern is
-present even when neither side touches it).
-
-Decomposed by re-running the identical bucket check on `poisson_v3` (goals-based team-
-level, no player blend at all -- this session's pre-2026-08-02 model) vs. a pure-team-
-level xG variant (`--weight-attack 1 --weight-defense 1 --team-metric xg`, isolates the
-team-rating source with zero player-blend contribution) vs. the full `poisson_v4_
-priorblend`: **two separate, additive causes**, both introduced/discovered via
-FEATURE-011's 2026-08-02 work --
-1. **Switching the team-level rating from actual goals to xG (`team_metric="xg"`,
-   shipped 2026-08-02, the change that CLEARED the Model Calibration success
-   criterion)** is itself the larger contributor at the underdog end -- alone adds
-   +0.056 on top of poisson_v3's small residual (+0.013 -> +0.069 at the biggest-
-   underdog bucket). This is a real tradeoff, not a wash: the xG switch fixed the
-   POOLED signed home/away bias (verified, see the 2026-07-27... no, 2026-08-02 result
-   table in FEATURE-011_BUILD_TRACKER.md) while introducing a mismatch-size-dependent
-   bias that the pooled signed-bias metric structurally cannot see.
-2. **The player-level blend layer on top adds a second, separate contribution** -- going
-   from pureteamxg to full priorblend adds another +0.039 at the underdog end and a
-   much larger -0.054 at the favorite end. Exact mechanism within the player-blend
-   layer (K_SHRINK_MINUTES=900 positional shrinkage is the leading suspect -- it
-   shrinks essentially every player's rate toward the position-wide average, which
-   would compress team-quality spread league-wide, not just for thin-sample players)
-   not yet isolated further.
-
-**Why this matters for FEATURE-011's ROI failure specifically:** promoted teams
-(Cremonese/Sassuolo/Pisa) are simply the most extreme underdogs in the league most
-often, so they're where this shows up most acutely (e.g. Cremonese's own attack/defense
-ratings are close to league-average, not inflated -- see FEATURE-011_BUILD_TRACKER.md;
-even a hypothetical "both teams exactly league-average" matchup already gets ~40% model
-home-win probability from the baseline/home-advantage structure alone). The promoted-
-team cold-start trust-score bug (this file's earlier note, fixed 2026-08-03) was real
-and independently worth fixing, but it is a SECONDARY contributor to the ROI failure --
-this spread-compression pattern is the dominant one, and it's league-wide.
-
-**Not yet fixed (as of 2026-08-04).** Candidates: (a) revert `team_metric` default to
-"goals" (undoes the xG-switch's ~half of the compression, but reopens some of the
-pooled signed home/away bias it fixed -- a real tradeoff to make deliberately, not
-accidentally); (b) reduce or retune `K_SHRINK_MINUTES` and re-check both this bucket
-table AND the pooled signed-bias metric together, since BUG-009's original fix and this
-one are now coupled; (c) investigate whether get_team_xg_ratings' xG data source itself
-has less spread than actual goals by construction (a known general property of xG
-models) vs. something league/window-specific fixable with tuning.
-
-**2026-08-05: (a) built and validated -- `team_xg_weight` param added to
-`team_level_lambda`/`compute()` (0.0=pure goals, 1.0=pure xG/DEFAULT/no-op, blends in
-between; replaces the old binary `team_metric` string, exact behavior preserved at both
-boundaries). Full-pipeline sweep (`poisson_v4_priorblend` family, Serie A 2025-26, vs.
-Betfair closing): bucket compression improves monotonically as weight drops toward 0.5
-(underdog end +0.108→+0.083, favorite end -0.125→-0.113) while pooled signed-bias stays
-within the ±0.01-0.02 target at every value tested down to 0.25 (-0.0090 at 1.0 down to
--0.0195 at 0.25). ROI, however, did NOT track the calibration improvement -- ROI @0/5/
-10% across alpha=1.0/0.75/0.5/0.25 zigzags with no monotonic trend (0.75 is the WORST of
-the four at EV>10%, -15.5%; 0.25 is the BEST at EV>0%, -8.1%) -- same "ROI is a noisy
-single-season validation check, not a tuning target" lesson as the original 2026-07-27
-fix. Not shipped as a new default pending more validation; parameter exists, default
-unchanged (1.0).
-
-**2026-08-05: found a MUCH larger, validated ROI lever -- the existing WC "noise
-amplification on longshots" guardrails (BUG-003, `generate_wc_card.py`:
-`MIN_PICK_PROBABILITY=0.25` floor, `MAX_UNDERDOG_MARKET_DISAGREEMENT=2.0` ratio cap) had
-never been ported to the club-league pipeline at all -- every poisson_v4 backtest all
-week included picks a WC-style guardrail would have silently rejected.** Retroactively
-applying floor+cap to `poisson_v4_priorblend`'s existing positive-EV picks (no model
-change, pure bet-selection filter -- pooled signed bias is mathematically unaffected,
-confirmed directly: 2025 home -0.0090/away +0.0125, 2024 home -0.0050/away +0.0055, both
-comfortably within target either way):
-
-| Guardrail | 2025 ROI @0/5/10% | 2024 ROI @0/5/10% |
-|---|---|---|
-| none | -9.0% / -7.5% / -7.6% | -15.6% / -20.7% / -21.2% |
-| floor=0.25 only | -8.0% / -5.9% / -2.4% | -6.7% / -10.7% / -8.8% |
-| floor=0.25 + cap=2.0 (WC's value) | -6.2% / -3.6% / **+0.6%** | -8.4% / -13.0% / -11.7% |
-
-Floor alone is a large, consistent win in BOTH seasons (roughly halves the loss every
-time). The WC's cap=2.0 helps in 2025 but hurts relative to floor-alone in 2024 -- its
-marginal value isn't season-robust. Swept cap directly against both seasons (floor held
-at 0.25): **cap=1.75 is the point where the two seasons' ROI curves converge**
-(2024 -5.8% / 2025 -5.7% at EV>0%, vs. cap=2.0's -8.4%/-6.2% -- a much tighter agreement
-than any other cap value tested, a stronger robustness signal than picking whichever
-single point scores best on one season) and beats cap=2.0 in EVERY cell of a 2-season x
-3-threshold grid (6/6). 2 seasons x ~300-330 bets is still a real sample-size caveat --
-"best-supported value in the data available," not proven. Not yet built into the
-pipeline as a real gate (tested via an ad hoc script only); WC's `select_pick()`/
-guardrail pattern (`generate_wc_card.py`) is the template to port if/when shipped.
-
-**Guardrail diagnostic breakdown (2026-08-05, floor=0.25/cap=1.75, both seasons pooled,
-EV>0%, one dimension at a time -- not re-tuned per slice, just checking where the
-already-chosen values' benefit concentrates):**
-
-| Dimension | Baseline ROI | With guardrail |
-|---|---|---|
-| Home picks | -23.4% | -11.6% |
-| Draw picks | -6.9% | -7.9% (guardrail ~inert on draws, as expected -- cap can't fire on a draw the way it does on a 1X2 underdog) |
-| Away picks | -7.4% | +2.6% |
-| Early season (MD 1-19) | -7.7% | -0.5% |
-| **Late season (MD 20-38)** | **-17.2%** | **-11.3%** |
-| Favorite picks (implied>=0.5) | +19.5% (n=26, too small to trust) | +19.5% (n=26, guardrail never fires here) |
-| Underdog picks | -13.3% | -6.9% |
-| Top-half team backed | **+15.2%** | +8.4% (guardrail COSTS profit here -- cuts some winners along with losers) |
-| Bottom-half team backed | -26.7% | -13.3% |
-| Excluded-by-guardrail picks (own perf) | -25.1% ROI, 12.4% win rate | n/a (this IS the excluded group) |
-| Included/kept picks (own perf) | -5.8% ROI, 28.5% win rate | n/a (this IS the included group) |
-
-Two findings worth carrying forward: (1) excluded picks have less than half the win
-rate of included picks (12.4% vs 28.5%) -- the guardrail is demonstrably cutting real
-bad bets, not just shrinking the sample for luck; backing top-half teams was ALREADY
-profitable pre-guardrail and the guardrail shaves some of that off, a real (if smaller)
-cost against the larger gain elsewhere. (2) **Late season is the worse bucket, both
-before AND after the guardrail fix -- the opposite of the "cold start" intuition that
-motivated most of this week's work (promoted-team trust score, prior-season blend).**
-If cold-start/thin-early-season-data were the dominant driver, early season should be
-worse. It isn't. This suggests a SEPARATE, not-yet-diagnosed systemic issue in how the
-model weighs accumulated in-season data as a season progresses -- next thread to pull,
-distinct from everything fixed/found this week. Small-sample caveat applies (2 seasons,
-~450-480 picks per early/late bucket) but the direction is clear enough to prioritize.
-
-**2026-08-05: late-season anomaly diagnosed -- NOT the spread-compression bug, NOT
-general model miscalibration; a real market-information gap that peaks specifically in
-MD20-28, concentrated in bottom-table (and top-table) teams.** Three checks against the
-"cold start gets worse as the season goes on" intuition, ruled out cleanly:
-
-1. **Spread-compression bug does not get worse late season -- if anything it's
-   slightly smaller in every bucket** (e.g. biggest-underdog bucket +0.112 early vs
-   +0.096 late, biggest-favorite bucket -0.139 early vs -0.106 late; market's own
-   implied-probability extremity is flat, 0.175 early vs 0.178 late). Ruled out the
-   "more current-season minutes accumulated -> less shrinkage -> bigger mismatches ->
-   compression bites harder" hypothesis directly (also confirmed shrinkage weight
-   `mins/(mins+900)` does climb steadily across the season, 0.17 at MD5 to 0.58-0.59 by
-   MD38, as expected -- the mechanism is real, it just isn't the explanation here).
-2. **The model's own calibration against REALIZED outcomes (Brier score, all games,
-   not just picks) is BETTER late season, not worse** (0.615 early -> 0.590 late,
-   pooled both seasons) -- and the MARKET improves similarly (0.586 -> 0.556). Per
-   `[[backtest-vs-realized-outcomes]]`-style discipline (check against reality, not
-   just the market): this rules out "the model's probabilities get less accurate as
-   the season goes on" as the cause -- they don't.
-3. **What DOES get worse: the specific subset of games the model actually bets on**
-   (positive-EV picks vs Bet365, pre-guardrail). Overconfidence (mean model pick
-   probability minus actual win rate) on this subset rises from +0.072 (MD1-19) to
-   +0.088 (MD20-38), and by finer matchday chunk is sharply non-monotonic -- MD1-9
-   +0.066, MD10-19 +0.077, **MD20-28 +0.104**, MD29-38 +0.071 (partial recovery). So
-   this isn't "everything gets worse as the season wears on" -- it's a **spike
-   concentrated in the MD20-28 window specifically**, not a smooth late-season drift.
-
-**MD20-28 breakdown by team's final-table position (both seasons pooled, n=236
-positive-EV picks in that window):**
-
-| Group | n | ROI | Win rate | Mean model p |
-|---|---|---|---|---|
-| Top-6 (final table) backed | 21 | -37.2% | 23.8% | 0.424 |
-| Mid-table backed | 74 | +9.8% | 29.7% | 0.309 |
-| **Bottom-6 (final table) backed** | 76 | **-62.5%** | **10.5%** | 0.304 |
-| Draw / no team attribution | 65 | -21.5% | 18.5% | 0.259 |
-
-Bottom-6 is the standout: 76 picks the model liked at an average 30% probability won
-only 10.5% of the time -- a much larger gap than anywhere else in the whole
-investigation this week. Top-6 is bad too (though n=21 is thin). Mid-table, by
-contrast, is fine (+9.8% ROI) in the exact same window -- so this isn't a pure
-matchday-number effect either, it's specific to teams with something riding on the
-run-in (relegation fight or European-spot race).
-
-**Leading hypothesis (not yet tested further): the Serie A winter transfer window.**
-Italy's window closes late January / early February, which lines up almost exactly
-with MD20-22 -- right at the front edge of the MD20-28 spike. A relegation-battle
-squad reshaped by January signings (or a key departure) has very little current-season
-minutes on the new pieces, so the model's rolling stats are describing a roster that
-partially no longer exists on the pitch -- compounded by motivation/manager-change
-effects (relegation four-point-plans, a new manager bounce) that no stats-based signal
-captures at all. This is a genuinely different mechanism from anything fixed this week
-(cold-start trust score is about *promoted* teams at *season start*; this is
-*established* teams reshaped *mid-season*) and from the compression bug (ruled out
-above). **Not yet fixed or further isolated** -- next steps, if pursued: (a) check
-whether bottom-6 team's MD20-28 losing picks cluster around actual transfer activity
-(new-signing-heavy lineups) vs. squad-stable relegation teams that still lose value,
-which would separate "roster-churn blind spot" from "pure motivation/desperation
-effect" as the driver; (b) same table-position x window breakdown on a 3rd season if/
-when one is backfilled, to check this isn't a 2-season coincidence.
-
-**2026-08-05: (a) tested directly -- roster-churn/departure NOT the driver, cleanly
-ruled out.** Flagged every bottom-6/top-6 team with a "significant departure" (a
-player with >=500 minutes before MD20 who then plays zero minutes for that team from
-MD20 on -- sold, released, or long-injured; the model can't tell which, but either way
-their stale rate keeps counting per `MODEL_PIPELINE_OVERVIEW.md` section 1's gap) and
-split the MD20-28 picks on it:
-
-| Group | Has significant departure | No departure |
-|---|---|---|
-| Bottom-6 backed | n=39, roi=-62.0%, win 12.8% | n=37, roi=-63.0%, win 8.1% |
-| Top-6 backed | n=4, roi=-18.8%, win 25.0% | n=17, roi=-41.6%, win 23.5% |
-| Mid-table backed | n=49, roi=+20.4%, win 34.7% | n=25, roi=-10.9%, win 20.0% |
-
-Within bottom-6 -- the group where the anomaly actually lives -- ROI and win rate are
-statistically indistinguishable with or without a squad-stable-vs-churned split
-(-62.0% vs -63.0%). Squad-stable relegation teams (Lecce 2024, Empoli 2024, Hellas
-Verona 2025, Cremonese 2025, Genoa 2025 -- no player crossing the 500-minute
-departure bar) collapse just as hard as the churned ones (Cagliari, Venezia, Monza,
-Parma 2024; Pisa, Fiorentina, Lecce 2025). **This rules out Follow-up A's stale-
-departed-player mechanism as the driver of THIS specific pattern** -- the roster-
-awareness feature ask still stands on its own general merit (section 1 of
-`MODEL_PIPELINE_OVERVIEW.md` is still a real gap), but building it would not be
-expected to fix the MD20-28 bottom-6 collapse specifically. Points the remaining
-explanation back toward something common to EVERY bottom-6 team in that window
-regardless of squad continuity -- relegation-fight motivation/effort-level swings
-(FEATURE-004's "dead rubber" idea is the inverse case; FEATURE-013 already proposed
-"additional external factors" as a category) rather than a data-staleness bug. Not
-further isolated; may be genuinely outside what a stats-only model can capture.
-
-**2026-08-05: separate thread -- additive-vs-multiplicative inconsistency in the
-player-level ATTACK recentering, tested and found to shrink compression but NOT
-reliably improve ROI (same disconnect as the `team_xg_weight` sweep).** Spotted while
-discussing whether the model treats goal-scoring as linear (user's hypothesis): today,
-`compute_club_player_strength.compute()` recenters player-level attack with a flat
-additive shift (`avg_home + (r["ra"] - attack_mean)`) but recenters defense with a
-multiplicative ratio (`r["rd"] * (avg_away / defense_mean)`) -- an unexplained
-asymmetry between the two components in the SAME function, and structurally exactly
-the "a fixed delta means the same thing everywhere" pattern the user was asking about
-(the team-level system itself, `lambda_H = h_att * (a_def / avg_h)`, is already
-multiplicative throughout, so this asymmetry is specific to the player-blend layer).
-
-Tested making attack multiplicative too (ad hoc script, not committed). Compression
-bucket table (2025-26, n=329, vs Betfair closing) improved in every bucket (e.g.
-biggest-underdog end +0.109->+0.084, biggest-favorite end -0.128->-0.106) with pooled
-signed bias essentially unchanged (-0.0104 -> -0.0102, both already within target).
-**ROI, however, is season-inconsistent -- the same "calibration improves, ROI doesn't
-track it" pattern already seen with `team_xg_weight`:**
-
-| | 2024 @0/5/10% EV | 2025 @0/5/10% EV | Pooled @0/5/10% EV |
-|---|---|---|---|
-| additive (today) | -15.6% / -20.7% / -21.2% | -9.0% / -7.5% / -7.6% | -12.4% / -14.1% / -14.3% |
-| multiplicative | -14.7% / -18.7% / -19.6% | -16.0% / -9.4% / -9.7% | -15.3% / -14.0% / -14.5% |
-
-Multiplicative is a clear, consistent win in 2024 (better at all 3 thresholds) and a
-clear, consistent loss in 2025 (worse at all 3 thresholds) -- pooled, it's close to a
-wash. Not shipped as a default. Consistent with this week's recurring lesson: ROI is a
-noisy single-season signal that does not reliably move with calibration improvements
--- the compression-bucket result is real evidence this fixes something, but on its
-own isn't sufficient to justify shipping given the ROI picture is a coin flip across
-the two seasons available. Candidate for revisiting alongside `team_xg_weight` if/when
-a 3rd season of backtest data exists.
-
-**2026-08-09: shipped anyway, on correctness/consistency grounds rather than waiting
-for a 3rd ROI season.** Re-examined the additive-vs-multiplicative question on its own
-mathematical merits rather than purely by backtested ROI: the additive form has no
-principled justification and a real defect the ratio form doesn't share -- it can
-drive the recentered player-attack lambda **negative** for a team far enough below
-`attack_mean` when `avg_home`/`avg_away` is small (a Poisson rate parameter must never
-be negative), and it implicitly treats the raw player-rate scale as directly
-comparable in absolute units to the goals-per-game scale, an assumption nothing in the
-pipeline actually establishes. Multiplicative has neither problem, and matches both
-defense's own recentering and the team-level system's convention throughout
-(`lambda_H = h_att * (a_def / avg_h)`) -- attack was the one inconsistent piece, not a
-deliberately different design.
-
-Shipped: `compute_club_player_strength.compute()`'s attack recentering is now
-`r["ra"] * (avg_home / attack_mean)` (was `avg_home + (r["ra"] - attack_mean)`),
-matching defense's `r["rd"] * (avg_away / defense_mean)` exactly. The two tests
-documenting this asymmetry (`tests/test_compute_club_player_strength.py`) are updated
--- the additive-behavior test is removed (no longer real behavior) and the
-multiplicative-contract test now passes instead of being deliberately left red.
-
-Regenerated `poisson_v4` (both seasons, current shipped constants -- NOT the 2025-26-
-only, pre-xG-stretch state the table above was measured under, so the two aren't
-directly comparable) to validate under the actual current pipeline:
-
-| | Brier 2024 | Brier 2025 | Brier pooled |
-|---|---|---|---|
-| additive (previous) | 0.5948 | 0.6169 | 0.6058 |
-| multiplicative (shipped) | 0.5906 | 0.6134 | **0.6020 (~0.6% better, both seasons)** |
-
-Compression bucket table improved in **every bucket, both seasons** (e.g. 2024
-biggest-underdog end +0.064->+0.050, biggest-favorite end -0.093->-0.073) --
-consistent with the 2026-08-05 finding. Pooled signed bias stayed in roughly the same
-(already-passing) range, home/draw/away all still within or near the +/-0.01-0.02
-target.
-
-ROI vs Bet365, however, **flipped direction from the 2026-08-05 reading** -- now worse
-in 2024 (@0/5/10% EV: -9.2%/-12.6%/-19.9% -> -11.0%/-16.4%/-19.1%, mixed but mostly
-worse) and better in 2025 (-9.8%/-6.6%/-8.5% -> -6.3%/-6.2%/-7.8%, better at all 3
-thresholds) -- the OPPOSITE season pattern from the earlier ad hoc test (which had
-2024 improving and 2025 worsening). This is strong direct evidence, not just an
-inference, that this fix's ROI sign is unstable across the model's own evolving
-constants and not a signal worth gating a correctness fix on -- the calibration
-evidence (Brier, compression bucket, both consistently positive in both seasons under
-both the old and new model states) is the trustworthy signal here, and it's what
-motivated shipping. Full snapshot: `model_snapshots/20260809_124219_poisson_v4.txt`.
-
-**2026-08-05: sanity-checked the ROI success criterion's own benchmark validity --
-does a sharp closing line actually beat Bet365, i.e. is chasing agreement with it a
-meaningful target at all?** Ran the identical backtest methodology used all week
-(find bets where a "prediction" disagrees enough with Bet365's price to clear an EV
-threshold, then check real-money ROI against Bet365's payouts) but substituted the
-SHARP BOOK'S OWN closing fair-probability in place of the model's:
-
-| Source used as "prediction" | 2024 @0% EV | 2025 @0% EV | Pooled @0/5/10% EV |
-|---|---|---|---|
-| **Betfair Exchange** | **+6.1%** (n=243) | **+13.8%** (n=197) | **+9.6%** / +27.8% / -1.2% |
-| Pinnacle | -11.6% (n=250) | +8.5% (n=108) | -5.6% / +4.6% / +7.7% |
-
-**Betfair Exchange -- the source this entire week's bias/compression diagnostics have
-used as ground truth -- validates cleanly:** positive ROI in BOTH seasons
-individually and pooled, at the largest/most-robust threshold (EV>0%, n=440). This
-confirms the ROI success criterion is chasing a real, profitable target, not an
-arbitrary one. **Pinnacle does NOT validate as cleanly** -- pooled negative at EV>0%
-(the only threshold with a robust sample, n=358), only positive at higher thresholds
-where n drops to 29-45 (thin, noisy). Practical implication: the model's persistent
-negative ROI this week (-5% to -21% across variants/seasons) should be read against
-Betfair Exchange's own achievable ceiling (+9.6% at EV>0%, and even that gets noisy
-past EV>5%, n=109-123) -- "beat zero" and "beat +9.6%" are different bars, and even
-the sharp benchmark itself doesn't hold up at every threshold/source combination
-tested. Not a criticism of the criterion itself (Betfair Exchange holds up fine), but
-useful context for calibrating how much ROI improvement is realistically achievable.
+**Where this leaves things:** two independently-diagnosed causes (team-level xG
+spread, player-blend shrinkage), both understood, both partially and safely addressed
+(xG-stretch, additive→multiplicative, guardrail all shipped; team-credibility
+de-shrink built and available but off by default). No further lever found at either
+the player or team level that improves compression without a real calibration cost —
+but the ~41% total-loss-reduction ceiling quantified above means this stays worth
+continued investment, not something to shelve. The specific thing that's exhausted is
+the constant-tuning family (shrinkage/stretch/credibility-weighting); the next
+attempt needs a structurally different idea, not another sweep inside that family.
 
 ---
 
@@ -4156,3 +3931,175 @@ sign the model's/market's read of the game was wrong. Two games, same day, oppos
 score-vs-process divergence — a clean illustration of why single-game results (and
 even the model's own goals-based proxy, not true xG — see DESIGN-001) can diverge
 sharply from the underlying quality of play in either direction.
+
+---
+
+## FEATURE-019 — Season-start kickoff sequence (league-membership sync, squad refresh, name-map/odds checks), run once per season — **SHIPPED 2026-08-19**
+
+- **Type:** enhancement / tooling · **Status:** SHIPPED 2026-08-19. New
+  `season_kickoff.py`, run once per season across all 10 tracked divisions.
+
+**Problem.** A team's row in `soccer_teams` carries a `league` column meant to answer
+"what league is this team in right now" — but nothing in the codebase ever updates it
+after the team is first created.  So if/when a team is relegated/promoted the value in 
+the league column gets out of date.  There is other code that consumes the league and 
+expects it to be correct, for example - `import_league_betting_odds.py`'s `load_team_map()` filters
+`soccer_teams WHERE league = ?`, so a promoted team silently becomes invisible to odds
+matching, every season, for as long as this project runs.
+
+**Two independent pipelines, two different bugs — both in scope.**
+1. The 8 TheStatsAPI-sourced divisions (Premier League/Bundesliga/La Liga/Ligue 1 +
+   their feeders) go through `core.sports_db.ensure_soccer_team()` — the stale-label
+   bug described above. Silent, not loud: a promotion just quietly stops updating.
+2. Serie A/Serie B go through `update_serie_a_results.py`'s OWN, separate
+   `ensure_team()`/`load_team_map()` (does not call `core.sports_db.ensure_soccer_team`
+   at all). Worse failure mode: `load_team_map()` only ever loads teams matching
+   `WHERE league = 'Serie A'` once at start, cached in a plain dict; a team promoted
+   FROM Serie B that already exists in `soccer_teams` (just under the wrong league)
+   won't be in that cache, so `ensure_team()` will attempt a fresh INSERT with the
+   same `name` — which `soccer_teams.name`'s UNIQUE constraint will reject with an
+   uncaught `sqlite3.IntegrityError`, crashing the whole sync. (Not hit today only
+   because the specific promoted team we pulled, Frosinone Calcio, happened to be new
+   to our tracking rather than a previously-known relegated team — this is a
+   real, live landmine for a future season, not already proven safe.)
+
+**Proposed shape.** A new script, run once at the start of each season, doing six
+things per division, in order:
+
+1. **Check the new season is actually available.** Some leagues publish their
+   schedule later than others — Bundesliga's 2026-27 season doesn't start until
+   Aug 28, over a week after the others. Because of that, the script needs to be
+   able to be run multiple times and only add new information (like a new league)
+   that has published its schedule.
+
+2. **Update any team that changed leagues.** For every team in the new season,
+   compare it to what league we currently have on file for them. If it changed,
+   that's a promotion or relegation — log it plainly and update our record; if it's
+   a team we've never seen before, just add it.
+
+3. **Pull in the full season's match schedule**, using the import scripts that already
+   do this — no new fixture-pulling logic needed here.
+
+4. **Refresh every team's roster.** Transfer windows close right around this time,
+   so last season's rosters are stale. The model needs current rosters to make good
+   picks, so re-pull them once this season's teams and matches are in place.
+
+5. **List any teams whose odds data didn't match.** Every season, some newly
+   promoted teams show up under a slightly different name in the odds data (e.g.
+   "Inter Milan" instead of our "Inter"), so their odds silently fail to import.
+   This step doesn't fix that automatically — it just logs a clear list of who
+   didn't match, so someone can fix the names on purpose instead of discovering the
+   gap by accident later.
+
+6. **Confirm each league's odds source is actually live**, not just configured
+   correctly, before assuming odds import will work. Cheap check, and it would have
+   flagged Bundesliga's not-yet-started season from a second angle.
+
+**What this deliberately does NOT do:** it doesn't change any other code's behavior
+(the fix stays isolated to this one script); it doesn't fix the name-mismatch gaps
+found in step 5, only lists them; and it doesn't add a new "seasons" table to the
+database — season stays a plain year number.
+
+**New automatic check to add:** compare every team's stored league against the
+league of their own most recent match, and flag any mismatch. This is a simple
+standing alarm — it would have caught today's Hull City-style problem immediately,
+and keeps catching similar mistakes in the future even if this new script has a
+gap somewhere. Runs against the real database, opt-in, same pattern as the
+project's existing data-quality checks. A brand-new team with no matches yet isn't
+treated as broken.
+
+**Decisions (resolved 2026-08-19, ready for implementation):**
+
+1. **Serie A/B's separate, older team-tracking code gets fixed too** — rewired onto
+   the same safe, shared pattern as the other 8 divisions, removing the live crash
+   risk (not left as a known risk for next season).
+2. **Resolved: use TheStatsAPI's dedicated `teams` endpoint**
+   (`client.paginate("teams", {"competition_id": ..., "season_id": ...})`), not the
+   match schedule. This endpoint already exists and is already used by two other
+   scripts in this codebase (`import_club_squads.py`, `import_club_player_stats.py`)
+   — not a new integration. Verified live for Premier League 2026-27: returns all 20
+   teams correctly, Hull City and Coventry City included. More direct and
+   authoritative than inferring team membership from fixtures, at the same cost (one
+   extra API call per division, already an established, cheap pattern here).
+3. **A team that drops out of everything we track gets an explicit sentinel value**
+   — `league = "(unknown - not seen this season)"` — instead of a silently stale
+   real league name. Two implementation notes that follow from this: (a) this can
+   only be determined after ALL ten divisions are processed for the season (a team
+   missing from Serie A alone isn't "unknown" until it's also missing from Serie B,
+   Championship, etc.) — one extra pass at the end, not a per-division check; (b) any
+   other code that looks up `soccer_teams.league` in `core/leagues.py`'s registry
+   needs to tolerate this value without erroring — to be verified during
+   implementation, not assumed safe.
+4. **First-run cleanup confirmed as normal behavior** — the five already-mislabeled
+   teams in the live DB get fixed automatically the first time this script runs, no
+   separate one-off migration needed.
+>>> YES
+**Shipped 2026-08-19.** New `season_kickoff.py`, implementing all six steps against
+`core.leagues.LEAGUES`' 10 tracked divisions:
+
+- **Decision 1 done:** `update_serie_a_results.py`'s own separate `ensure_team()`/
+  `load_team_map()` now delegates to `core.sports_db.ensure_soccer_team()` instead of
+  a raw INSERT, removing the live crash risk (verified directly: a team that already
+  exists under a different, stale league no longer raises `sqlite3.IntegrityError`).
+  `load_team_map()` also dropped its `WHERE league = 'Serie A'` filter, since `name`
+  is already the real unique key.
+- **Decision 2 done:** team lists come from TheStatsAPI's `teams` endpoint (8
+  divisions) or football-data.org's `/teams` endpoint (Serie A only) — not derived
+  from fixtures.
+- **Decision 3 done:** a team not seen in any of the 10 divisions this run gets
+  `league = "(unknown - not seen this season)"`, applied only after all divisions are
+  processed, and only to teams whose *current* label belongs to a division that was
+  actually checked this run (a skipped division's teams are left untouched, not
+  incorrectly marked unknown).
+- **New data-integrity test** (`tests/test_data_integrity.py`,
+  `test_team_league_matches_their_most_recent_match`): compares every team's stored
+  league against their most recent match. One real refinement found while building
+  it — a division with zero matches in the *current* season yet (e.g. Serie B, since
+  `import_league_matches.py` only imports finished matches for divisions without an
+  odds source, and no 2026-27 Serie B match has been played yet) will always look
+  "stale" by this check even when correctly labeled, since there's no fresher match to
+  compare against. Exempted: only leagues with at least one current-season match get
+  the strict check; the rest are skipped as "can't validate yet," not "known good."
+
+**Verified end-to-end against the real database, not just tests.** First run
+surfaced far more staleness than the 5 teams found by hand while pulling fixtures —
+**22 teams**, including relegated teams stale in the *other* direction too (Sampdoria,
+Southampton, etc. still showing their old top-flight label). A second run (full
+pipeline, fixtures included) fixed the rest and left **~40 additional teams**
+correctly marked with the new sentinel — mostly teams from 2022-2025 seasons that
+have since dropped below the two tiers this project tracks per country, a real
+first-time "true-up" given nothing has ever reconciled these labels before. The new
+data-integrity test passes cleanly on the resulting database.
+
+**Not done in this pass, left for a follow-up run:** step 4 (squad refresh) was run
+with `--skip-squads` during testing to keep iteration fast; run separately right
+after, surfacing one more real bug worth recording here.
+
+**2026-08-19, same day: squad refresh run for real, found and fixed a second
+recurring problem.** `import_club_squads.py` resolves its TheStatsAPI competition by
+a bare name search when `--competition-id` isn't passed — genuinely ambiguous for
+common league names, confirmed live: "Serie A" also matches "LigaPro Serie A
+(Ecuador)"; "Bundesliga" also matches "Austrian Bundesliga"; "Premier League" matches
+six different competitions. 5 of 10 divisions (Serie A, Premier League, Bundesliga,
+Ligue 1, Championship) failed outright on first attempt. Since `season_kickoff.py`'s
+own step 4 calls this exact script without `--competition-id`, every future
+season-kickoff run would have silently hit the same failure. Fixed: `import_club_
+squads.py` now defaults `--competition-id` from `core/leagues.py`'s registry when the
+caller doesn't pass one explicitly (8 of 10 divisions already have a registered id);
+`season_kickoff.py` special-cases Serie A with its own discovered id
+(`comp_5840`) since squad data comes from TheStatsAPI even though matches
+deliberately don't (staying on football-data.org) — not added to the shared registry
+field, since that field's meaning there is specifically about the match-import
+source and overloading it would make `import_league_matches.py` wrongly skip the
+football-data.org path for Serie A's matches.
+
+**Final squad-refresh result: 9 of 10 divisions done.** Serie B is the one exception
+— genuinely zero matches recorded for the 2026-27 season yet (its season hasn't
+started producing results; `import_club_squads.py` requires at least one match on
+record to know which teams to pull), same underlying data-availability shape as the
+Bundesliga-fixtures and Serie-B-matches cases already noted above, not a bug. Will
+resolve itself on a future re-run once Serie B's season is underway.
+
+Step 5 (name-map gaps) surfaced real gaps as designed (Inter Milan, Atalanta BC,
+Bayer Leverkusen, Alavés, Athletic Bilbao, Le Mans FC, Paris Saint Germain, and
+others) — reported, not fixed, per the feature's explicit scope.
