@@ -41,12 +41,20 @@ def main():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # ONE odds row per match -- see backfill_player_blend_predictions.py's
+    # identical subquery for the rationale (BUG-018, 2026-08-20: multi-book
+    # matches used to insert duplicate prediction rows).
     cur.execute("""
         SELECT sm.match_id, sm.home_team_id, sm.away_team_id, sm.match_date,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
                o.over_under, o.over_odds, o.under_odds
         FROM soccer_matches sm
-        JOIN soccer_betting_odds o ON o.match_id = sm.match_id
+        JOIN soccer_betting_odds o ON o.odds_id = (
+            SELECT o2.odds_id FROM soccer_betting_odds o2
+            WHERE o2.match_id = sm.match_id
+            ORDER BY (o2.sportsbook = 'Bet365') DESC, o2.odds_date DESC, o2.odds_id DESC
+            LIMIT 1
+        )
         WHERE sm.league = ? AND sm.season = ?
         ORDER BY sm.match_date
     """, (args.league, args.season))

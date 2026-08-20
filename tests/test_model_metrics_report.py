@@ -102,6 +102,30 @@ def test_discover_seasons_scoped_to_only_the_given_leagues(db_path, conn):
     assert report.discover_seasons(conn, ["Serie A"], "poisson_v4") == [2024]
 
 
+def test_burn_in_cutoff_excludes_pre_cutoff_2022_matches(db_path, conn):
+    """METRICS_MIN_MATCH_DATE (2022 cold-start burn-in, BUGS.md WATCH entry
+    2026-08-20): matches strictly before the cutoff are excluded from the
+    report's metrics BY DEFAULT, making 2022 a deliberate partial season;
+    min_match_date=None restores full-season grading for callers that want it."""
+    home = sports_db.ensure_soccer_team("Cold FC", "Serie A")
+    away = sports_db.ensure_soccer_team("Start FC", "Serie A")
+    for date in ("2022-08-20T15:00:00Z", "2022-11-05T15:00:00Z"):
+        match_id = sports_db.add_soccer_match("Serie A", 2022, home, away, date)
+        sports_db.update_soccer_match_result(match_id, 2, 1)
+        sports_db.add_soccer_model_prediction(
+            match_id=match_id, league="Serie A", match_date=date,
+            generated_at="2022-08-01T00:00:00Z", method="poisson_v4",
+            over_under_line=2.5, p_over=1.0, p_under=0.0, conn=conn,
+        )
+
+    score, n = report.totals_brier_score(conn, "Serie A", 2022, "poisson_v4")
+    assert n == 1  # only the post-cutoff match graded
+
+    score, n = report.totals_brier_score(conn, "Serie A", 2022, "poisson_v4",
+                                          min_match_date=None)
+    assert n == 2  # opt-out restores the full season
+
+
 def test_pooled_brier_matches_hand_computed_weighted_average(db_path, conn):
     """Two leagues, one match each -- pooled Brier must be the plain average here
     since both groups have n=1 (a real n-weighting difference is already covered

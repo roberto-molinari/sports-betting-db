@@ -9,6 +9,114 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-018 — Backfill scripts insert one prediction row PER `soccer_betting_odds` row, so a multi-book match gets duplicate predictions, double-counting it in every downstream metric — **FIXED + DATA CLEANED 2026-08-20**
+
+- **Type:** bug (bare join, wrong cardinality assumption) · **Severity:** medium
+  (30 Serie A 2025 matches double-counted in every Brier/ROI query, across the
+  live tag AND all 19 kept-for-comparison method tags) · **Found:** 2026-08-20,
+  during the BUG-017 re-backfill audit (Serie A 2025 inserted 410 rows for 380
+  matches).
+
+**Root cause.** `backfill_player_blend_predictions.py`/`backfill_soccer_model_
+predictions.py` selected matches via a bare `JOIN soccer_betting_odds`, assuming
+one odds row per match (an assumption `backtest_from_predictions.py`'s docstring
+even stated outright). It went stale once Bet365 coverage was completed over
+matches that already had Pinnacle/"User Book" rows: 30 Serie A 2025 matches carry
+two books, so the backfill loop processed them twice — two prediction rows with
+IDENTICAL probabilities (same matchday `compute()` result) but different stored
+ev/moneyline metadata. `generate_club_league_card.py` had the same bare join: a
+doubly-priced upcoming match was processed once per book, the second pass
+silently replacing the first's stored picks (FEATURE-016) with picks priced off
+whichever odds row sorted last.
+
+**Fix (all three call sites, same subquery):** join through
+`o.odds_id = (SELECT ... ORDER BY (sportsbook='Bet365') DESC, odds_date DESC,
+odds_id DESC LIMIT 1)` — one odds row per match, preferring Bet365 (the soft-book
+reference every ROI criterion is defined against), newest otherwise.
+`backtest_from_predictions.py` needed no query change (its sportsbook filter
+already guarantees one row per match); its stale docstring claim was corrected.
+
+**Data cleanup:** Serie A 2025 `poisson_v4_4` re-backfilled with the fixed query
+(410 -> 380 rows). The 19 historical method tags were DEDUPED in place (570 rows
+deleted, keeping the first row per match/method) rather than re-run — re-running
+them under 2026-08-20's data would have changed them (BUG-017), destroying their
+value as historical records; the duplicate rows' probabilities were verified
+identical in every case first, so the deletion is lossless (only unused stored
+ev/odds metadata differed; every backtest recomputes EV from soccer_betting_odds
+directly). New data-integrity test pins the invariant
+(`test_no_duplicate_model_prediction_rows`); full suite green (478 unit + 14
+data-integrity).
+
+---
+
+## BUG-017 — Importing new historical data silently stales already-backfilled `soccer_model_predictions` rows — **FOUND + REMEDIATED (re-backfill) 2026-08-20; no structural guard yet**
+
+- **Type:** process/data-freshness gap · **Severity:** high for any analysis run on
+  the stale rows (Serie A 2022 p_home shifted by up to **0.43** between the stale
+  and fresh computation) · **Found:** 2026-08-20, while validating the newly
+  imported 2022-2023 history (all 5 leagues + feeders back to season 2022).
+
+**Finding.** `soccer_model_predictions` rows are point-in-time correct *with
+respect to the data present when the backfill ran* — nothing marks them stale when
+a LATER import adds data those predictions would have used. The 2026-08-20 history
+import (2022+2023 for Premier League/Bundesliga/La Liga/Ligue 1, plus feeder
+divisions and Serie A player/odds gaps back to 2022) changed the inputs of 12
+already-backfilled league-seasons: the season-blind last-10 player/team windows of
+early-2024 matchdays now reach into the newly imported 2023 seasons; Serie A
+2022/2023 (backfilled 2026-08-18 from partial data) changed outright. Confirmed by
+row-level recomputation: leagues backfilled AFTER the import reproduce to ~1e-16;
+Serie A 2022 (backfilled before it) differs up to 0.43 in p_home.
+
+**Remediation (done 2026-08-20):** re-ran `backfill_player_blend_predictions.py
+--method poisson_v4_4` for the 12 stale league-seasons (Serie A 2022-2025 + the
+four other leagues' 2024/2025). `generated_at` is the tell for staleness: any
+prediction row older than the latest data import is suspect. The refresh didn't
+just restore consistency — it measurably IMPROVED the 2024/2025 predictions
+(deeper history now behind their early-season windows): calibration slope
+0.989 -> 1.020, corr-with-Pinnacle 0.830 -> 0.840, home-Brier 0.2141 -> 0.2125
+on the same n=3,030 sample.
+
+**Open (structural guard, not built):** nothing prevents a recurrence — options
+when it next matters: a `data_version`/import-timestamp check in the metrics
+scripts (warn when predictions predate the newest relevant import), or folding
+"re-backfill all method tags" into the season-kickoff checklist (FEATURE-019).
+
+---
+
+## WATCH — 2022 is a cold-start burn-in season: first ~3 months badly overconfident, and no shipped lever fixes it (investigated 2026-08-20, no code change)
+
+The 2022 season is the earliest data in the DB, so its opening months have no
+prior history behind the season-blind windows at all — a condition no other
+backtest season has. Measured on `poisson_v4_4` vs Pinnacle closing:
+first-3-months-of-2022 calibration slope **0.385** with model logit sd 0.961 vs
+market 0.858 (the model sprays MORE spread than the market on a fraction of the
+information); rest of 2022 recovers to slope 0.888; 2023 onward is normal.
+
+Isolation probes (in-memory recomputation of the early-2022 slice, no DB writes):
+team-level shrinkage `TEAM_RATING_PULL_TOWARD_AVERAGE_MATCHES` k=5 improves it
+only marginally (slope 0.450 -> 0.488, Brier 0.6470 -> 0.6446 3-class), k=10 is
+worse; disabling the player stretch, the team xG stretch, or both barely moves it;
+pure team-level (`w=1.0`) is WORSE (slope 0.337) — the player blend genuinely
+helps here. Conclusion: the badness is an information deficit inherent to the
+boundary of the dataset, not a mis-set constant — same lesson as BUG-009's
+re-diagnosis: no output-side constant can substitute for missing information.
+
+**Practical consequence — handled in the metrics tool (2026-08-20, later):**
+`model_metrics_report.py` now excludes matches before **2022-11-01** from EVERY
+metric it reports (Brier, bias, ROI, both markets) via `METRICS_MIN_MATCH_DATE`,
+making 2022 a deliberate partial season — the report only ever grades predictions
+built off real prior history, and its header states the scope. This is a
+reporting scope, not a model change: backfills still cover full seasons, and
+`backtest_from_predictions.py`'s own CLI still grades whole seasons (its
+`min_match_date` parameter defaults to None; the report passes the cutoff
+explicitly, same pattern in `compare_model_vs_market_odds.fetch_pairs`). No
+model-side fix shipped: a `k_eff = window_size - n` "window-fill" shrink was
+considered (exact no-op on full windows) but the flat-k probe caps its plausible
+gain at ~0.04 slope — real fixes would need external pre-2022 history that
+doesn't exist in the DB.
+
+---
+
 ## BUG-016 — Matchday grouping used the exact match_date timestamp, not calendar date: a later same-day kickoff's rating computation could see an earlier same-day match's already-finished result — **FIXED + SHIPPED 2026-08-15 as `poisson_v4_1_1`**
 
 - **Type:** bug (correctness, not just perf) · **Severity:** high on individual
@@ -2177,7 +2285,7 @@ found **false** rather than assumed true.
 
 ---
 
-## BUG-009 — Model compresses extreme mismatches toward a coin flip (favorite underrated, underdog overrated); pooled home/away bias fixed, compression partially addressed
+## BUG-009 — Model compresses extreme mismatches toward a coin flip (favorite underrated, underdog overrated); pooled home/away bias fixed, compression partially addressed; re-diagnosed 2026-08-20 (residual is regression dilution, not miscalibration) + market-probability floor **SHIPPED 2026-08-20**
 
 - **Severity:** high (touches every match; drives negative backtest ROI specifically on
   the model's most confident bets, not a cosmetic footnote) · **Status:** PARTIALLY
@@ -2312,6 +2420,110 @@ but the ~41% total-loss-reduction ceiling quantified above means this stays wort
 continued investment, not something to shelve. The specific thing that's exhausted is
 the constant-tuning family (shrinkage/stretch/credibility-weighting); the next
 attempt needs a structurally different idea, not another sweep inside that family.
+
+**2026-08-20 re-diagnosis — the residual "compression" is regression dilution
+(an information deficit), not miscalibration; there was never anything left for an
+output transform to fix. Plus a validated betting-layer fix.**
+
+- **The model is already calibrated at the extremes.** Logistic regression of the
+  home-win outcome on logit(model p_home), `poisson_v4_4`, all matches with a
+  Pinnacle closing line (n=3,030): **calibration slope = 0.989** (1.0 = perfect;
+  <1 = overconfident, >1 = underconfident), intercept -0.037. When the model says
+  30%, it happens ~30% of the time — including in the tail buckets. There is no
+  residual compression *relative to reality* to stretch away.
+- **The compression only exists relative to the market, and its size is exactly
+  what noise geometry predicts.** On the logit scale: model sd 0.831, Pinnacle
+  closing sd 0.860, correlation 0.830. Regressing model on market therefore gives
+  slope corr x sd_model/sd_market ~= 0.80 — i.e. in market-p buckets the model
+  looks ~20% "compressed" even though it is perfectly calibrated. That is textbook
+  errors-in-variables/regression dilution: the market has information the model
+  lacks (lineups, injuries, rest, transfers), so conditioning on an extreme market
+  price selects matches where the model's noisier estimate is less extreme.
+- **This is why the constant-tuning family had to fail — confirmed on the stored
+  sweep methods** (same regression, same n=3,030 sample): `bug009_shrinkage_k150`
+  and `bug009_team_deshrink` raise logit sd to ~1.06-1.08 ("compression fixed" in
+  market buckets) but collapse the calibration slope to ~0.78 (overconfident) and
+  worsen Brier, while corr with the market barely moves (0.83 -> 0.83-0.85). A
+  monotone output transform can add spread but cannot add information; the Pareto
+  wall found on 2026-08-18/19 is a mathematical necessity, not bad luck. **The
+  right metrics for future attempts on this bug are calibration slope (keep ~1.0)
+  and logit-correlation with the sharp closing line (raise it) — not "compression
+  in market-p buckets," which any harmful stretch can fake.**
+- **Checked and ruled out: Poisson-grid truncation.** `outcome_probs()` sums the
+  MAX_GOALS=6 grid without renormalizing, so p_H+p_D+p_A < 1; but the deficit is
+  ~0.01% typical and ~1% worst-case in the most lopsided matches. A one-line
+  renormalization is harmless and correct, but it is not this bug.
+- **The dollar leak has a separate, fixable cause: the pick guardrail floors on
+  MODEL probability only** (`guardrail_reasons`), so the losing segment — market
+  prices the picked side under 25% but the model says more — passes it by
+  construction. Those bets are exactly where (a) EV>0 selection on a corr-0.83
+  model harvests estimation error (winner's-curse: a huge model-vs-market gap is
+  far more likely noise than edge), and (b) the market yardstick itself is biased:
+  `import_league_market_odds.py` de-vigs proportionally, which leaves the
+  favorite-longshot bias in `p_*_fair` (measured market calibration slope 1.154 —
+  longshots win even less often than fair-p implies). Long-odds "edges" are
+  double-counterfeit.
+- **Validated fix, betting layer (simulation on stored `poisson_v4_4` predictions
+  vs Bet365 closing, best-EV-per-match, EV>0, 3,913 matches):** add a market-side
+  floor to the guardrail — skip any pick whose market fair probability is below
+  ~0.30. Baseline: 3,585 bets, -11.4% ROI, -409.6 units. Floor 0.25: -122.5 units.
+  **Floor 0.30: 1,640 bets, -4.5% ROI, -73.4 units (82% of total loss removed).**
+  Floor 0.35: -29.0 units. Improves every season individually (2023: -19.0% ->
+  -2.8% at 0.30, +5.4% at 0.35; 2024: -7.0% -> -2.8%; 2025: -14.2% -> -6.3%) and
+  4 of 5 leagues at 0.30 (Ligue 1 slightly worse, small sample). This beats the
+  ~41% headline ceiling because dropping the segment entirely is better than
+  making it perform "as well as the rest." Blending model p toward the book's own
+  fair p on the logit scale before EV (w_model 0.3-0.7) was also tested and barely
+  helps on its own — the prior it shrinks toward is itself longshot-biased; fix
+  the de-vig (power/logit method instead of proportional) before revisiting that.
+- **The only genuine fix for the dilution itself is more information per rating
+  (raise corr), not more spread:** the team xG window is a hard last-10 home-only
+  (resp. away-only) sample with flat weights (`TEAM_PAST_MATCH_WINDOW_SIZE=10`,
+  `TEAM_RATING_XG_WINDOW_DECAY=1.0` — the decay knob exists, unused); widening to
+  ~20-30 matches with a decay half-life around 8-10, and/or pooling home+away
+  with an explicit home-advantage factor, roughly doubles the effective sample
+  per rating. Validate against calibration slope + corr-with-closing-line, per
+  above. Lineup/availability data (FEATURE-001's club-league analogue) is the
+  single largest information gap vs. the closing line, but is a bigger project.
+
+**Market floor SHIPPED 2026-08-20** — `CLUB_LEAGUE_MIN_MARKET_PROBABILITY = 0.32`
+(vig-inclusive single-side implied, `1/decimal`; equals the fair-p 0.30 the
+diagnosis validated once Bet365's ~5% 1X2 overround is added back), as a new
+`market_floor` check in `core.pick_guardrails.guardrail_reasons`/`guardrail_excess`,
+wired into `generate_club_league_card.py` and `backtest_from_predictions.py`'s
+`--guardrail` flag (which now mirrors both live floors). WC pipeline untouched
+(never swept there). Calibration sweep on the implied scale (0.25-0.40, stored
+`poisson_v4_4` vs Bet365 closing, best-EV-per-match, no model floor): every season
+improves monotonically up to ~0.30-0.32, flattening into thin-sample noise beyond —
+0.32 per the "largest value inside the target" discipline, anchored to the
+independently-diagnosed fair-0.30 mechanism rather than the noisy ROI tail.
+**Marginal validation on the live card's actual policy** (top-2-EV-per-match, model
+floor 0.25 already applied — the shipped baseline): total 3-season loss
+-205.8 -> -78.9 units (-6.3% -> -4.6% ROI), with 2023 -10.7% -> -4.1%,
+2025 -9.9% -> -6.5%, 2024 flat in absolute units (-20.6 -> -20.7, ROI -1.4% ->
+-2.8% on half the bets). Honest caveat: under `backtest_from_predictions.py`'s
+stake-EVERY-EV-positive-side policy the marginal effect is smaller (total loss
+-203 -> -115 units, pooled per-bet ROI roughly flat, and 2024's removed segment
+was mildly positive) — the floor's value concentrates exactly where the card
+concentrates, on the highest-EV (largest model-vs-market gap) candidates, which
+is what the winner's-curse mechanism predicts. Unit tests added (guardrail
+market-floor cases + card wiring test); full suite green (478 passed).
+
+**2026-08-20 (later): out-of-sample confirmation on the newly imported
+2022/2023 history.** The 2026-08-20 data import (all 5 leagues back to season
+2022) provided league-seasons neither the re-diagnosis nor the market floor had
+ever seen. On 2023x4 (the four non-Serie-A leagues' 2023 seasons, which have
+2022 history behind them): calibration slope **1.065**, corr-with-Pinnacle
+0.817, home-Brier 0.216 — matching the calibration-era numbers (0.989/0.830/
+0.214), so the shipped constants are NOT overfit to 2024/2025 and no retuning
+is indicated. The market floor also held out-of-sample: on the new
+league-seasons pooled (best-EV-per-match vs Bet365 closing, model floor
+applied), floor 0.32 cut the total loss -160.4 -> -62.5 units (2023x4 strongly
+better, -126.0 -> -38.9; 2022 slightly worse per-bet but smaller in absolute
+units, -34.4 -> -23.5 — and 2022 is the cold-start burn-in season, see the
+WATCH entry). 2022's own degraded calibration (slope 0.66) is entirely the
+cold-start artifact, not evidence against the constants — see the 2026-08-20
+WATCH entry for the decomposition and probes.
 
 ---
 

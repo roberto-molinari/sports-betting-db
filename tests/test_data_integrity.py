@@ -82,6 +82,23 @@ def test_no_duplicate_nhl_matches(live_conn):
     assert dupes == 0
 
 
+def test_no_duplicate_model_prediction_rows(live_conn):
+    """One prediction row per (match, method) -- BUG-018, 2026-08-20: matches
+    priced by several sportsbooks used to get one prediction row PER odds row
+    from the backfill scripts' bare soccer_betting_odds join (Serie A 2025: 30
+    matches doubled), silently double-counting those matches in every
+    downstream Brier/ROI query. The backfills now dedupe to one odds row per
+    match; this pins the resulting invariant."""
+    dupes = _count(live_conn, """
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM soccer_model_predictions
+            GROUP BY match_id, method
+            HAVING COUNT(*) > 1
+        )
+    """)
+    assert dupes == 0
+
+
 # ── Completed games must have scores ─────────────────────────────────────────
 
 def test_completed_soccer_matches_have_scores(live_conn):
@@ -129,20 +146,30 @@ def test_no_team_scores_absurdly_high(live_conn):
 # ── Team coverage within league bounds ───────────────────────────────────────
 
 def test_distinct_team_counts_within_bounds(live_conn):
-    soccer_teams = _count(live_conn, """
-        SELECT COUNT(DISTINCT team_id) FROM (
-            SELECT home_team_id AS team_id FROM soccer_matches
-            UNION SELECT away_team_id FROM soccer_matches
+    """Per LEAGUE-SEASON, not a single global cap: the original global <=30 bound
+    dated from the Serie-A-only DB and went stale twice over (multi-league
+    expansion FEATURE-014, then 2026-08-20's history extension back to 2022 --
+    254 distinct teams across 10 leagues x 4-5 seasons is legitimate). The real
+    invariant is that one league-season names a plausible division's worth of
+    teams: every current top flight/feeder here runs 18-24 clubs (Bundesliga/
+    2. Bundesliga/Ligue 2 at 18, Championship at 24); fewer than 16 means a
+    partial import, more than 26 means duplicate-team damage."""
+    rows = live_conn.execute("""
+        SELECT league, season, COUNT(DISTINCT team_id) AS n FROM (
+            SELECT league, season, home_team_id AS team_id FROM soccer_matches
+            UNION SELECT league, season, away_team_id FROM soccer_matches
         )
-    """)
+        GROUP BY league, season
+        HAVING n < 16 OR n > 26
+    """).fetchall()
+    assert rows == [], f"league-seasons with implausible team counts: {rows}"
+
     nhl_teams = _count(live_conn, """
         SELECT COUNT(DISTINCT team_id) FROM (
             SELECT home_team_id AS team_id FROM nhl_matches
             UNION SELECT away_team_id FROM nhl_matches
         )
     """)
-    # Serie A: 20 per season, a few more across promotion/relegation over seasons.
-    assert 0 < soccer_teams <= 30
     # NHL has 32 franchises.
     assert 0 < nhl_teams <= 32
 

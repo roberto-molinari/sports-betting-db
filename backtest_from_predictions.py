@@ -9,11 +9,13 @@ match on its own, so the whole season is a valid test set.
 Staking odds come from soccer_betting_odds, filtered to a single --sportsbook
 (default Bet365 -- the soft-book reference the Success Criteria's ROI bar is defined
 against, FEATURE-011_REQUIREMENTS.md; see FEATURE-011_BUILD_TRACKER.md's loose thread
-on this, found 2026-08-01). Each match has exactly one soccer_betting_odds row, but
-which book varies by match (Serie A season 2025: 350 Bet365, 10 Pinnacle, 20 "User
-Book") -- unfiltered, the backtest silently staked some matches against a sharp book
-or an unidentified source instead of the soft book the criteria means. Matches without
-a Bet365 row are excluded, not substituted with another book.
+on this, found 2026-08-01). A match can carry soccer_betting_odds rows from SEVERAL
+books (BUG-018, 2026-08-20 -- the old "exactly one row per match" claim here went
+stale once Bet365 coverage was completed over matches that already had Pinnacle/
+"User Book" rows); the sportsbook filter keeps this backtest to one row per match
+regardless. Unfiltered, the backtest silently staked some matches against a sharp
+book or an unidentified source instead of the soft book the criteria means. Matches
+without a Bet365 row are excluded, not substituted with another book.
 
 Usage:
     python backtest_from_predictions.py --method poisson_v4 --season 2025
@@ -24,16 +26,31 @@ import argparse
 import sqlite3
 
 from core.sports_db import DATABASE_PATH
-from core.poisson_model import american_to_decimal, compute_ev
+from core.poisson_model import american_to_decimal, american_to_implied_prob, compute_ev
 from core.pick_guardrails import guardrail_reasons
-from generate_club_league_card import CLUB_LEAGUE_MIN_PICK_PROBABILITY
+from generate_club_league_card import (CLUB_LEAGUE_MIN_PICK_PROBABILITY,
+                                       CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
 
 DEFAULT_SPORTSBOOK = "Bet365"
 
 
-def load_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK):
+def _min_date_clause(min_match_date):
+    """Optional m.match_date lower bound shared by both loaders below. None
+    (default everywhere in this file, including the CLI) is unchanged behavior;
+    model_metrics_report.py sets it to its METRICS_MIN_MATCH_DATE so its ROI
+    numbers exclude the 2022 cold-start burn-in (BUGS.md WATCH entry,
+    2026-08-20). Plain string comparison is safe: match_date always starts
+    'YYYY-MM-DD' in both stored timestamp formats."""
+    if min_match_date is None:
+        return "", ()
+    return "AND m.match_date >= ?", (min_match_date,)
+
+
+def load_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK,
+                     min_match_date=None):
+    clause, extra = _min_date_clause(min_match_date)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT mp.p_home, mp.p_draw, mp.p_away,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
                m.home_score, m.away_score
@@ -41,30 +58,32 @@ def load_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK
         JOIN soccer_matches m ON m.match_id = mp.match_id
         JOIN soccer_betting_odds o ON o.match_id = mp.match_id AND o.sportsbook = ?
         WHERE mp.league = ? AND mp.method = ? AND m.season = ?
-              AND m.home_score IS NOT NULL
-    """, (sportsbook, league, method, season))
+              AND m.home_score IS NOT NULL {clause}
+    """, (sportsbook, league, method, season) + extra)
     return cur.fetchall()
 
 
-def load_totals_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK):
+def load_totals_predictions(conn, league, season, method, sportsbook=DEFAULT_SPORTSBOOK,
+                            min_match_date=None):
     """Same shape as load_predictions but for the totals (over/under) market --
     p_over/p_under and over_odds/under_odds, plus the line itself and actual total
     goals (needed since 'over' only means something relative to o.over_under)."""
+    clause, extra = _min_date_clause(min_match_date)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT mp.p_over, mp.p_under, o.over_odds, o.under_odds, o.over_under,
                m.home_score, m.away_score
         FROM soccer_model_predictions mp
         JOIN soccer_matches m ON m.match_id = mp.match_id
         JOIN soccer_betting_odds o ON o.match_id = mp.match_id AND o.sportsbook = ?
         WHERE mp.league = ? AND mp.method = ? AND m.season = ?
-              AND m.home_score IS NOT NULL AND o.over_under IS NOT NULL
-    """, (sportsbook, league, method, season))
+              AND m.home_score IS NOT NULL AND o.over_under IS NOT NULL {clause}
+    """, (sportsbook, league, method, season) + extra)
     return cur.fetchall()
 
 
 def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK,
-              guardrail_floor=None):
+              guardrail_floor=None, guardrail_market_floor=None, min_match_date=None):
     """Core 1X2 grading logic, returning the full stats dict (not just roi/bets) --
     factored out of run() so a caller pooling across many leagues/seasons (e.g.
     model_metrics_report.py's all-up view) can sum true staked/profit dollars
@@ -80,8 +99,19 @@ def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPO
     the live card generator would actually have surfaced," not a different
     metric. No cap check: the live card generator itself only applies the floor
     for club leagues (see its own module docstring), so this mirrors that, not a
-    simplification."""
-    rows = load_predictions(conn, league, season, method, sportsbook=sportsbook)
+    simplification.
+
+    guardrail_market_floor: same deal for the MARKET-side floor (BUG-009
+    re-diagnosis, 2026-08-20 -- CLUB_LEAGUE_MIN_MARKET_PROBABILITY): reject any
+    candidate whose vig-inclusive implied probability (from this sportsbook's own
+    moneyline, the same american_to_implied_prob the live card uses) is below it.
+    None (default) skips the check.
+
+    min_match_date: optional ISO-date lower bound on graded matches, passed to
+    load_predictions -- see _min_date_clause's docstring. None (default) grades
+    the whole season, unchanged."""
+    rows = load_predictions(conn, league, season, method, sportsbook=sportsbook,
+                            min_match_date=min_match_date)
     total_staked = total_profit = 0.0
     bets = wins = 0
     by_side = {"home": [0, 0, 0.0], "draw": [0, 0, 0.0], "away": [0, 0, 0.0]}
@@ -98,7 +128,10 @@ def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPO
             ev = compute_ev(p_model, ml)
             if ev <= ev_threshold:
                 continue
-            if guardrail_floor is not None and guardrail_reasons(p_model, None, guardrail_floor):
+            if (guardrail_floor is not None or guardrail_market_floor is not None) and \
+                    guardrail_reasons(p_model, american_to_implied_prob(ml),
+                                      guardrail_floor if guardrail_floor is not None else 0.0,
+                                      market_floor=guardrail_market_floor):
                 continue
             stake = 1.0
             won = (side == actual)
@@ -130,10 +163,14 @@ def print_grading_report(stats, label):
         print(f"    {side:>5}  n={n:<4} wins={w:<4} profit=${p:>+8.2f}  ROI={side_roi:+.1%}")
 
 
-def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None):
+def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None,
+        guardrail_market_floor=None, min_match_date=None):
     stats = grade_1x2(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
-                      guardrail_floor=guardrail_floor)
+                      guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
+                      min_match_date=min_match_date)
     guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
+    if guardrail_market_floor is not None:
+        guardrail_note += f" | market floor {guardrail_market_floor:g}"
     label = (f"{method} | {league} season {season} | vs {sportsbook} | "
              f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
@@ -142,14 +179,15 @@ def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOO
 
 
 def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK,
-                 guardrail_floor=None):
+                 guardrail_floor=None, guardrail_market_floor=None, min_match_date=None):
     """Core totals (over/under) grading logic -- same role as grade_1x2() for the
     O/U market, factored out of run_totals() for the same pooling reason.
     guardrail_floor: see grade_1x2's docstring -- the live card generator applies
     the same floor to OVER/UNDER candidates as it does to HOME/DRAW/AWAY
     (build_candidates() screens both through one guardrail_reasons() call), so
     this mirrors that rather than treating totals as ungated."""
-    rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook)
+    rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook,
+                                   min_match_date=min_match_date)
     total_staked = total_profit = 0.0
     bets = wins = 0
     by_side = {"over": [0, 0, 0.0], "under": [0, 0, 0.0]}
@@ -168,7 +206,10 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
             ev = compute_ev(p_model, odds)
             if ev <= ev_threshold:
                 continue
-            if guardrail_floor is not None and guardrail_reasons(p_model, None, guardrail_floor):
+            if (guardrail_floor is not None or guardrail_market_floor is not None) and \
+                    guardrail_reasons(p_model, american_to_implied_prob(odds),
+                                      guardrail_floor if guardrail_floor is not None else 0.0,
+                                      market_floor=guardrail_market_floor):
                 continue
             stake = 1.0
             won = (side == actual)
@@ -186,7 +227,8 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
             "bets": bets, "wins": wins, "by_side": by_side}
 
 
-def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None):
+def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOOK, guardrail_floor=None,
+               guardrail_market_floor=None, min_match_date=None):
     """Totals (over/under) market ROI -- kept as a SEPARATE report/return value from
     run()'s 1X2 numbers, not pooled together, since they're different markets and
     every existing ROI reference point in BUGS.md/model_metrics_report.py is 1X2-only.
@@ -194,8 +236,11 @@ def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SP
     -- the model already computed p_over/p_under and it was already stored, but
     nothing graded it, so there was no way to tell if those picks were any good."""
     stats = grade_totals(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
-                         guardrail_floor=guardrail_floor)
+                         guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
+                         min_match_date=min_match_date)
     guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
+    if guardrail_market_floor is not None:
+        guardrail_note += f" | market floor {guardrail_market_floor:g}"
     label = (f"{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
              f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
@@ -217,21 +262,24 @@ def main():
                              "totals support existed). 'both' prints two separate reports "
                              "-- totals ROI is never pooled into the 1x2 numbers.")
     parser.add_argument("--guardrail", action="store_true",
-                        help="Additionally reject any candidate below "
-                             "CLUB_LEAGUE_MIN_PICK_PROBABILITY (generate_club_league_card.py's "
-                             "real, shipped guardrail floor) -- 'what would ROI look like for "
-                             "what the live card generator actually surfaces', not just every "
-                             "raw EV-positive prediction. Default off: unchanged raw-model ROI.")
+                        help="Additionally reject any candidate the live card generator's "
+                             "guardrails would reject: model probability below "
+                             "CLUB_LEAGUE_MIN_PICK_PROBABILITY, or market implied probability "
+                             "below CLUB_LEAGUE_MIN_MARKET_PROBABILITY (BUG-009, 2026-08-20) -- "
+                             "'what would ROI look like for what the live card generator "
+                             "actually surfaces', not just every raw EV-positive prediction. "
+                             "Default off: unchanged raw-model ROI.")
     args = parser.parse_args()
     guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
+    guardrail_market_floor = CLUB_LEAGUE_MIN_MARKET_PROBABILITY if args.guardrail else None
 
     conn = sqlite3.connect(DATABASE_PATH)
     if args.market in ("1x2", "both"):
         run(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook,
-            guardrail_floor=guardrail_floor)
+            guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
     if args.market in ("totals", "both"):
         run_totals(conn, args.league, args.season, args.method, args.ev_threshold, sportsbook=args.sportsbook,
-                  guardrail_floor=guardrail_floor)
+                  guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
     conn.close()
 
 

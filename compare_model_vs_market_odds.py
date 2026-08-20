@@ -61,10 +61,16 @@ SOFT_SEASON_SOURCES = {
 }
 
 
-def fetch_pairs(conn, league, season, source, line_type=LINE_TYPE, method=METHOD):
+def fetch_pairs(conn, league, season, source, line_type=LINE_TYPE, method=METHOD,
+                min_match_date=None):
+    """min_match_date: optional ISO-date lower bound on m.match_date (matches
+    strictly before it are excluded). None (default) is unchanged behavior --
+    exists for model_metrics_report.py's 2022 cold-start burn-in exclusion
+    (METRICS_MIN_MATCH_DATE; BUGS.md WATCH entry, 2026-08-20); this script's own
+    CLI never sets it."""
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT mp.p_home, mp.p_draw, mp.p_away,
                mo.p_home_fair, mo.p_draw_fair, mo.p_away_fair
         FROM soccer_model_predictions mp
@@ -72,8 +78,10 @@ def fetch_pairs(conn, league, season, source, line_type=LINE_TYPE, method=METHOD
                                    AND mo.source = ? AND mo.line_type = ?
         JOIN soccer_matches m ON m.match_id = mp.match_id
         WHERE mp.league = ? AND mp.method = ? AND m.season = ?
+        {"AND m.match_date >= ?" if min_match_date is not None else ""}
         """,
         (source, line_type, league, method, season)
+        + ((min_match_date,) if min_match_date is not None else ())
     )
     return cur.fetchall()
 

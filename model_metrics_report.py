@@ -65,13 +65,26 @@ from core.sports_db import DATABASE_PATH
 import compute_club_player_strength as strength
 import compare_model_vs_market_odds as cmvmo
 import backtest_from_predictions as bfp
-from generate_club_league_card import CLUB_LEAGUE_MIN_PICK_PROBABILITY
+from generate_club_league_card import (CLUB_LEAGUE_MIN_PICK_PROBABILITY,
+                                       CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
 
 SNAPSHOT_DIR = Path(__file__).parent / "model_snapshots"
 DEFAULT_METHOD = "poisson_v4"
 DEFAULT_SEASONS = [2024, 2025]
 DEFAULT_SHARP_SOURCE = "Betfair Exchange"
 DEFAULT_SPORTSBOOK = "Bet365"
+
+# 2022 cold-start burn-in exclusion (2026-08-20; BUGS.md WATCH entry): season 2022
+# is the earliest data in the DB, so its opening months have NO prior history behind
+# the season-blind rating windows -- measured calibration slope 0.385 (vs ~1.0
+# everywhere else) before this date, recovering after it. Every metric this report
+# computes (Brier, bias, ROI, both markets) excludes matches strictly before this
+# cutoff, making 2022 a deliberate partial season: the report only ever grades
+# predictions that were built off real prior history. This is a REPORTING scope,
+# not a model constant -- backfills still cover full seasons, and
+# backtest_from_predictions.py's own CLI still grades whole seasons unless a
+# caller passes min_match_date explicitly.
+METRICS_MIN_MATCH_DATE = "2022-11-01"
 EV_THRESHOLDS = (0.0, 0.05, 0.10)
 BUCKETS = [(0.00, 0.15), (0.15, 0.25), (0.25, 0.35), (0.35, 0.45), (0.45, 0.55), (0.55, 1.01)]
 
@@ -105,14 +118,18 @@ def committed_knob_values():
     return {f"{mod}.{name}": getattr(_MODULES[mod], name, "<not found>") for mod, name in KNOB_NAMES}
 
 
-def brier_score(conn, league, season, method):
+def brier_score(conn, league, season, method, min_match_date=METRICS_MIN_MATCH_DATE):
+    """min_match_date defaults to METRICS_MIN_MATCH_DATE (the 2022 cold-start
+    burn-in cutoff -- see that constant's comment); pass None to grade a full
+    season without it."""
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT mp.p_home, mp.p_draw, mp.p_away, m.home_score, m.away_score
         FROM soccer_model_predictions mp
         JOIN soccer_matches m ON m.match_id = mp.match_id
         WHERE mp.league = ? AND mp.method = ? AND m.season = ? AND m.home_score IS NOT NULL
-    """, (league, method, season))
+        {"AND m.match_date >= ?" if min_match_date is not None else ""}
+    """, (league, method, season) + ((min_match_date,) if min_match_date is not None else ()))
     total, n = 0.0, 0
     for p_h, p_d, p_a, hs, as_ in cur.fetchall():
         if p_h is None:
@@ -123,7 +140,7 @@ def brier_score(conn, league, season, method):
     return (total / n if n else float("nan")), n
 
 
-def totals_brier_score(conn, league, season, method):
+def totals_brier_score(conn, league, season, method, min_match_date=METRICS_MIN_MATCH_DATE):
     """Same shape/scale as brier_score() (sum of squared errors across every
     outcome class, not the single-term binary convention) so the two numbers stay
     comparable at a glance -- for a 2-class market centered near p=0.5 the naive
@@ -133,14 +150,17 @@ def totals_brier_score(conn, league, season, method):
     were actually computed against), not a fresh join to soccer_betting_odds --
     consistent with what the model was graded on at prediction time. A push (total
     goals == line) has no defined over/under outcome and is excluded, matching
-    backtest_from_predictions.run_totals()'s own handling."""
+    backtest_from_predictions.run_totals()'s own handling.
+
+    min_match_date: same burn-in cutoff default as brier_score()."""
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT mp.p_over, mp.p_under, mp.over_under_line, m.home_score, m.away_score
         FROM soccer_model_predictions mp
         JOIN soccer_matches m ON m.match_id = mp.match_id
         WHERE mp.league = ? AND mp.method = ? AND m.season = ? AND m.home_score IS NOT NULL
-    """, (league, method, season))
+        {"AND m.match_date >= ?" if min_match_date is not None else ""}
+    """, (league, method, season) + ((min_match_date,) if min_match_date is not None else ()))
     total, n = 0.0, 0
     for p_over, p_under, line, hs, as_ in cur.fetchall():
         if p_over is None or line is None:
@@ -256,11 +276,26 @@ def pooled_bias(conn, leagues, seasons, method, sharp_source):
     for league in leagues:
         for season in seasons:
             all_pairs.extend(cmvmo.fetch_pairs(conn, league, season, sharp_source,
-                                                line_type="closing", method=method))
+                                                line_type="closing", method=method,
+                                                min_match_date=METRICS_MIN_MATCH_DATE))
     return cmvmo.summarize(all_pairs) if all_pairs else None
 
 
-def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False, guardrail_floor=None):
+def _guardrail_header_line(guardrail_floor, guardrail_market_floor, suffix):
+    """One consistent 'Guardrail: ...' report-header line for whichever of the two
+    floors (model-probability, market-probability -- BUG-009 2026-08-20) are set."""
+    parts = []
+    if guardrail_floor is not None:
+        parts.append(f"floor={guardrail_floor:g}")
+    if guardrail_market_floor is not None:
+        parts.append(f"market_floor={guardrail_market_floor:g}")
+    if not parts:
+        return ("Guardrail: none -- ROI below is raw model ROI, every EV-positive candidate "
+                "regardless of probability (unchanged from before --guardrail existed)")
+    return f"Guardrail: {', '.join(parts)} {suffix}"
+
+
+def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False, guardrail_floor=None, guardrail_market_floor=None):
     """True pooled ROI (sum of profit / sum of staked across every (league,
     season) pair), via backtest_from_predictions' stats-dict helpers -- not a
     weighted-average of pre-computed ROI ratios (mathematically equivalent if
@@ -270,16 +305,19 @@ def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=
     EV-positive prediction, regardless of how low its probability is. Pass
     CLUB_LEAGUE_MIN_PICK_PROBABILITY (or any floor) to additionally reject
     candidates below it, the same guardrail generate_club_league_card.py applies
-    to real picks -- see grade_1x2's docstring. Brier/bias are NEVER guardrail-
-    filtered (they're calibration checks over all games, not a betting-selection
-    question) -- this parameter only exists on the ROI path."""
+    to real picks -- see grade_1x2's docstring. guardrail_market_floor: same for
+    the MARKET-side implied-probability floor (CLUB_LEAGUE_MIN_MARKET_PROBABILITY,
+    BUG-009 2026-08-20). Brier/bias are NEVER guardrail-filtered (they're
+    calibration checks over all games, not a betting-selection question) -- these
+    parameters only exist on the ROI path."""
     grade_fn = bfp.grade_totals if totals else bfp.grade_1x2
     staked = profit = 0.0
     bets = wins = graded = 0
     for league in leagues:
         for season in seasons:
             stats = grade_fn(conn, league, season, method, ev_threshold, sportsbook=sportsbook,
-                             guardrail_floor=guardrail_floor)
+                             guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
+                             min_match_date=METRICS_MIN_MATCH_DATE)
             staked += stats["staked"]
             profit += stats["profit"]
             bets += stats["bets"]
@@ -290,7 +328,8 @@ def pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=
 
 
 def compression_bucket_table(conn, league, season, method, source):
-    pairs = cmvmo.fetch_pairs(conn, league, season, source, line_type="closing", method=method)
+    pairs = cmvmo.fetch_pairs(conn, league, season, source, line_type="closing", method=method,
+                              min_match_date=METRICS_MIN_MATCH_DATE)
     by_bucket = {b: [] for b in BUCKETS}
     for p_h, p_d, p_a, m_h, m_d, m_a in pairs:
         for lo, hi in BUCKETS:
@@ -300,16 +339,17 @@ def compression_bucket_table(conn, league, season, method, source):
     return {b: (sum(v) / len(v) if v else None, len(v)) for b, v in by_bucket.items()}
 
 
-def build_report(conn, league, seasons, method, sharp_source, note, guardrail_floor=None):
+def build_report(conn, league, seasons, method, sharp_source, note, guardrail_floor=None, guardrail_market_floor=None):
     lines = []
     lines.append(f"# Model metrics report -- {method} / {league}")
     lines.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"Seasons: {seasons}")
     lines.append(f"Note: {note}")
-    lines.append(f"Guardrail: floor={guardrail_floor:g} (ROI below reflects only guardrail-clear "
-                  f"candidates)" if guardrail_floor is not None else
-                  "Guardrail: none -- ROI below is raw model ROI (unchanged from before "
-                  "--guardrail existed)")
+    lines.append(_guardrail_header_line(guardrail_floor, guardrail_market_floor,
+                                        "(ROI below reflects only guardrail-clear candidates)"))
+    lines.append(f"Scope: matches before {METRICS_MIN_MATCH_DATE} excluded from every metric "
+                  f"(2022 cold-start burn-in -- BUGS.md WATCH entry, 2026-08-20; "
+                  f"season 2022 is a deliberate partial season)")
     lines.append("")
     lines.append("## Committed model constants at run time")
     for name, val in committed_knob_values().items():
@@ -371,7 +411,8 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
         for ev in (0.0, 0.05, 0.10):
             buf = io.StringIO()
             with redirect_stdout(buf):
-                bfp.run(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor)
+                bfp.run(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
+                        min_match_date=METRICS_MIN_MATCH_DATE)
             lines.append(buf.getvalue().rstrip())
     lines.append("")
 
@@ -380,7 +421,8 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
         for ev in (0.0, 0.05, 0.10):
             buf = io.StringIO()
             with redirect_stdout(buf):
-                bfp.run_totals(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor)
+                bfp.run_totals(conn, league, season, method, ev, sportsbook="Bet365", guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
+                               min_match_date=METRICS_MIN_MATCH_DATE)
             lines.append(buf.getvalue().rstrip())
     lines.append("")
 
@@ -404,16 +446,16 @@ def pooled_brier_across_markets(conn, leagues, seasons, method):
     return (b1x2 * n1x2 + btot * ntot) / n, n
 
 
-def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, sportsbook, guardrail_floor=None):
+def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, sportsbook, guardrail_floor=None, guardrail_market_floor=None):
     """True cross-market ROI: every bet is staked $1 regardless of which market it
     came from, so summing profit/staked across both markets is exact -- the
     portfolio-level return if every EV-positive bet in either market were placed
     (or, with guardrail_floor set, every EV-positive AND guardrail-clear bet --
     see pooled_roi's docstring)."""
     r1x2 = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=False,
-                      guardrail_floor=guardrail_floor)
+                      guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
     rtot = pooled_roi(conn, leagues, seasons, method, ev_threshold, sportsbook, totals=True,
-                      guardrail_floor=guardrail_floor)
+                      guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
     staked = r1x2["staked"] + rtot["staked"]
     profit = r1x2["profit"] + rtot["profit"]
     roi = profit / staked if staked else 0.0
@@ -422,7 +464,7 @@ def pooled_roi_across_markets(conn, leagues, seasons, method, ev_threshold, spor
             "n_graded": r1x2["n_graded"] + rtot["n_graded"]}
 
 
-def _all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None):
+def _all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None, guardrail_market_floor=None):
     """The genuine ALL-UP block -- three numbers (Brier, Bias, ROI), each pooled
     across every league, season, AND market, not shown per-market like every other
     block in this report. Bias is the one metric that can't actually be pooled
@@ -444,13 +486,13 @@ def _all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=
 
     for ev in EV_THRESHOLDS:
         r = pooled_roi_across_markets(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK,
-                                      guardrail_floor=guardrail_floor)
+                                      guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         lines.append(f"  ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  (1X2 + totals pooled; "
                       f"bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def _both_markets_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None):
+def _both_markets_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=None, guardrail_market_floor=None):
     """Brier/bias/ROI for BOTH markets, side by side, never blended into one
     number -- the block used for the ALL-UP section and each BY LEAGUE entry."""
     lines = []
@@ -470,18 +512,18 @@ def _both_markets_block(conn, leagues, seasons, method, sharp_source, guardrail_
 
     for ev in EV_THRESHOLDS:
         r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=False,
-                       guardrail_floor=guardrail_floor)
+                       guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         lines.append(f"  1X2 ROI    @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     for ev in EV_THRESHOLDS:
         r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=True,
-                       guardrail_floor=guardrail_floor)
+                       guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         lines.append(f"  Totals ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def _single_market_block(conn, leagues, seasons, method, sharp_source, totals, guardrail_floor=None):
+def _single_market_block(conn, leagues, seasons, method, sharp_source, totals, guardrail_floor=None, guardrail_market_floor=None):
     """Brier/bias/ROI for ONE market only -- the block used inside the BY MARKET
     section, which is already scoped to a single market per subsection."""
     lines = []
@@ -501,13 +543,13 @@ def _single_market_block(conn, leagues, seasons, method, sharp_source, totals, g
 
     for ev in EV_THRESHOLDS:
         r = pooled_roi(conn, leagues, seasons, method, ev, DEFAULT_SPORTSBOOK, totals=totals,
-                       guardrail_floor=guardrail_floor)
+                       guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         lines.append(f"  ROI @ EV>{ev:.0%}: {r['roi']:+.1%}  "
                       f"(bets={r['bets']}, staked=${r['staked']:.2f}, profit=${r['profit']:+.2f})")
     return lines
 
 
-def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, guardrail_floor=None):
+def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, guardrail_floor=None, guardrail_market_floor=None):
     """The default (no --league) report -- FEATURE-017, 2026-08-11: a summary view
     across every league/season the model has real prediction data for, discovered
     live from the database (see discover_leagues/discover_seasons), not the
@@ -538,11 +580,12 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, g
     lines.append(f"Leagues ({len(leagues)}): {', '.join(leagues)}")
     lines.append(f"Seasons ({len(seasons)}): {seasons}")
     lines.append(f"Note: {note}")
-    lines.append(f"Guardrail: floor={guardrail_floor:g} (matches generate_club_league_card.py's "
-                  f"CLUB_LEAGUE_MIN_PICK_PROBABILITY -- ROI below reflects only guardrail-clear "
-                  f"candidates)" if guardrail_floor is not None else
-                  "Guardrail: none -- ROI below is raw model ROI, every EV-positive candidate "
-                  "regardless of probability (unchanged from before --guardrail existed)")
+    lines.append(_guardrail_header_line(guardrail_floor, guardrail_market_floor,
+                                        "(matches generate_club_league_card.py's shipped floors -- "
+                                        "ROI below reflects only guardrail-clear candidates)"))
+    lines.append(f"Scope: matches before {METRICS_MIN_MATCH_DATE} excluded from every metric "
+                  f"(2022 cold-start burn-in -- BUGS.md WATCH entry, 2026-08-20; "
+                  f"season 2022 is a deliberate partial season)")
     lines.append("")
     lines.append("## Committed model constants at run time")
     for name, val in committed_knob_values().items():
@@ -561,7 +604,7 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, g
     lines.append("=" * 78)
     lines.append("ALL-UP  (every league x every season x every market)")
     lines.append("=" * 78)
-    lines.extend(_all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=guardrail_floor))
+    lines.extend(_all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor))
     lines.append("")
 
     lines.append("=" * 78)
@@ -571,11 +614,11 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, g
         market_label = "TOTALS/over-under" if totals else "1X2"
         lines.append(f"\n-- {market_label}, across seasons --")
         lines.extend(_single_market_block(conn, leagues, seasons, method, sharp_source, totals,
-                                          guardrail_floor=guardrail_floor))
+                                          guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor))
         for season in seasons:
             lines.append(f"\n-- {market_label}, season {season} --")
             lines.extend(_single_market_block(conn, leagues, [season], method, sharp_source, totals,
-                                              guardrail_floor=guardrail_floor))
+                                              guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor))
     lines.append("")
 
     lines.append("=" * 78)
@@ -584,11 +627,11 @@ def build_all_up_report(conn, method, sharp_source, note, seasons_filter=None, g
     for league in leagues:
         lines.append(f"\n-- {league}, across seasons --")
         lines.extend(_both_markets_block(conn, [league], seasons, method, sharp_source,
-                                         guardrail_floor=guardrail_floor))
+                                         guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor))
         for season in seasons:
             lines.append(f"\n-- {league}, season {season} --")
             lines.extend(_both_markets_block(conn, [league], [season], method, sharp_source,
-                                             guardrail_floor=guardrail_floor))
+                                             guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor))
     lines.append("")
 
     return "\n".join(lines)
@@ -631,26 +674,29 @@ def main():
                              "All-up mode default: every season discovered in the data.")
     parser.add_argument("--sharp-source", default=DEFAULT_SHARP_SOURCE)
     parser.add_argument("--guardrail", action="store_true",
-                        help="Report ROI with CLUB_LEAGUE_MIN_PICK_PROBABILITY (generate_club_"
-                             "league_card.py's real, shipped floor) applied on top of the EV "
-                             "threshold -- 'what would ROI look like for what the live card "
+                        help="Report ROI with generate_club_league_card.py's real, shipped "
+                             "guardrails applied on top of the EV threshold: "
+                             "CLUB_LEAGUE_MIN_PICK_PROBABILITY (model floor) and "
+                             "CLUB_LEAGUE_MIN_MARKET_PROBABILITY (market floor, BUG-009 "
+                             "2026-08-20) -- 'what would ROI look like for what the live card "
                              "generator actually surfaces', not just every raw EV-positive "
                              "prediction. Brier/bias are unaffected either way (calibration "
                              "checks over all games, not a betting-selection question). Default "
                              "off: today's unchanged raw-model ROI.")
     args = parser.parse_args()
     guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
+    guardrail_market_floor = CLUB_LEAGUE_MIN_MARKET_PROBABILITY if args.guardrail else None
     note = args.note if args.note is not None else "(console-only preview -- not persisted)"
 
     conn = sqlite3.connect(DATABASE_PATH)
     if args.league:
         seasons = args.seasons or DEFAULT_SEASONS
         report = build_report(conn, args.league, seasons, args.method, args.sharp_source, note,
-                              guardrail_floor=guardrail_floor)
+                              guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         league_slug = "".join(c if c.isalnum() else "_" for c in args.league.lower()).strip("_")
     else:
         report = build_all_up_report(conn, args.method, args.sharp_source, note,
-                                      seasons_filter=args.seasons, guardrail_floor=guardrail_floor)
+                                      seasons_filter=args.seasons, guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor)
         league_slug = "all_leagues"
     conn.close()
 

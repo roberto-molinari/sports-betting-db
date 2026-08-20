@@ -135,6 +135,19 @@ def test_card_excludes_subfloor_candidate_and_logs_it(db_path, conn, capsys):
     assert "AWAY" not in picks_section
 
 
+def test_card_wires_market_floor_into_guardrail(db_path, conn, capsys):
+    """BUG-009 re-diagnosis (2026-08-20): CLUB_LEAGUE_MIN_MARKET_PROBABILITY must
+    actually reach guardrail_reasons() -- patched to 1.0 so EVERY candidate's market
+    implied probability is below it, meaning no pick may survive and the exclusions
+    must cite the market floor, not just the model floor."""
+    _seed_lopsided_league(conn)
+    with patch.object(gclc, "CLUB_LEAGUE_MIN_MARKET_PROBABILITY", 1.0):
+        out = _run_card(capsys, db_path)
+
+    assert "No guardrail-clear positive-EV picks in this window" in out
+    assert "market floor" in out
+
+
 # ── FEATURE-016: picks persisted for later scoring ─────────────────────────────────
 
 def test_card_stores_picks_by_default(db_path, conn, capsys):

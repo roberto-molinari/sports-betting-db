@@ -13,9 +13,11 @@ roster, not a point-in-time reconstruction).
 
 Applies CLUB_LEAGUE_MIN_PICK_PROBABILITY as a guardrail (BUG-003's pattern, via the
 shared core.pick_guardrails -- BUG-009 2026-08-05 found this had never been ported
-from the WC card generator). No cap: swept on top of the xG-stretch fix and found
-close to inert (BUGS.md, BUG-009, 2026-08-07 addendum) -- floor alone is the
-validated guardrail here, not floor+cap.
+from the WC card generator), plus CLUB_LEAGUE_MIN_MARKET_PROBABILITY on the market's
+own implied probability (BUG-009 re-diagnosis, 2026-08-20 -- see that constant's
+comment). No cap: swept on top of the xG-stretch fix and found close to inert
+(BUGS.md, BUG-009, 2026-08-07 addendum) -- the two floors are the validated
+guardrails here, not floor+cap.
 
 Only surfaces genuine positive-EV, guardrail-clear candidates (unlike the old
 script, which showed the top-2-by-EV per match regardless of EV sign) -- brings
@@ -54,6 +56,22 @@ MAX_PICKS_PER_MATCH = 2
 # value, 0.25, by coincidence of separate validation on different data, not a shared
 # constant) since club leagues and the World Cup were tuned against different data.
 CLUB_LEAGUE_MIN_PICK_PROBABILITY = 0.25
+
+# MARKET-side floor (BUG-009 re-diagnosis, 2026-08-20): reject any candidate whose
+# vig-inclusive single-side implied probability (1/decimal odds -- exactly what
+# build_candidates() computes) is below this, regardless of what the model thinks.
+# The model floor above can't catch the worst-losing segment (market prices the side
+# as a longshot, model says >= 0.25) because a huge model-vs-market gap on a
+# corr-0.83 model is far more likely estimation noise than edge, and the
+# proportional devig's residual favorite-longshot bias makes long odds look fairer
+# than they are (BUGS.md, BUG-009, 2026-08-20 -- both mechanisms measured). Swept
+# 0.25-0.40 on stored poisson_v4_4 vs Bet365 closing (5 leagues, 3 seasons,
+# best-EV-per-match): improvement is large and improves EVERY season individually up
+# to ~0.30-0.32, flattening into thin-sample ROI noise beyond. 0.32 on this
+# vig-inclusive scale corresponds to the fair-probability 0.30 the diagnosis
+# validated (Bet365 1X2 overround ~5%): total loss -409.6 -> -71 units, ROI
+# -11.4% -> -4.3%. Not applied to the WC pipeline (different data, never swept there).
+CLUB_LEAGUE_MIN_MARKET_PROBABILITY = 0.32
 
 
 def load_team_ids(conn, league, season):
@@ -105,6 +123,10 @@ def main():
     start = (now.date() + timedelta(days=start_offset)).isoformat()
     end = (now.date() + timedelta(days=end_offset)).isoformat()
 
+    # ONE odds row per match -- see backfill_player_blend_predictions.py's
+    # identical subquery for the rationale (BUG-018, 2026-08-20: a match priced
+    # by several books used to be processed once per book, silently overwriting
+    # its stored picks with whichever odds row came last).
     cur.execute('''
         SELECT m.match_id, m.match_date, m.season, ht.name AS home, at.name AS away,
                m.home_team_id, m.away_team_id,
@@ -113,7 +135,12 @@ def main():
         FROM soccer_matches m
         JOIN soccer_teams ht ON ht.team_id = m.home_team_id
         JOIN soccer_teams at ON at.team_id = m.away_team_id
-        JOIN soccer_betting_odds o ON o.match_id = m.match_id
+        JOIN soccer_betting_odds o ON o.odds_id = (
+            SELECT o2.odds_id FROM soccer_betting_odds o2
+            WHERE o2.match_id = m.match_id
+            ORDER BY (o2.sportsbook = 'Bet365') DESC, o2.odds_date DESC, o2.odds_id DESC
+            LIMIT 1
+        )
         WHERE m.league = ?
           AND date(m.match_date) >= date(?)
           AND date(m.match_date) <= date(?)
@@ -170,7 +197,8 @@ def main():
 
             candidates = build_candidates(row, result)
             for c in candidates:
-                c["excluded_by"] = guardrail_reasons(c["prob"], c["implied"], CLUB_LEAGUE_MIN_PICK_PROBABILITY)
+                c["excluded_by"] = guardrail_reasons(c["prob"], c["implied"], CLUB_LEAGUE_MIN_PICK_PROBABILITY,
+                                                     market_floor=CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
 
             clean = [c for c in candidates if not c["excluded_by"] and c["ev"] > 0]
             excluded_log.extend(c for c in candidates if c["excluded_by"] and c["ev"] > 0)

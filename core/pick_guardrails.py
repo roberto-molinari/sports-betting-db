@@ -15,7 +15,7 @@ validated independently against different data.
 """
 
 
-def guardrail_reasons(prob, implied, floor, cap=None):
+def guardrail_reasons(prob, implied, floor, cap=None, market_floor=None):
     """Independent per-guardrail checks -- a candidate must clear ALL of them
     to be guardrail-clear. floor: reject if prob < floor (a sub-floor
     probability is noise, not edge, at any market). cap: reject if
@@ -23,17 +23,26 @@ def guardrail_reasons(prob, implied, floor, cap=None):
     be `cap`x its own high implied prob), catching the model confidently
     over-rating a dog rather than genuinely disagreeing with the market. Pass
     cap=None to skip the cap check entirely (e.g. a system that only wants
-    the floor). Returns a list of human-readable reason strings -- empty
-    means guardrail-clear."""
+    the floor). market_floor: reject if implied < market_floor -- the MARKET's
+    own probability for the side, not the model's (BUG-009, 2026-08-20): a side
+    the market prices as a big longshot is exactly where a large model-vs-market
+    gap is far more likely estimation noise than edge (winner's-curse selection
+    on a noisy model), and where the proportional devig's residual
+    favorite-longshot bias overstates the market's own fair probability -- both
+    effects fake edge at long odds. Skipped when market_floor is None (default)
+    or when implied is unknown. Returns a list of human-readable reason
+    strings -- empty means guardrail-clear."""
     reasons = []
     if prob < floor:
         reasons.append(f"floor (model {prob:.3f} < {floor:g})")
     if cap is not None and implied and prob >= cap * implied:
         reasons.append(f"cap (model {prob:.3f} >= {cap:g}x market {implied:.3f})")
+    if market_floor is not None and implied is not None and implied < market_floor:
+        reasons.append(f"market floor (market {implied:.3f} < {market_floor:g})")
     return reasons
 
 
-def guardrail_excess(prob, implied, floor, cap=None):
+def guardrail_excess(prob, implied, floor, cap=None, market_floor=None):
     """How far past whichever guardrail(s) fired, in probability points -- the
     LARGEST excess if more than one fired (a candidate must clear all of them,
     so the hardest one to fix is what determines how close it really is).
@@ -43,4 +52,6 @@ def guardrail_excess(prob, implied, floor, cap=None):
         excesses.append(floor - prob)
     if cap is not None and implied and prob >= cap * implied:
         excesses.append(prob - cap * implied)
+    if market_floor is not None and implied is not None and implied < market_floor:
+        excesses.append(market_floor - implied)
     return max(excesses) if excesses else None

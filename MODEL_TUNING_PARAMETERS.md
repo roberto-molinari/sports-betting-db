@@ -230,3 +230,30 @@ per-player stats. *Docs: docstring paragraph.*
 > already used different underlying fields (`xg` vs `club_xga_per90`) and can be set
 > independently — see `load_team_players`'s signature.
 
+
+---
+
+## Pick-selection guardrails (`generate_club_league_card.py` + `core/pick_guardrails.py`)
+
+Not model knobs — they don't touch lambdas or probabilities — but they are calibrated
+constants that decide which priced candidates become real picks, so they belong in
+this inventory. Both are club-league-owned; `generate_wc_card.py` has its own
+independently-validated values and does not share these.
+
+### `CLUB_LEAGUE_MIN_PICK_PROBABILITY`
+Reject any candidate whose MODEL probability is below this (BUG-003's "a tiny
+probability overestimate at long odds fakes a big EV" diagnosis). *Docs: comment
+above the constant; BUGS.md BUG-009 2026-08-05/07.*
+
+### `CLUB_LEAGUE_MIN_MARKET_PROBABILITY`
+Reject any candidate whose MARKET-side vig-inclusive implied probability
+(`1/decimal odds`, exactly what `build_candidates()` computes) is below this —
+regardless of what the model thinks (BUG-009 re-diagnosis, 2026-08-20: a large
+model-vs-market gap on a corr-0.83 model is overwhelmingly estimation noise, and the
+proportional devig's residual favorite-longshot bias overstates longshots' fair
+probability, so long-odds "edges" are double-counterfeit). Swept 0.25-0.40 on stored
+`poisson_v4_4` vs Bet365 closing: every season improves monotonically to ~0.30-0.32,
+noise beyond; 0.32 on this scale equals the independently-validated fair-probability
+0.30 once Bet365's ~5% 1X2 overround is added back. *Docs: comment above the
+constant; BUGS.md BUG-009 2026-08-20 addendum (mechanism + marginal validation
+numbers under the live card's top-2 policy).*

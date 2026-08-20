@@ -160,12 +160,23 @@ def main():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # ONE odds row per match (BUG-018, 2026-08-20): a match can legitimately carry
+    # rows from several sportsbooks (e.g. Serie A 2025: 30 matches priced by
+    # Bet365 AND Pinnacle/"User Book"), and a bare join then inserts DUPLICATE
+    # prediction rows for those matches -- double-counting them in every
+    # downstream Brier/ROI query. Prefer Bet365 (the soft-book reference every
+    # ROI criterion is defined against), newest odds_date as tiebreak.
     cur.execute("""
         SELECT sm.match_id, sm.home_team_id, sm.away_team_id, sm.match_date,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
                o.over_under, o.over_odds, o.under_odds
         FROM soccer_matches sm
-        JOIN soccer_betting_odds o ON o.match_id = sm.match_id
+        JOIN soccer_betting_odds o ON o.odds_id = (
+            SELECT o2.odds_id FROM soccer_betting_odds o2
+            WHERE o2.match_id = sm.match_id
+            ORDER BY (o2.sportsbook = 'Bet365') DESC, o2.odds_date DESC, o2.odds_id DESC
+            LIMIT 1
+        )
         WHERE sm.league = ? AND sm.season = ?
         ORDER BY sm.match_date
     """, (args.league, args.season))
