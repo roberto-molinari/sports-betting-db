@@ -1945,3 +1945,188 @@ def test_attack_recentering_scales_by_ratio_to_league_average(db_path, conn):
 
     expected_la_home_multiplicative = ra_a * (r["avg_home"] / attack_mean)
     assert r["lambda_attack_player_home"] == pytest.approx(expected_la_home_multiplicative)
+
+
+# ── team-specific credibility de-shrink (BUG-009 proposed fix, 2026-08-19) ────────
+
+def test_apply_shrinkage_stores_the_per_player_weight_it_used():
+    """apply_shrinkage used to compute w = mins/(mins+k) internally and discard
+    it after applying the shrink -- team_credibility() needs that exact weight,
+    so apply_shrinkage must now store it under SHRINKAGE_WEIGHT_OUTPUT_FIELD."""
+    by_team = {1: [{"pos": "F", "attack_rate": 1.0, "attack_minutes": 300,
+                    "club_ga_per90": 1.0, "defense_minutes": 300}]}
+    strength.apply_shrinkage(by_team, k_minutes=900.0)
+    p = by_team[1][0]
+    assert p["_shrink_weight_attack"] == pytest.approx(300 / (300 + 900.0))
+    assert p["_shrink_weight_defense"] == pytest.approx(300 / (300 + 900.0))
+
+
+def test_apply_shrinkage_weight_matches_the_actual_shrink_applied():
+    """The stored weight must be the exact w used in the blend
+    w*val + (1-w)*prior -- not just some plausible-looking number."""
+    by_team = {
+        1: [{"pos": "F", "attack_rate": 2.0, "attack_minutes": 300,
+             "club_ga_per90": None, "defense_minutes": None}],
+        2: [{"pos": "F", "attack_rate": 0.0, "attack_minutes": 300,
+             "club_ga_per90": None, "defense_minutes": None}],
+    }
+    strength.apply_shrinkage(by_team, k_minutes=900.0)
+    prior = 1.0  # minutes-weighted average of the two players' raw rates (2.0, 0.0)
+    w = 300 / (300 + 900.0)
+    p = by_team[1][0]
+    assert p["attack_rate"] == pytest.approx(w * 2.0 + (1 - w) * prior)
+    assert p["_shrink_weight_attack"] == pytest.approx(w)
+
+
+def test_team_credibility_is_the_minutes_and_position_weighted_average():
+    """Must use the SAME weighting raw_team_strength() uses for the value
+    itself (minutes * position weight) -- not a flat average across players,
+    or a heavily-played bench player could outweigh the team's actual starters."""
+    players = [
+        {"pos": "FWD", "attack_rate": 1.0, "attack_minutes": 900, "_shrink_weight_attack": 0.8},
+        {"pos": "FWD", "attack_rate": 1.0, "attack_minutes": 100, "_shrink_weight_attack": 0.1},
+    ]
+    w_team = strength.team_credibility(players, "attack_rate", strength.PLAYER_RATING_POSITION_ATTACK_WEIGHTS)
+    expected = (900 * 0.8 + 100 * 0.1) / (900 + 100)
+    assert w_team == pytest.approx(expected)
+
+
+def test_team_credibility_ignores_players_with_zero_position_weight():
+    """A goalkeeper contributes 0.0 to PLAYER_RATING_POSITION_ATTACK_WEIGHTS --
+    must not pull the attack credibility score toward their shrink weight."""
+    players = [
+        {"pos": "FWD", "attack_rate": 1.0, "attack_minutes": 300, "_shrink_weight_attack": 0.9},
+        {"pos": "GK", "attack_rate": 0.0, "attack_minutes": 900, "_shrink_weight_attack": 0.1},
+    ]
+    w_team = strength.team_credibility(players, "attack_rate", strength.PLAYER_RATING_POSITION_ATTACK_WEIGHTS)
+    assert w_team == pytest.approx(0.9)
+
+
+def test_team_credibility_none_when_no_qualifying_players():
+    players = [{"pos": "GK", "attack_rate": 0.0, "attack_minutes": 900, "_shrink_weight_attack": 0.1}]
+    assert strength.team_credibility(players, "attack_rate", strength.PLAYER_RATING_POSITION_ATTACK_WEIGHTS) is None
+
+
+def test_compute_team_deshrink_off_by_default_matches_flat_stretch_default(db_path, conn):
+    """Off by default (PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK=False) --
+    compute() called with no override at all must reproduce the exact
+    flat-stretch shape already locked in by the PLAYER_RATING_SPREAD_STRETCH_
+    ATTACK tests above, not silently switch mechanisms."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
+
+    no_override = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                   xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0)
+    explicit_off = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                    xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                                    player_use_team_credibility_deshrink=False)
+    assert no_override[team_a]["lambda_attack_player_home"] == pytest.approx(
+        explicit_off[team_a]["lambda_attack_player_home"])
+
+
+def test_compute_team_deshrink_toggle_changes_the_rating(db_path, conn):
+    """Flipping player_use_team_credibility_deshrink must actually change the
+    computed player-level rating vs. the flat-stretch default (same 2-team
+    above/below-mean fixture used by the flat-stretch tests above)."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
+
+    flat = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                            xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0)
+    deshrunk = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                                player_use_team_credibility_deshrink=True)
+
+    assert deshrunk[team_a]["lambda_attack_player_home"] != pytest.approx(flat[team_a]["lambda_attack_player_home"])
+
+
+def test_compute_team_deshrink_ignores_flat_stretch_params_when_on(db_path, conn):
+    """When the toggle is on, player_spread_stretch_attack/_defense must be
+    ignored entirely (the de-shrink REPLACES that mechanism, not layers on
+    top of it) -- two different flat-stretch values must produce identical
+    results once the toggle is on."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
+
+    a = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                         xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                         player_use_team_credibility_deshrink=True, player_spread_stretch_attack=1.0)
+    b = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                         xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                         player_use_team_credibility_deshrink=True, player_spread_stretch_attack=3.0)
+
+    assert a[team_a]["lambda_attack_player_home"] == pytest.approx(b[team_a]["lambda_attack_player_home"])
+
+
+def test_compute_team_deshrink_pushes_above_mean_team_further_above(db_path, conn):
+    """Same directional guarantee as the flat-stretch tests: de-shrinking an
+    above-mean team must push it FURTHER above the league mean, not toward
+    it -- a de-shrink that accidentally compressed further would be worse
+    than doing nothing."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=400, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
+
+    flat = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                            xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                            player_spread_stretch_attack=1.0)
+    deshrunk = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                                player_use_team_credibility_deshrink=True)
+
+    # team_a is the above-mean team (2 goals vs team_b's 0) -- de-shrinking
+    # (like stretching) must move it further above avg_home, not toward it.
+    assert deshrunk[team_a]["lambda_attack_player_home"] > flat[team_a]["lambda_attack_player_home"]
+
+
+def test_compute_team_deshrink_floor_prevents_wild_extrapolation(db_path, conn):
+    """A team with almost no credible player data (very low minutes -> shrink
+    weight near 0) must have its de-shrink capped by player_team_credibility_
+    floor, not divided by a near-zero credibility score -- otherwise a single
+    thin-sample player could send the team's rating to an absurd value."""
+    team_a, opp_a, ma1 = _seed_match(conn, "TeamA", "OppA", date="2025-09-01")
+    team_b, opp_b, mb1 = _seed_match(conn, "TeamB", "OppB", date="2025-09-01")
+    pa = sports_db.add_player(team_a, "StrikerA", position="F", conn=conn)
+    pb = sports_db.add_player(team_b, "StrikerB", position="F", conn=conn)
+    # Just above the 300-minute "has_attack" qualification floor (350, not
+    # 300 exactly -- calendar decay shaves a couple points off even a 1-day-
+    # old match, and 300 flat lands just BELOW the threshold after that) but
+    # with player_shrinkage_k_minutes pushed way up below -- at k=5000, ~350
+    # decayed minutes gives a shrink weight of only ~0.065, well under the
+    # floor -- vs. the default k=900, where the same minutes give ~0.28,
+    # already above any floor under 0.28 and unable to demonstrate the floor
+    # mattering at all.
+    sports_db.add_player_match_stats(pa, ma1, season=2025, venue="home", minutes_played=350, goals=2, conn=conn)
+    sports_db.add_player_match_stats(pb, mb1, season=2025, venue="home", minutes_played=400, goals=0, conn=conn)
+
+    tiny_floor = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                  xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                                  player_use_team_credibility_deshrink=True,
+                                  player_shrinkage_k_minutes=5000.0,
+                                  player_team_credibility_floor=0.01)
+    normal_floor = strength.compute(conn, [team_a, team_b], "Serie A", 2025, "2025-09-02",
+                                    xg_spread_stretch_attack=1.0, xg_spread_stretch_defense=1.0,
+                                    player_use_team_credibility_deshrink=True,
+                                    player_shrinkage_k_minutes=5000.0,
+                                    player_team_credibility_floor=0.15)
+
+    # A much smaller floor allows a much larger (more extreme) de-shrink --
+    # confirms the floor is actually load-bearing, not a dead parameter.
+    tiny_val = tiny_floor[team_a]["lambda_attack_player_home"]
+    normal_val = normal_floor[team_a]["lambda_attack_player_home"]
+    assert tiny_val > normal_val

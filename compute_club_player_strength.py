@@ -82,6 +82,32 @@ PLAYER_RATING_PAST_MATCH_WINDOW_SIZE = 10
 PLAYER_RATING_RECENCY_HALF_LIFE_DAYS = 120.0
 PLAYER_RATING_RECENCY_CUTOFF_DAYS = 180.0
 
+# BUG-009 proposed fix (2026-08-19): team-specific linear de-shrink, replacing
+# the flat multiplicative player_spread_stretch_attack/_defense correction
+# with a per-team credibility factor derived from apply_shrinkage's own
+# per-player shrink weights (see apply_shrinkage's and team_credibility's
+# docstrings for the mechanism). Motivation: the flat stretch applies the
+# SAME correction to every team regardless of how much shrinkage that team's
+# specific roster actually absorbed -- a settled, high-minutes squad barely
+# gets shrunk and needs almost no correction, while a thin/rotation squad
+# gets shrunk hard and needs a much bigger one. A chat-session probe
+# (2026-08-18/19, 200 lopsided matches) found this nearly zeroes the
+# favorite/underdog compression bias (-0.053 -> -0.012) at the SAME k_minutes
+# as the shipped baseline (no shrinkage change at all), at roughly 60% of the
+# bulk-calibration cost (Brier/pooled bias) that an equivalent flat-stretch
+# fix required -- a real improvement to the trade-off, not a full escape from
+# it (see BUGS.md BUG-009). Off by default -- a genuinely different code
+# path, not just a new constant value, so it ships as an explicit opt-in
+# toggle pending a full backfill sweep before it could become the default.
+PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK = False
+
+# Floor on the per-team credibility factor before dividing by it in the
+# team-credibility de-shrink above, so a team with almost no credible player
+# data doesn't get wildly extrapolated -- same "must not diverge to something
+# absurd" discipline BUG-014 established for the old additive spread-stretch
+# bug. Probed at 0.15 in chat (2026-08-19); not independently swept.
+PLAYER_RATING_TEAM_CREDIBILITY_FLOOR = 0.15
+
 
 def calendar_recency_weight(match_date, before_date, half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
                             cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS, shape="exponential"):
@@ -718,17 +744,66 @@ def positional_priors(by_team, field, weight_field):
 # see load_team_players).
 SHRINKAGE_WEIGHT_FIELD = {"attack_rate": "attack_minutes", "club_ga_per90": "defense_minutes"}
 
+# field -> the key apply_shrinkage stores that player's shrink weight under
+# (BUG-009 team-credibility de-shrink, 2026-08-19) -- see apply_shrinkage's
+# docstring and team_credibility() below.
+SHRINKAGE_WEIGHT_OUTPUT_FIELD = {"attack_rate": "_shrink_weight_attack", "club_ga_per90": "_shrink_weight_defense"}
+
 
 def apply_shrinkage(by_team, k_minutes=PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE):
+    """Shrinks each player's attack_rate/club_ga_per90 toward their position's
+    league-wide average -- `w*val + (1-w)*prior`, where `w = mins/(mins+k_minutes)`
+    is how much a player's own rate counts vs. the position prior at their current
+    credibility (decayed minutes).
+
+    Also stores that per-player `w` under SHRINKAGE_WEIGHT_OUTPUT_FIELD (BUG-009,
+    2026-08-19) -- previously computed and discarded. team_credibility() below
+    aggregates it into one team-level credibility score, the input to the
+    team-specific de-shrink (PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK) that
+    replaces the flat, one-constant-for-every-team spread_around_mean stretch.
+    Storing it here (rather than recomputing from mins/k_minutes downstream)
+    keeps a single source of truth for "how much was this specific player
+    actually shrunk," including whatever k_minutes value this call used."""
     for field in ("attack_rate", "club_ga_per90"):
         weight_field = SHRINKAGE_WEIGHT_FIELD[field]
+        output_field = SHRINKAGE_WEIGHT_OUTPUT_FIELD[field]
         prior = positional_priors(by_team, field, weight_field=weight_field)
         for players in by_team.values():
             for p in players:
                 pos, val = p["pos"], p.get(field)
                 mins = p.get(weight_field)
                 if pos in prior and val is not None and mins:
-                    p[field] = (mins * val + k_minutes * prior[pos]) / (mins + k_minutes)
+                    w = mins / (mins + k_minutes)
+                    p[output_field] = w
+                    p[field] = w * val + (1 - w) * prior[pos]
+
+
+def team_credibility(players, field, position_weights):
+    """Credibility-weighted average of a team's players' shrink weights (from
+    apply_shrinkage, SHRINKAGE_WEIGHT_OUTPUT_FIELD) for one field ("attack_rate"
+    or "club_ga_per90") -- weighted the SAME way raw_team_strength() weights
+    that field's VALUE for team aggregation (minutes * position weight), so the
+    credibility score reflects each player's actual contribution to the team's
+    raw rate, not a flat per-player average.
+
+    Returns None if no player has both a shrink weight and a positive
+    aggregation weight (mirrors raw_team_strength's own "not enough signal"
+    fallback shape)."""
+    weight_field = SHRINKAGE_WEIGHT_FIELD[field]
+    output_field = SHRINKAGE_WEIGHT_OUTPUT_FIELD[field]
+    num = den = 0.0
+    for p in players:
+        pos = p["pos"]
+        sw = p.get(output_field)
+        mins = p.get(weight_field)
+        if pos is None or sw is None or not mins:
+            continue
+        w = mins * position_weights.get(pos, 0.0)
+        if w <= 0:
+            continue
+        num += w * sw
+        den += w
+    return (num / den) if den > 0 else None
 
 
 def spread_around_mean(raw, mean, factor, mode):
@@ -1477,7 +1552,10 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
            player_recency_half_life_days=PLAYER_RATING_RECENCY_HALF_LIFE_DAYS,
            player_recency_cutoff_days=PLAYER_RATING_RECENCY_CUTOFF_DAYS,
            player_window_min_date=None, cache=None,
-           xg_window_decay=None, xg_opponent_adjust=None):
+           xg_window_decay=None, xg_opponent_adjust=None,
+           player_shrinkage_k_minutes=PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE,
+           player_use_team_credibility_deshrink=PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK,
+           player_team_credibility_floor=PLAYER_RATING_TEAM_CREDIBILITY_FLOOR):
     """w_attack/w_defense: force this weight for EVERY team, bypassing per-team
     resolution -- a manual debugging/comparison override, not the normal path. Leave
     as None (default) to use resolve_blend_weight() per team, per component.
@@ -1546,7 +1624,32 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     compute() calls -- e.g. a backfill/backtest script looping over a season's
     matchdays can create one dict before the loop and pass it every call, turning
     ~12,700+ redundant aggregate recomputations per season into one per team. None
-    (default) is a no-op -- identical behavior to before BUG-011's fix."""
+    (default) is a no-op -- identical behavior to before BUG-011's fix.
+
+    player_shrinkage_k_minutes: passed through to apply_shrinkage as k_minutes --
+    the "half-trust point" (in decayed minutes) at which a player's own attack/
+    defense rate counts as much as their position's league-wide average, before
+    that point the average dominates. Default is the shipped
+    PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE (900 -- a
+    heavy pull toward the mean for most players). BUG-009 diagnosis (2026-08-18):
+    this shrinkage is a real, isolated contributor to the favorite/underdog
+    spread-compression bug -- lowering it toward ~100 nearly zeroes the
+    favorite-side underrating in a 200-match probe (-0.053 -> -0.006), though the
+    underdog side only partially improves (a second, separate cause -- the
+    team-level xG rating switch -- still contributes there). Exists as a tunable
+    parameter so a real multi-league sweep can validate a new default against
+    Brier/bias/ROI together, not just this one compression metric.
+
+    player_use_team_credibility_deshrink (default PLAYER_RATING_USE_TEAM_
+    CREDIBILITY_DESHRINK, False -- opt-in only): when True, REPLACES the flat
+    player_spread_stretch_attack/_defense correction with a per-team linear
+    de-shrink sized to exactly undo that team's OWN aggregate shrinkage
+    (team_credibility(), using the per-player weights apply_shrinkage stores).
+    player_spread_stretch_attack/_defense are ignored in this mode (this is a
+    replacement for that mechanism, not an addition to it). See
+    PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK's comment for the validated
+    trade-off (BUG-009, 2026-08-19) and player_team_credibility_floor for the
+    divide-by-near-zero guard."""
     by_team = load_team_players(conn, team_ids, before_date,
                                 attack_xg_v_goals_source=attack_xg_v_goals_source,
                                 defense_xg_v_goals_source=defense_xg_v_goals_source,
@@ -1554,7 +1657,7 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
                                 half_life_days=player_recency_half_life_days,
                                 cutoff_days=player_recency_cutoff_days,
                                 min_date=player_window_min_date)
-    apply_shrinkage(by_team)
+    apply_shrinkage(by_team, k_minutes=player_shrinkage_k_minutes)
 
     if xg_window_decay is None:
         xg_window_decay = TEAM_RATING_XG_WINDOW_DECAY
@@ -1615,14 +1718,45 @@ def compute(conn, team_ids, league, season, before_date, w_attack=None, w_defens
     # constant) that doesn't change relative dispersion at all; stretching after it
     # would be a no-op in effect. Recenters each team's raw player-level rate around
     # the SAME league mean the unit conversion itself uses, so the mean is preserved.
-    if player_spread_stretch_attack != 1.0 and attack_mean is not None:
-        for r in raw.values():
-            if r["ra"] is not None:
-                r["ra"] = spread_around_mean(r["ra"], attack_mean, player_spread_stretch_attack, mode="multiplicative")
-    if player_spread_stretch_defense != 1.0 and defense_mean is not None:
-        for r in raw.values():
-            if r["rd"] is not None:
-                r["rd"] = spread_around_mean(r["rd"], defense_mean, player_spread_stretch_defense, mode="multiplicative")
+    if player_use_team_credibility_deshrink:
+        # BUG-009 team-specific de-shrink (2026-08-19): REPLACES the flat
+        # stretch below with a per-team linear correction sized to exactly
+        # undo THAT team's own aggregate shrinkage, instead of one constant
+        # applied identically to every team. See apply_shrinkage/
+        # team_credibility's docstrings for the mechanism.
+        if attack_mean is not None:
+            for tid, players in by_team.items():
+                r = raw[tid]
+                if r["ra"] is None:
+                    continue
+                w_team = team_credibility(players, "attack_rate", PLAYER_RATING_POSITION_ATTACK_WEIGHTS)
+                if w_team is not None:
+                    w_team = max(w_team, player_team_credibility_floor)
+                    r["ra"] = attack_mean + (r["ra"] - attack_mean) / w_team
+        if defense_mean is not None:
+            for tid, players in by_team.items():
+                r = raw[tid]
+                if r["rd"] is None:
+                    continue
+                w_team = team_credibility(players, "club_ga_per90", PLAYER_RATING_POSITION_DEFENSE_WEIGHTS)
+                if w_team is not None:
+                    w_team = max(w_team, player_team_credibility_floor)
+                    r["rd"] = defense_mean + (r["rd"] - defense_mean) / w_team
+    else:
+        # Player-level counterpart to xg_spread_stretch_attack/_defense above (2026-08-12,
+        # BUG-010 continued) -- MUST happen here, before the avg_home/attack_mean unit
+        # conversion below, since that conversion is a pure linear rescale (multiply by a
+        # constant) that doesn't change relative dispersion at all; stretching after it
+        # would be a no-op in effect. Recenters each team's raw player-level rate around
+        # the SAME league mean the unit conversion itself uses, so the mean is preserved.
+        if player_spread_stretch_attack != 1.0 and attack_mean is not None:
+            for r in raw.values():
+                if r["ra"] is not None:
+                    r["ra"] = spread_around_mean(r["ra"], attack_mean, player_spread_stretch_attack, mode="multiplicative")
+        if player_spread_stretch_defense != 1.0 and defense_mean is not None:
+            for r in raw.values():
+                if r["rd"] is not None:
+                    r["rd"] = spread_around_mean(r["rd"], defense_mean, player_spread_stretch_defense, mode="multiplicative")
 
     results = {}
     for tid, players in by_team.items():

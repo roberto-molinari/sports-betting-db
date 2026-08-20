@@ -124,6 +124,36 @@ def main():
                              "against a season-SCOPED window. See compute_club_player_"
                              "strength.load_team_players' docstring "
                              "(FEATURE-011 Follow-up B, 2026-08-06).")
+    parser.add_argument("--shrinkage-k-minutes", dest="player_shrinkage_k_minutes", type=float,
+                        default=strength.PLAYER_RATING_MINUTES_TO_HALF_TRUST_OWN_RATE_OVER_LEAGUE_AVERAGE,
+                        help="apply_shrinkage's k_minutes -- the decayed-minutes half-trust "
+                             "point at which a player's own rate counts as much as their "
+                             "position's league-wide average. Default is the shipped 900. "
+                             "BUG-009 diagnosis (2026-08-18): a real, isolated contributor to "
+                             "favorite/underdog spread compression -- see compute()'s "
+                             "player_shrinkage_k_minutes docstring.")
+    parser.add_argument("--team-deshrink", dest="player_use_team_credibility_deshrink",
+                        action="store_true", default=strength.PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK,
+                        help="Opt-in toggle (default off): replaces the flat --player-stretch-"
+                             "attack/-defense correction with a per-team linear de-shrink sized "
+                             "to that team's own aggregate shrinkage, instead of one constant "
+                             "applied to every team. BUG-009 proposed fix (2026-08-19) -- see "
+                             "compute()'s player_use_team_credibility_deshrink docstring and "
+                             "PLAYER_RATING_USE_TEAM_CREDIBILITY_DESHRINK's comment for the "
+                             "validated trade-off before promoting this to the default.")
+    parser.add_argument("--xg-window-decay", dest="xg_window_decay", type=float,
+                        default=strength.TEAM_RATING_XG_WINDOW_DECAY,
+                        help="Recency weight on get_team_xg_ratings' last-N-matches window, "
+                             "most-recent-first (default 1.0 = flat mean, no-op). See "
+                             "TEAM_RATING_XG_WINDOW_DECAY's comment.")
+    parser.add_argument("--xg-opponent-adjust", dest="xg_opponent_adjust",
+                        action="store_true", default=strength.TEAM_RATING_XG_OPPONENT_ADJUST,
+                        help="Opt-in toggle (default off): point-in-time schedule-strength "
+                             "adjustment on team-level xG ratings -- each past match's xG/xGA "
+                             "scaled by the opponent's own RAW (unadjusted) rating as of that "
+                             "match date. BUG-010 candidate, built 2026-08-12 but never "
+                             "validated with a real backfill -- see TEAM_RATING_XG_OPPONENT_"
+                             "ADJUST's comment and team_level_lambda's opponent_adjust docstring.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DATABASE_PATH)
@@ -168,6 +198,9 @@ def main():
                                    player_recency_half_life_days=args.player_recency_half_life_days,
                                    player_recency_cutoff_days=args.player_recency_cutoff_days,
                                    player_window_min_date=args.player_window_min_date,
+                                   player_shrinkage_k_minutes=args.player_shrinkage_k_minutes,
+                                   player_use_team_credibility_deshrink=args.player_use_team_credibility_deshrink,
+                                   xg_window_decay=args.xg_window_decay, xg_opponent_adjust=args.xg_opponent_adjust,
                                    current_roster_ids_by_team=roster_ids_by_team, cache=cache)
 
         for row in date_rows:
