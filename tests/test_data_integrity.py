@@ -173,3 +173,51 @@ def test_matches_reference_existing_teams(live_conn, match_table, team_table):
            OR m.away_team_id NOT IN (SELECT team_id FROM {team_table})
     """)
     assert orphans == 0
+
+
+# ── Team league label freshness (FEATURE-019, 2026-08-19) ───────────────────────
+# soccer_teams.league is only ever set once, at first insert, and never touched
+# again except by the season-kickoff sync -- a promoted/relegated team (or any
+# other code path that slips through) can silently drift out of sync with the
+# league they're actually playing in. This is a direct, standing regression
+# check for exactly that: confirmed live 2026-08-19 to catch Hull City/Coventry
+# City/Le Mans/Troyes/Racing de Santander all sitting on a stale pre-promotion
+# league label.
+
+def test_team_league_matches_their_most_recent_match(live_conn):
+    """A team's stored league must match the league of its own most recent
+    soccer_matches row. Exemptions: a team with no matches yet (freshly
+    inserted, fixtures not imported); a team deliberately marked with the
+    "dropped out of everything we track" sentinel (FEATURE-019 decision 3);
+    and a team whose stored league has ZERO matches in the CURRENT (latest)
+    season yet (import_league_matches.py deliberately only imports FINISHED
+    matches for a feeder division with no odds source -- e.g. Serie B's new
+    season has no recorded matches at all until its first results come in, so
+    every correctly-labeled Serie B team would otherwise show as "stale"
+    against their last, older match in a different league from a PRIOR season
+    -- a data-availability gap, not a label bug -- while a league that DOES
+    have current-season matches still gets the full, real check). All three
+    are expected states, not staleness."""
+    SENTINEL = "(unknown - not seen this season)"
+    cur = live_conn.cursor()
+    cur.execute("SELECT MAX(season) FROM soccer_matches")
+    latest_season = cur.fetchone()[0]
+    cur.execute("SELECT DISTINCT league FROM soccer_matches WHERE season = ?", (latest_season,))
+    leagues_with_current_season_matches = {row[0] for row in cur.fetchall()}
+
+    cur.execute("""
+        SELECT t.name, t.league,
+               (SELECT m.league FROM soccer_matches m
+                WHERE m.home_team_id = t.team_id OR m.away_team_id = t.team_id
+                ORDER BY m.match_date DESC, m.match_id DESC LIMIT 1) AS actual_league
+        FROM soccer_teams t
+    """)
+    stale = [
+        (name, stored, actual) for name, stored, actual in cur.fetchall()
+        if actual is not None and stored != actual and stored != SENTINEL
+        and stored in leagues_with_current_season_matches
+    ]
+    assert stale == [], (
+        f"{len(stale)} team(s) have a league label that doesn't match their most "
+        f"recent match (name, stored_league, actual_league): {stale}"
+    )

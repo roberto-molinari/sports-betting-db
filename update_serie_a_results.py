@@ -33,7 +33,11 @@ import time
 import argparse
 import csv
 import os
+import sys
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from core.sports_db import ensure_soccer_team
 
 DB_PATH = 'sports_betting.db'
 
@@ -124,25 +128,33 @@ def parse_int_or_none(value):
 # ---------------------------------------------------------------------------
 
 def load_team_map(conn):
-# ...existing code...
+    """name -> team_id, for every team in soccer_teams -- NOT filtered by
+    league (FEATURE-019, 2026-08-19: name is already the real unique key, and
+    a promoted/relegated team's `league` column can lag reality between season
+    transitions -- filtering on it here would just reintroduce the same
+    stale-label blind spot this feature exists to remove)."""
     cur = conn.cursor()
-    cur.execute("SELECT name, team_id FROM soccer_teams WHERE league = 'Serie A'")
+    cur.execute("SELECT name, team_id FROM soccer_teams")
     return dict(cur.fetchall())
 
 
 def ensure_team(conn, team_map, name):
-    """Return the DB team_id for *name*, inserting a new row if needed."""
+    """Return the DB team_id for *name*, inserting a new row if needed.
+
+    Delegates to core.sports_db.ensure_soccer_team (FEATURE-019, 2026-08-19)
+    instead of a raw INSERT -- the old version only checked the LOCAL,
+    once-loaded team_map cache before inserting, so a team that already
+    existed under a different (stale) league -- exactly what a promotion
+    looks like -- wasn't in that cache and hit soccer_teams.name's UNIQUE
+    constraint as an uncaught sqlite3.IntegrityError, crashing the whole
+    sync. ensure_soccer_team already handles "insert if new, reuse if it
+    already exists under any league" safely; team_map here is now just a
+    call-avoidance cache, not the source of truth for whether a team exists."""
     if name in team_map:
         return team_map[name]
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO soccer_teams (name, league, country) VALUES (?, 'Serie A', 'Italy')",
-        (name,)
-    )
-    conn.commit()
-    team_id = cur.lastrowid
+    team_id = ensure_soccer_team(name, 'Serie A', 'Italy')
     team_map[name] = team_id
-    print(f"  + New team added: {name} (id={team_id})")
+    print(f"  + Team resolved: {name} (id={team_id})")
     return team_id
 
 
@@ -270,6 +282,7 @@ def sync_from_api(api_key, season):
                 match_id = cur.lastrowid
 
                 score_str = ''
+                hhs = has_ = None
                 if api_status == 'FINISHED':
                     score = m.get('score', {})
                     ft = score.get('fullTime', {})

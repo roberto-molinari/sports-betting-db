@@ -15,6 +15,7 @@ import re
 import sqlite3
 import sys
 
+from core.leagues import LEAGUES
 from core.sports_db import DATABASE_PATH, add_player
 from core.thestatsapi import Client, TheStatsAPIError
 
@@ -147,6 +148,19 @@ def match_teams_to_api(db_teams, api_teams):
 def main():
     args = parse_args()
     search = args.search or args.league
+    # FEATURE-019 (2026-08-19): default --competition-id from core/leagues.py's
+    # registry when the caller didn't pass one -- a bare name search is
+    # genuinely ambiguous for common league names (confirmed live: "Serie A",
+    # "Premier League", "Bundesliga", "Ligue 1", "Championship" all match
+    # multiple competitions, e.g. "Bundesliga" also matches "Austrian
+    # Bundesliga"), so every squad refresh for those leagues failed and
+    # required manual disambiguation. Explicit --competition-id still wins if
+    # passed. Serie A has no registry entry here (thestatsapi_competition_id
+    # is deliberately None -- it stays on football-data.org for MATCHES, see
+    # core/leagues.py) even though its SQUAD data does come from TheStatsAPI
+    # under a different id -- still needs manual --competition-id for now.
+    if args.competition_id is None:
+        args.competition_id = LEAGUES.get(args.league, {}).get("thestatsapi_competition_id")
     try:
         client = Client(api_key=args.api_key, max_requests=args.max_requests)
     except TheStatsAPIError as exc:
