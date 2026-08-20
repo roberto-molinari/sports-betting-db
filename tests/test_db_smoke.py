@@ -413,3 +413,81 @@ def test_wc_pick_override_supersedes_ungraded(db_path, conn):
     cur = conn.cursor()
     cur.execute("SELECT user_side FROM soccer_wc_pick_overrides WHERE match_id = ?", (match_id,))
     assert cur.fetchall() == [("DRAW",)]   # ungraded prior replaced, not stacked
+
+
+# ── soccer_club_league_picks (FEATURE-016, 2026-08-19) ────────────────────────────
+
+def test_club_league_picks_stores_multiple_picks_per_match(db_path, conn):
+    """One match can produce up to MAX_PICKS_PER_MATCH picks across different
+    markets (e.g. a 1X2 side and a totals side together) -- unlike soccer_wc_picks,
+    which stores one pick per match."""
+    home = sports_db.ensure_soccer_team("Genoa CFC", "Serie A")
+    away = sports_db.ensure_soccer_team("Inter", "Serie A")
+    match_id = sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-09-01")
+    picks = [
+        {"side": "AWAY", "odds": -150, "prob": 0.65, "ev": 0.10, "stars": 3},
+        {"side": "OVER 2.5", "odds": 105, "prob": 0.55, "ev": 0.08, "stars": 2},
+    ]
+    pick_ids = sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-08-31T12:00:00", picks)
+    assert len(pick_ids) == 2
+    cur = conn.cursor()
+    cur.execute("SELECT side, league, stars FROM soccer_club_league_picks "
+                "WHERE match_id = ? ORDER BY pick_id", (match_id,))
+    assert cur.fetchall() == [("AWAY", "Serie A", 3), ("OVER 2.5", "Serie A", 2)]
+
+
+def test_club_league_picks_replace_supersedes_ungraded_for_the_whole_match(db_path, conn):
+    """Re-running the card for the same match must replace ALL of that match's
+    prior ungraded picks (not stack), same contract as replace_wc_pick -- but
+    scoped to the whole match since one match can have multiple picks."""
+    home = sports_db.ensure_soccer_team("AC Milan", "Serie A")
+    away = sports_db.ensure_soccer_team("Napoli", "Serie A")
+    match_id = sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-09-08")
+    sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-09-07T12:00:00",
+        [{"side": "HOME", "odds": -110, "prob": 0.55, "ev": 0.05, "stars": 1}])
+    # re-run after a model improvement now picks two different markets
+    sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-09-07T13:00:00",
+        [{"side": "DRAW", "odds": 250, "prob": 0.30, "ev": 0.07, "stars": 2},
+         {"side": "UNDER 2.5", "odds": 100, "prob": 0.52, "ev": 0.04, "stars": 1}])
+    cur = conn.cursor()
+    cur.execute("SELECT side FROM soccer_club_league_picks WHERE match_id = ? ORDER BY pick_id",
+                (match_id,))
+    assert cur.fetchall() == [("DRAW",), ("UNDER 2.5",)]   # old pick gone, both new picks present
+
+
+def test_club_league_picks_replace_preserves_graded(db_path, conn):
+    """A later re-run must not wipe an already-graded pick for that match --
+    locked history, same as replace_wc_pick."""
+    home = sports_db.ensure_soccer_team("Juventus", "Serie A")
+    away = sports_db.ensure_soccer_team("Lazio", "Serie A")
+    match_id = sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-09-15")
+    pick_ids = sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-09-14T12:00:00",
+        [{"side": "HOME", "odds": -130, "prob": 0.60, "ev": 0.10, "stars": 2}])
+    sports_db.set_club_league_pick_result(pick_ids[0], "win")
+    sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-09-14T13:00:00",
+        [{"side": "AWAY", "odds": 300, "prob": 0.30, "ev": 0.05, "stars": 1}])
+    cur = conn.cursor()
+    cur.execute("SELECT side, result FROM soccer_club_league_picks WHERE match_id = ? ORDER BY pick_id",
+                (match_id,))
+    rows = cur.fetchall()
+    assert ("HOME", "win") in rows   # graded pick retained
+    assert len(rows) == 2            # graded kept, new ungraded added alongside
+
+
+def test_club_league_pick_grade_round_trip(db_path, conn):
+    home = sports_db.ensure_soccer_team("Bologna", "Serie A")
+    away = sports_db.ensure_soccer_team("Torino", "Serie A")
+    match_id = sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-09-22")
+    pick_ids = sports_db.replace_club_league_picks_for_match(
+        match_id, "Serie A", "2025-09-21T12:00:00",
+        [{"side": "UNDER 2.5", "odds": -110, "prob": 0.58, "ev": 0.06, "stars": 2}])
+    sports_db.set_club_league_pick_result(pick_ids[0], "loss")
+    cur = conn.cursor()
+    cur.execute("SELECT side, stars, result FROM soccer_club_league_picks WHERE pick_id = ?",
+                (pick_ids[0],))
+    assert cur.fetchone() == ("UNDER 2.5", 2, "loss")

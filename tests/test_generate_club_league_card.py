@@ -48,7 +48,8 @@ def _seed_lopsided_league(conn, league="Serie A", season=2025):
     return match_id
 
 
-def _run_card(capsys, db_path, days_ahead=(1, 4), now=datetime(2025, 9, 21, tzinfo=timezone.utc), league="Serie A"):
+def _run_card(capsys, db_path, days_ahead=(1, 4), now=datetime(2025, 9, 21, tzinfo=timezone.utc), league="Serie A",
+              dry_run=False):
     # generate_club_league_card does `from core.sports_db import DATABASE_PATH`,
     # binding its own copy at import time -- the db_path fixture only patches
     # core.sports_db's and core.poisson_model's copies (see conftest.py's
@@ -61,6 +62,8 @@ def _run_card(capsys, db_path, days_ahead=(1, 4), now=datetime(2025, 9, 21, tzin
         old_argv = sys.argv
         sys.argv = ["generate_club_league_card.py", "--league", league,
                     "--days-ahead", str(days_ahead[0]), str(days_ahead[1])]
+        if dry_run:
+            sys.argv.append("--dry-run")
         try:
             gclc.main()
         finally:
@@ -130,3 +133,36 @@ def test_card_excludes_subfloor_candidate_and_logs_it(db_path, conn, capsys):
     picks_section = out.split("GUARDRAIL LOG")[0]
     assert "AWAY" in log_section and "floor" in log_section
     assert "AWAY" not in picks_section
+
+
+# ── FEATURE-016: picks persisted for later scoring ─────────────────────────────────
+
+def test_card_stores_picks_by_default(db_path, conn, capsys):
+    _seed_lopsided_league(conn)
+    out = _run_card(capsys, db_path)
+    assert "stored in soccer_club_league_picks" in out
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    assert cur.fetchone()[0] > 0
+
+
+def test_card_dry_run_does_not_store(db_path, conn, capsys):
+    _seed_lopsided_league(conn)
+    out = _run_card(capsys, db_path, dry_run=True)
+    assert "dry-run, not stored" in out
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    assert cur.fetchone()[0] == 0
+
+
+def test_card_rerun_replaces_ungraded_picks_not_stack(db_path, conn, capsys):
+    _seed_lopsided_league(conn)
+    _run_card(capsys, db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    first_count = cur.fetchone()[0]
+    assert first_count > 0
+
+    _run_card(capsys, db_path)   # re-run, same inputs -- must replace, not double
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    assert cur.fetchone()[0] == first_count

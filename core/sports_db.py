@@ -325,6 +325,29 @@ def init_database():
             FOREIGN KEY (match_id) REFERENCES soccer_matches(match_id)
         );
 
+        -- FEATURE-016 (2026-08-19): generate_club_league_card.py's picks, so a live
+        -- card can be scored later -- same purpose as soccer_wc_picks below, one level
+        -- up (club leagues, not the World Cup). side covers both 1X2 ('HOME'/'DRAW'/
+        -- 'AWAY') and totals ('OVER 2.5'/'UNDER 2.5') since one match can produce up to
+        -- MAX_PICKS_PER_MATCH picks across different markets. league is denormalized
+        -- (also reachable via match_id -> soccer_matches.league) matching every other
+        -- multi-league table in this schema (soccer_model_predictions, soccer_market_
+        -- odds) -- cheap and avoids a join for the common "picks for this league" query.
+        CREATE TABLE IF NOT EXISTS soccer_club_league_picks (
+            pick_id      INTEGER PRIMARY KEY,
+            match_id     INTEGER NOT NULL,
+            league       TEXT NOT NULL,
+            generated_at TIMESTAMP NOT NULL,
+            side         TEXT,
+            odds         REAL,
+            model_prob   REAL,
+            ev           REAL,
+            stars        INTEGER,
+            result       TEXT,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (match_id) REFERENCES soccer_matches(match_id)
+        );
+
         -- 1X2 odds from an external book (sharp: Pinnacle, Betfair Exchange; soft:
         -- Bet365), for measuring the model against a market read. `source` distinguishes
         -- the book, `line_type` distinguishes opening vs closing. `p_*_fair` is the
@@ -458,6 +481,8 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_extra_time_goals_match ON soccer_extra_time_goals(match_id);
         CREATE INDEX IF NOT EXISTS idx_model_predictions_match ON soccer_model_predictions(match_id);
         CREATE INDEX IF NOT EXISTS idx_model_predictions_league ON soccer_model_predictions(league);
+        CREATE INDEX IF NOT EXISTS idx_club_league_picks_match  ON soccer_club_league_picks(match_id);
+        CREATE INDEX IF NOT EXISTS idx_club_league_picks_league ON soccer_club_league_picks(league);
         CREATE INDEX IF NOT EXISTS idx_market_odds_match  ON soccer_market_odds(match_id);
         CREATE INDEX IF NOT EXISTS idx_market_odds_source ON soccer_market_odds(source);
         CREATE INDEX IF NOT EXISTS idx_market_odds_type   ON soccer_market_odds(line_type);
@@ -1263,6 +1288,65 @@ def set_wc_pick_result(pick_id, result):
         conn.commit()
     finally:
         conn.close()
+
+
+def replace_club_league_picks_for_match(match_id, league, generated_at, picks, conn=None):
+    """Store generate_club_league_card.py's picks for one match, replacing any
+    prior *ungraded* picks for that match (result IS NULL) so re-running the card
+    supersedes rather than stacks -- same "DB is the current record, already-
+    graded picks are locked history" contract as replace_wc_pick (FEATURE-016).
+
+    Deletes/inserts for the WHOLE match in one call (not per-pick) because one
+    match can produce up to MAX_PICKS_PER_MATCH picks across different markets
+    (e.g. HOME and OVER 2.5 together) -- a per-pick delete-then-insert would wipe
+    out a same-match pick just inserted moments earlier.
+
+    picks: list of dicts, each with side/odds/prob/ev and optionally stars --
+    matches the candidate dicts generate_club_league_card.py already builds.
+    Returns the list of new pick_ids, in the same order as `picks`."""
+    owns_conn = conn is None
+    if owns_conn:
+        conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM soccer_club_league_picks WHERE match_id = ? AND result IS NULL",
+            (match_id,)
+        )
+        pick_ids = []
+        for p in picks:
+            cur.execute(
+                """INSERT INTO soccer_club_league_picks
+                   (match_id, league, generated_at, side, odds, model_prob, ev, stars)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (match_id, league, generated_at, p["side"], p["odds"], p["prob"],
+                 p["ev"], p.get("stars"))
+            )
+            pick_ids.append(cur.lastrowid)
+        if owns_conn:
+            conn.commit()
+        return pick_ids
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def set_club_league_pick_result(pick_id, result, conn=None):
+    """Grade a stored club-league pick: result is 'win', 'loss', or 'push'."""
+    owns_conn = conn is None
+    if owns_conn:
+        conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE soccer_club_league_picks SET result = ? WHERE pick_id = ?",
+            (result, pick_id)
+        )
+        if owns_conn:
+            conn.commit()
+    finally:
+        if owns_conn:
+            conn.close()
 
 
 def add_wc_pick_override(match_id, user_side, user_odds, reason,

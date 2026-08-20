@@ -30,10 +30,19 @@ import argparse
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
-from core.sports_db import DATABASE_PATH
-from core.poisson_model import analyse_match_wc, american_to_implied_prob
+from core.sports_db import DATABASE_PATH, replace_club_league_picks_for_match
+from core.poisson_model import analyse_match_wc, american_to_implied_prob, ev_to_stars
 from core.pick_guardrails import guardrail_reasons
+from core.leagues import LEAGUES, has_odds_source
 import compute_club_player_strength as strength
+
+# Card generation only makes sense for a league with a real odds source -- the
+# feeder divisions in core.leagues.LEAGUES (Serie B, Championship, etc.) exist
+# for cross-league player history, not for picks. Restricting --league's
+# choices to this list (2026-08-19) means a typo'd league name now fails loudly
+# via argparse's own error message instead of silently matching zero matches
+# and printing "MATCHES 0" with no indication anything was wrong.
+CARD_LEAGUES = sorted(lg for lg in LEAGUES if has_odds_source(lg))
 
 DEFAULT_LEAGUE = "Serie A"
 MAX_PICKS_PER_MATCH = 2
@@ -79,9 +88,12 @@ def build_candidates(match, result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--league", default=DEFAULT_LEAGUE)
+    parser.add_argument("--league", default=DEFAULT_LEAGUE, choices=CARD_LEAGUES)
     parser.add_argument("--days-ahead", type=int, nargs=2, default=(1, 4), metavar=("START", "END"),
                         help="Window is [today+START, today+END] (UTC calendar days). Default: 1 4.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the card without storing picks in soccer_club_league_picks "
+                             "(FEATURE-016) -- same flag/behavior as generate_wc_card.py.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DATABASE_PATH)
@@ -121,6 +133,7 @@ def main():
 
     ranked_matches = []
     excluded_log = []
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
     for before_date in dates:
@@ -165,7 +178,16 @@ def main():
             if not clean:
                 continue
             clean.sort(key=lambda c: c["ev"], reverse=True)
-            ranked_matches.append(clean[:MAX_PICKS_PER_MATCH])
+            top_picks = clean[:MAX_PICKS_PER_MATCH]
+            ranked_matches.append(top_picks)
+
+            if not args.dry_run:
+                for p in top_picks:
+                    p["stars"] = ev_to_stars(p["ev"])
+                replace_club_league_picks_for_match(
+                    match_id=row["match_id"], league=args.league,
+                    generated_at=generated_at, picks=top_picks,
+                )
 
     ranked_matches.sort(key=lambda picks: picks[0]["ev"], reverse=True)
 
@@ -175,7 +197,10 @@ def main():
             f"| odds {pick['odds']:+.0f} | model p {pick['prob']:.3f} | EV {pick['ev']:+.1%} | stake 1.00u"
         )
 
-    print("=== TOP PICKS PER MATCH (guardrail-clear, positive-EV only, ranked by best pick's EV) ===")
+    picks_total = sum(len(picks) for picks in ranked_matches)
+    print(f"=== TOP PICKS PER MATCH (guardrail-clear, positive-EV only, ranked by best pick's EV) ==="
+          f"{f'  [{picks_total} picks stored in soccer_club_league_picks]' if not args.dry_run and picks_total else ''}"
+          f"{'  (dry-run, not stored)' if args.dry_run else ''}")
     if ranked_matches:
         for index, picks in enumerate(ranked_matches, 1):
             print(fmt_pick(f"{index}.", picks[0]))
