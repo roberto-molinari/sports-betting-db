@@ -77,7 +77,13 @@ def devig(home_odds, draw_odds, away_odds):
 
 
 def get_team_id(cur, league, name):
-    cur.execute("SELECT team_id FROM soccer_teams WHERE league = ? AND name = ?", (league, name))
+    """league is unused for the lookup itself (kept for call-site symmetry): a team's
+    soccer_teams.league is its CURRENT division (FEATURE-019), so scoping by it would
+    fail to resolve a team that's since been promoted/relegated out of `league` for a
+    historical-season import -- name is globally unique (ensure_soccer_team), so an
+    unscoped lookup is the correct one. Same bug/fix as import_league_betting_odds.py's
+    load_team_map, found live 2026-08-20."""
+    cur.execute("SELECT team_id FROM soccer_teams WHERE name = ?", (name,))
     row = cur.fetchone()
     return row[0] if row else None
 

@@ -127,8 +127,16 @@ def parse_match_datetime(row):
 
 
 def load_team_map(conn, league):
+    """{name: team_id} for every team, globally -- NOT filtered by league. A team's
+    soccer_teams.league is its CURRENT division (see FEATURE-019); a historical-season
+    odds import needs to resolve teams that have since been promoted/relegated out of
+    `league` entirely (e.g. importing Premier League 2022-23 odds must still resolve
+    Leicester City/West Ham/Southampton/Wolves, all since relegated). name is globally
+    unique by design (ensure_soccer_team), so an unscoped lookup is safe and correct --
+    scoping by current league silently dropped 140/380 matches' odds when first found
+    live 2026-08-20 backfilling Premier League 2022-23."""
     cur = conn.cursor()
-    cur.execute("SELECT name, team_id FROM soccer_teams WHERE league = ?", (league,))
+    cur.execute("SELECT name, team_id FROM soccer_teams")
     return dict(cur.fetchall())
 
 
