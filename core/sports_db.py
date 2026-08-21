@@ -333,6 +333,11 @@ def init_database():
         -- (also reachable via match_id -> soccer_matches.league) matching every other
         -- multi-league table in this schema (soccer_model_predictions, soccer_market_
         -- odds) -- cheap and avoids a join for the common "picks for this league" query.
+        -- method (2026-08-21): the live pipeline's model/guardrail version tag
+        -- (generate_club_league_card.CARD_MODEL_VERSION) at the moment this pick was
+        -- generated -- so post-matchday performance-over-time analysis can tell model
+        -- changes apart instead of silently blending picks made under different configs.
+        -- Nullable: rows from before this column existed have no way to know retroactively.
         CREATE TABLE IF NOT EXISTS soccer_club_league_picks (
             pick_id      INTEGER PRIMARY KEY,
             match_id     INTEGER NOT NULL,
@@ -344,6 +349,7 @@ def init_database():
             ev           REAL,
             stars        INTEGER,
             result       TEXT,
+            method       TEXT,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (match_id) REFERENCES soccer_matches(match_id)
         );
@@ -505,6 +511,24 @@ def init_database():
     conn.commit()
     conn.close()
     print(f"Database initialized at {DATABASE_PATH}")
+
+
+def ensure_club_league_picks_schema(conn=None):
+    """Add the `method` column to soccer_club_league_picks on older databases
+    (2026-08-21 -- see that column's comment in init_database)."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(soccer_club_league_picks)")
+        existing = {row[1] for row in cur.fetchall()}
+        if "method" not in existing:
+            cur.execute("ALTER TABLE soccer_club_league_picks ADD COLUMN method TEXT")
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 def ensure_wc_team_strength_schema(conn=None):
@@ -1290,7 +1314,7 @@ def set_wc_pick_result(pick_id, result):
         conn.close()
 
 
-def replace_club_league_picks_for_match(match_id, league, generated_at, picks, conn=None):
+def replace_club_league_picks_for_match(match_id, league, generated_at, picks, method=None, conn=None):
     """Store generate_club_league_card.py's picks for one match, replacing any
     prior *ungraded* picks for that match (result IS NULL) so re-running the card
     supersedes rather than stacks -- same "DB is the current record, already-
@@ -1303,10 +1327,13 @@ def replace_club_league_picks_for_match(match_id, league, generated_at, picks, c
 
     picks: list of dicts, each with side/odds/prob/ev and optionally stars --
     matches the candidate dicts generate_club_league_card.py already builds.
-    Returns the list of new pick_ids, in the same order as `picks`."""
+    method: the model/guardrail version tag in effect for this run (2026-08-21,
+    generate_club_league_card.CARD_MODEL_VERSION) -- None if the caller doesn't
+    track one. Returns the list of new pick_ids, in the same order as `picks`."""
     owns_conn = conn is None
     if owns_conn:
         conn = sqlite3.connect(DATABASE_PATH)
+    ensure_club_league_picks_schema(conn=conn)
     cur = conn.cursor()
     try:
         cur.execute(
@@ -1317,10 +1344,10 @@ def replace_club_league_picks_for_match(match_id, league, generated_at, picks, c
         for p in picks:
             cur.execute(
                 """INSERT INTO soccer_club_league_picks
-                   (match_id, league, generated_at, side, odds, model_prob, ev, stars)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (match_id, league, generated_at, side, odds, model_prob, ev, stars, method)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (match_id, league, generated_at, p["side"], p["odds"], p["prob"],
-                 p["ev"], p.get("stars"))
+                 p["ev"], p.get("stars"), method)
             )
             pick_ids.append(cur.lastrowid)
         if owns_conn:

@@ -25,19 +25,27 @@ Only surfaces genuine positive-EV, guardrail-clear candidates (unlike the old
 script, which showed the top-2-by-EV per match regardless of EV sign) -- brings
 this tool in line with backtest_from_predictions.py's own screening discipline.
 
+Running with no arguments at all prints this help and exits -- this script
+writes real picks to the database by default (no --dry-run), so a bare
+invocation must never silently take a real action off implicit defaults
+(found live 2026-08-21: a zero-arg run stored 4 real Serie A picks nobody
+intended to generate yet).
+
 Usage:
-    python generate_club_league_card.py                        # Serie A, next 1-4 days
-    python generate_club_league_card.py --league "Serie A" --days-ahead 1 7
+    python generate_club_league_card.py --league "Serie A" --matchday-date 2026-08-22
+    python generate_club_league_card.py --league "Serie A" --matchday-date 2026-08-22 2026-08-25
 """
 
 import argparse
 import sqlite3
-from datetime import datetime, timezone, timedelta
+import sys
+from datetime import datetime, timezone
 
 from core.sports_db import DATABASE_PATH, replace_club_league_picks_for_match
 from core.poisson_model import analyse_match_wc, american_to_implied_prob, ev_to_stars
 from core.pick_guardrails import guardrail_reasons
 from core.leagues import LEAGUES, has_odds_source
+from core.matchday import matchday_utc_window, matchday_range_utc_window, format_db_timestamp, MATCHDAY_BUFFER_HOURS
 import compute_club_player_strength as strength
 
 # Card generation only makes sense for a league with a real odds source -- the
@@ -50,6 +58,18 @@ CARD_LEAGUES = sorted(lg for lg in LEAGUES if has_odds_source(lg))
 
 DEFAULT_LEAGUE = "Serie A"
 MAX_PICKS_PER_MATCH = 2
+
+# The live pipeline's model version tag (2026-08-21), stored on every pick
+# (soccer_club_league_picks.method) so post-matchday performance-over-time
+# analysis can tell picks made under different model configs apart instead of
+# silently blending them together. This is compute_club_player_strength.
+# compute()'s CURRENT shipped defaults (no method-specific override passed
+# here) -- must be bumped BY HAND whenever a change to those defaults would
+# count as a new method in soccer_model_predictions terms (the same
+# discipline MODEL_VERSION_LOG.md already tracks for backfilled predictions);
+# nothing enforces this automatically, so it can silently go stale if a
+# default changes and this constant isn't updated alongside it.
+CARD_MODEL_VERSION = "poisson_v4_4"
 
 # Guardrail floor (BUG-003 pattern via core.pick_guardrails). Validated 2026-08-05
 # (as a retrofit onto poisson_v4_priorblend) and re-checked 2026-08-07 on top of the
@@ -140,27 +160,54 @@ def build_candidates(match, result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--league", default=DEFAULT_LEAGUE, choices=CARD_LEAGUES)
-    parser.add_argument("--days-ahead", type=int, nargs=2, default=(1, 4), metavar=("START", "END"),
-                        help="Window is [today+START, today+END] (UTC calendar days). Default: 1 4.")
+    parser.add_argument("--matchday-date", nargs="+", required=True, metavar="YYYY-MM-DD",
+                        help="One matchday, or two (a start and end date) to cover every "
+                             "matchday in between, inclusive. US Eastern time plus a same-day "
+                             "buffer past ET midnight for late kickoffs (core.matchday, "
+                             "docs/PRE-AND-POST-MATCHDAY-EXPERIENCE.md) -- the same day-boundary "
+                             "grading/scorecards use, so a card generated for this date lines up "
+                             "with how it'll later be scored. Examples: "
+                             "--matchday-date 2026-08-22  /  --matchday-date 2026-08-22 2026-08-25")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the card without storing picks in soccer_club_league_picks "
                              "(FEATURE-016) -- same flag/behavior as generate_wc_card.py.")
+    parser.add_argument("--post-friendly", action="store_true",
+                        help="Print a compact, copy-pasteable block (team names + pick only, "
+                             "one line per pick) instead of the detailed report -- for posting "
+                             "picks directly, not for reading in a terminal.")
+
+    if len(sys.argv) == 1:
+        # No args at all -- this script writes real picks to the database by
+        # default (no --dry-run), so a bare invocation with an implicit
+        # league/window default would silently take a real action instead of
+        # being a safe no-op. Found live 2026-08-21: running with zero args
+        # stored 4 real Serie A picks nobody intended to generate yet.
+        parser.print_help()
+        sys.exit(0)
+
     args = parser.parse_args()
+    if len(args.matchday_date) not in (1, 2):
+        parser.error("--matchday-date takes 1 or 2 dates")
 
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    now = datetime.now(timezone.utc)
-    start_offset, end_offset = args.days_ahead
-    start = (now.date() + timedelta(days=start_offset)).isoformat()
-    end = (now.date() + timedelta(days=end_offset)).isoformat()
+    if len(args.matchday_date) == 1:
+        start_utc, end_utc = matchday_utc_window(args.matchday_date[0])
+        window_label = f"matchday {args.matchday_date[0]} (ET, +{MATCHDAY_BUFFER_HOURS}h buffer)"
+    else:
+        start_utc, end_utc = matchday_range_utc_window(*args.matchday_date)
+        window_label = (f"matchdays {args.matchday_date[0]} to {args.matchday_date[1]} "
+                        f"(ET, +{MATCHDAY_BUFFER_HOURS}h buffer)")
+    start, end = format_db_timestamp(start_utc), format_db_timestamp(end_utc)
+    date_clause = "m.match_date >= ? AND m.match_date < ?"
 
     # ONE odds row per match -- see backfill_player_blend_predictions.py's
     # identical subquery for the rationale (BUG-018, 2026-08-20: a match priced
     # by several books used to be processed once per book, silently overwriting
     # its stored picks with whichever odds row came last).
-    cur.execute('''
+    cur.execute(f'''
         SELECT m.match_id, m.match_date, m.season, ht.name AS home, at.name AS away,
                m.home_team_id, m.away_team_id,
                o.home_moneyline, o.draw_moneyline, o.away_moneyline,
@@ -175,19 +222,22 @@ def main():
             LIMIT 1
         )
         WHERE m.league = ?
-          AND date(m.match_date) >= date(?)
-          AND date(m.match_date) <= date(?)
+          AND {date_clause}
         ORDER BY m.match_date, m.match_id
     ''', (args.league, start, end))
     rows = cur.fetchall()
 
-    print(f"LEAGUE {args.league}")
-    print(f"WINDOW {start} to {end}")
-    print(f"MATCHES {len(rows)}")
-    print()
+    if not args.post_friendly:
+        print(f"LEAGUE {args.league}")
+        print(f"WINDOW {window_label}")
+        print(f"MATCHES {len(rows)}")
+        print()
 
     if not rows:
-        print("No matches with priced markets")
+        if args.post_friendly:
+            print_post_friendly(args.league, args.matchday_date, [], 0)
+        else:
+            print("No matches with priced markets")
         conn.close()
         return
 
@@ -247,10 +297,15 @@ def main():
                     p["stars"] = ev_to_stars(p["ev"])
                 replace_club_league_picks_for_match(
                     match_id=row["match_id"], league=args.league,
-                    generated_at=generated_at, picks=top_picks,
+                    generated_at=generated_at, picks=top_picks, method=CARD_MODEL_VERSION,
                 )
 
     ranked_matches.sort(key=lambda picks: picks[0]["ev"], reverse=True)
+
+    if args.post_friendly:
+        print_post_friendly(args.league, args.matchday_date, ranked_matches, len(rows))
+        conn.close()
+        return
 
     def fmt_pick(rank_label, pick):
         match_date = strength.match_calendar_date(pick["match_date"])
@@ -280,6 +335,45 @@ def main():
                   f"| EV {c['ev']:+.1%} | {' & '.join(c['excluded_by'])}")
 
     conn.close()
+
+
+PICK_EMOJI = {"HOME": "\U0001F3E0", "AWAY": "✈️", "DRAW": "\U0001F91D"}
+
+
+def _pick_emoji(side):
+    if side in PICK_EMOJI:
+        return PICK_EMOJI[side]
+    return "⬆️" if side.startswith("OVER") else "⬇️"
+
+
+def print_post_friendly(league, matchday_date, ranked_matches, match_count):
+    """One copy-pasteable block: team names + pick only, no odds/EV/model detail
+    (docs/PRE-AND-POST-MATCHDAY-EXPERIENCE.md, 2026-08-21) -- one call = one
+    league's post; the caller runs this once per league it wants a post for.
+
+    matchday_date: the raw --matchday-date value (a list of 1 or 2 date
+    strings) or None (--days-ahead-style window) -- formatted here, not by the
+    caller, so this is the one place that has to know its shape.
+    match_count: distinguishes "no games today" from "games happened but
+    nothing cleared the guardrail" (found live 2026-08-21 -- with no count,
+    a real no-picks day was indistinguishable from a possible bug)."""
+    if not matchday_date:
+        date_label = ""
+    elif len(matchday_date) == 1:
+        date_label = f" — {matchday_date[0]}"
+    else:
+        date_label = f" — {matchday_date[0]} to {matchday_date[1]}"
+    print(f"⚽ {league} Picks{date_label}")
+    if not ranked_matches:
+        if match_count == 0:
+            print("No matches today")
+        else:
+            print(f"No guardrail-clear picks today ({match_count} match{'es' if match_count != 1 else ''}, "
+                  f"none cleared the floor)")
+        return
+    for picks in ranked_matches:
+        for pick in picks:
+            print(f"{_pick_emoji(pick['side'])} {pick['home']} vs {pick['away']}: {pick['side']}")
 
 
 if __name__ == "__main__":

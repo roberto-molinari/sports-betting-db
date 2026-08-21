@@ -105,7 +105,7 @@ LEAGUES = {
 # football-data.co.uk's season-label format (e.g. 2024 -> "2425") -- confirmed the
 # SAME format across every league on that site, not league-specific, so this is one
 # shared table rather than per-league.
-FOOTBALLDATACOUK_SEASON_CODE = {2022: "2223", 2023: "2324", 2024: "2425", 2025: "2526"}
+FOOTBALLDATACOUK_SEASON_CODE = {2022: "2223", 2023: "2324", 2024: "2425", 2025: "2526", 2026: "2627"}
 
 
 def has_odds_source(league):

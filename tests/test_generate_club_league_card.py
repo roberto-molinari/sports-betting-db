@@ -39,7 +39,7 @@ def _seed_lopsided_league(conn, league="Serie A", season=2025):
     # probability itself is still under the floor, the exact "confident-looking EV
     # is actually noise" case the guardrail exists for (BUG-003's original
     # diagnosis).
-    match_id = sports_db.add_soccer_match(league, season, strong, weak, "2025-09-22")
+    match_id = sports_db.add_soccer_match(league, season, strong, weak, "2025-09-22T18:00:00.000Z")
     sports_db.add_soccer_betting_odds(
         match_id=match_id, sportsbook="Test", odds_date="2025-09-20",
         home_moneyline=-350, draw_moneyline=450, away_moneyline=2000,
@@ -48,22 +48,29 @@ def _seed_lopsided_league(conn, league="Serie A", season=2025):
     return match_id
 
 
-def _run_card(capsys, db_path, days_ahead=(1, 4), now=datetime(2025, 9, 21, tzinfo=timezone.utc), league="Serie A",
-              dry_run=False):
+def _run_card(capsys, db_path, now=datetime(2025, 9, 21, tzinfo=timezone.utc), league="Serie A",
+              dry_run=False, matchday_date="2025-09-22", post_friendly=False):
     # generate_club_league_card does `from core.sports_db import DATABASE_PATH`,
     # binding its own copy at import time -- the db_path fixture only patches
     # core.sports_db's and core.poisson_model's copies (see conftest.py's
     # docstring), so this module's copy needs patching too or it silently hits
     # the real production DB instead of the isolated test one.
+    # matchday_date: a single 'YYYY-MM-DD' string, or a (start, end) tuple/list
+    # for the two-date range form.
     with patch("generate_club_league_card.DATABASE_PATH", db_path), \
          patch("generate_club_league_card.datetime") as mock_dt:
         mock_dt.now.return_value = now
         import sys
         old_argv = sys.argv
-        sys.argv = ["generate_club_league_card.py", "--league", league,
-                    "--days-ahead", str(days_ahead[0]), str(days_ahead[1])]
+        sys.argv = ["generate_club_league_card.py", "--league", league, "--matchday-date"]
+        if isinstance(matchday_date, (tuple, list)):
+            sys.argv += list(matchday_date)
+        else:
+            sys.argv.append(matchday_date)
         if dry_run:
             sys.argv.append("--dry-run")
+        if post_friendly:
+            sys.argv.append("--post-friendly")
         try:
             gclc.main()
         finally:
@@ -199,3 +206,158 @@ def test_per_league_overrides_within_5pp_of_shared_default():
     # noisiest number (BUGS.md, 2026-08-21).
     for league, floor in gclc.CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE.items():
         assert abs(floor - gclc.CLUB_LEAGUE_MIN_MARKET_PROBABILITY) <= 0.05 + 1e-9
+
+
+# ── --matchday-date / --post-friendly (2026-08-21) ─────────────────────────────────
+
+def test_matchday_date_finds_match_by_et_matchday_not_utc_calendar_date(db_path, conn, capsys):
+    # Kickoff at 01:00 UTC on the 23rd = 21:00 EDT on the 22nd -- same ET matchday
+    # as the 22nd, even though its UTC calendar date is already the 23rd. A plain
+    # UTC-date query would miss this; matchday_utc_window() must not.
+    match_id = _seed_lopsided_league(conn)
+    cur = conn.cursor()
+    cur.execute("UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+               ("2025-09-23T01:00:00.000Z", match_id))
+    conn.commit()
+
+    out = _run_card(capsys, db_path, matchday_date="2025-09-22", dry_run=True)
+    assert "MATCHES 1" in out
+    assert "StrongFC vs WeakFC" in out
+
+
+def test_matchday_date_rejects_more_than_two_dates():
+    import subprocess
+    result = subprocess.run(
+        ["python3", "generate_club_league_card.py", "--league", "Serie A",
+         "--matchday-date", "2025-09-22", "2025-09-23", "2025-09-24"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "takes 1 or 2 dates" in result.stderr
+
+
+def test_matchday_date_range_covers_every_day_in_between(db_path, conn, capsys):
+    # One match on 9/22, another on 9/24 -- a range of 9/22..9/25 must find both.
+    _seed_lopsided_league(conn)
+    strong2 = sports_db.ensure_soccer_team("StrongFC2", "Serie A")
+    weak2 = sports_db.ensure_soccer_team("WeakFC2", "Serie A")
+    match_id_2 = sports_db.add_soccer_match("Serie A", 2025, strong2, weak2, "2025-09-24T18:00:00.000Z")
+    sports_db.add_soccer_betting_odds(
+        match_id=match_id_2, sportsbook="Test", odds_date="2025-09-23",
+        home_moneyline=-350, draw_moneyline=450, away_moneyline=2000,
+        over_under=2.5, over_odds=-110, under_odds=-110,
+    )
+
+    out = _run_card(capsys, db_path, matchday_date=("2025-09-22", "2025-09-25"), dry_run=True)
+    assert "MATCHES 2" in out
+
+
+def test_post_friendly_output_is_team_names_and_pick_only(db_path, conn, capsys):
+    match_id = _seed_lopsided_league(conn)
+    cur = conn.cursor()
+    cur.execute("UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+               ("2025-09-22T18:00:00.000Z", match_id))
+    conn.commit()
+
+    out = _run_card(capsys, db_path, matchday_date="2025-09-22", post_friendly=True)
+    assert "StrongFC vs WeakFC" in out
+    # The date label must be a clean date, not the raw ['2025-09-22'] list repr
+    # --matchday-date's nargs="+" produces (found live 2026-08-21).
+    assert "— 2025-09-22" in out
+    assert "[" not in out
+    # None of the detailed-report fields leak into the post-friendly output.
+    assert "EV" not in out
+    assert "odds" not in out
+    assert "model p" not in out
+
+
+def test_post_friendly_range_date_label_shows_both_dates(db_path, conn, capsys):
+    match_id = _seed_lopsided_league(conn)
+    cur = conn.cursor()
+    cur.execute("UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+               ("2025-09-22T18:00:00.000Z", match_id))
+    conn.commit()
+
+    out = _run_card(capsys, db_path, matchday_date=("2025-09-20", "2025-09-25"), post_friendly=True)
+    assert "— 2025-09-20 to 2025-09-25" in out
+    assert "[" not in out
+
+
+def test_post_friendly_distinguishes_no_matches_from_no_clearing_picks(db_path, conn, capsys):
+    # No matches at all on this date -> a plain "no matches" message.
+    out = _run_card(capsys, db_path, matchday_date="2025-09-22", post_friendly=True)
+    assert "No matches today" in out
+
+    # Real matches existed but none cleared the guardrail -- a different,
+    # more informative message (found live 2026-08-21: with no distinction,
+    # a real no-picks day was indistinguishable from a possible bug). Tested
+    # directly against print_post_friendly() -- forcing a real match's odds to
+    # genuinely clear zero EV isn't reliable to construct through the full
+    # pipeline, and this is the exact boundary the fix is about.
+    capsys.readouterr()   # clear the previous call's captured output
+    gclc.print_post_friendly("Serie A", ["2025-09-22"], [], match_count=3)
+    out = capsys.readouterr().out
+    assert "No guardrail-clear picks today" in out
+    assert "3 matches" in out
+
+
+def test_post_friendly_still_stores_picks_unless_dry_run(db_path, conn, capsys):
+    match_id = _seed_lopsided_league(conn)
+    cur = conn.cursor()
+    cur.execute("UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+               ("2025-09-22T18:00:00.000Z", match_id))
+    conn.commit()
+
+    _run_card(capsys, db_path, matchday_date="2025-09-22", post_friendly=True)
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    assert cur.fetchone()[0] > 0
+
+
+# ── bare invocation must be a safe no-op (2026-08-21) ──────────────────────────────
+
+def test_no_args_prints_help_and_does_not_write_picks(db_path, conn, capsys):
+    with patch("generate_club_league_card.DATABASE_PATH", db_path):
+        import sys
+        old_argv = sys.argv
+        sys.argv = ["generate_club_league_card.py"]
+        try:
+            gclc.main()
+            raised = False
+        except SystemExit as e:
+            raised = True
+            assert e.code == 0
+        finally:
+            sys.argv = old_argv
+
+    assert raised
+    out = capsys.readouterr().out
+    # Not asserting the exact "usage: generate_club_league_card.py" prog name --
+    # under pytest (python -m pytest), argparse derives prog from sys.orig_argv
+    # rather than the sys.argv this test patches (a Python 3.14 argparse
+    # behavior, confirmed in isolation), so that part of the real script's
+    # output can't be reproduced faithfully here. What matters is that this is
+    # the REAL, full help text (not a truncated/wrong one) and nothing ran.
+    assert out.startswith("usage:")
+    assert "--league" in out
+    assert "--matchday-date" in out
+    assert "--post-friendly" in out
+
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
+    assert cur.fetchone()[0] == 0
+
+
+# ── model version tracking (2026-08-21) ─────────────────────────────────────────────
+
+def test_stored_picks_are_tagged_with_the_model_version(db_path, conn, capsys):
+    match_id = _seed_lopsided_league(conn)
+    cur = conn.cursor()
+    cur.execute("UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+               ("2025-09-22T18:00:00.000Z", match_id))
+    conn.commit()
+
+    _run_card(capsys, db_path, matchday_date="2025-09-22")
+
+    cur.execute("SELECT DISTINCT method FROM soccer_club_league_picks")
+    methods = {row[0] for row in cur.fetchall()}
+    assert methods == {gclc.CARD_MODEL_VERSION}
