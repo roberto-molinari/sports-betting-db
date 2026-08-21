@@ -1,8 +1,18 @@
 """
-Per-league team-name maps: football-data.co.uk's short CSV team name -> the
-canonical name already stored in soccer_teams (TheStatsAPI-sourced for every league
+Per-league team-name maps: a source's own team-name spelling -> the canonical
+name already stored in soccer_teams (TheStatsAPI-sourced for every league
 except Serie A, which stays on football-data.org until the tracked fast-follow
 migration -- see BUGS.md and core/leagues.py).
+
+Two source vocabularies share one map per league (canonical_team_name() is
+used by both): football-data.co.uk's short CSV names (historical odds,
+import_league_betting_odds.py --download / import_league_market_odds.py) and
+The Odds API's own, usually longer, names (live odds, import_league_betting_
+odds.py --future-only) -- entries from the latter are commented inline since
+they're not obvious from the key alone. Found live 2026-08-21: 9 Odds API
+names across 4 leagues were unmapped, silently blocking live odds for
+whichever matches involved those teams (e.g. Inter vs Monza never got a
+price because "Inter Milan" -- The Odds API's spelling -- had no entry).
 
 Consolidates what were three independent, Serie-A-only, hand-maintained maps
 (update_serie_a_results.py's CSV_TEAM_NAME_MAP/API_TEAM_NAME_MAP,
@@ -26,6 +36,7 @@ lists -- zero names were left unmatched for either season actually in scope.
 TEAM_NAME_MAPS = {
     "Serie A": {
         "Atalanta": "Atalanta",
+        "Atalanta BC": "Atalanta",       # The Odds API's name, not football-data.co.uk's
         "Bologna": "Bologna",
         "Cagliari": "Cagliari Calcio",
         "Como": "Como 1907",
@@ -35,6 +46,7 @@ TEAM_NAME_MAPS = {
         "Frosinone": "Frosinone Calcio",
         "Genoa": "Genoa CFC",
         "Inter": "Inter",
+        "Inter Milan": "Inter",          # The Odds API's name, not football-data.co.uk's
         "Juventus": "Juventus",
         "Lazio": "Lazio",
         "Lecce": "Lecce",
@@ -57,6 +69,7 @@ TEAM_NAME_MAPS = {
         "Bournemouth": "Bournemouth",
         "Brentford": "Brentford",
         "Brighton": "Brighton & Hove Albion",
+        "Brighton and Hove Albion": "Brighton & Hove Albion",   # The Odds API's name
         "Burnley": "Burnley",
         "Chelsea": "Chelsea",
         "Crystal Palace": "Crystal Palace",
@@ -79,12 +92,16 @@ TEAM_NAME_MAPS = {
     },
     "Bundesliga": {
         "Augsburg": "FC Augsburg",
+        "Bayer Leverkusen": "Bayer 04 Leverkusen",   # The Odds API's name
         "Bayern Munich": "FC Bayern München",
         "Bochum": "VfL Bochum 1848",
+        "Borussia Monchengladbach": "Borussia M'gladbach",   # The Odds API's name
         "Darmstadt": "Darmstadt 98",
         "Dortmund": "Borussia Dortmund",
         "Ein Frankfurt": "Eintracht Frankfurt",
+        "Elversberg": "SV 07 Elversberg",   # The Odds API's name
         "FC Koln": "1. FC Köln",
+        "FSV Mainz 05": "1. FSV Mainz 05",   # The Odds API's name
         "Freiburg": "SC Freiburg",
         "Hamburg": "Hamburger SV",
         "Heidenheim": "1. FC Heidenheim",
@@ -95,6 +112,7 @@ TEAM_NAME_MAPS = {
         "M'gladbach": "Borussia M'gladbach",
         "Mainz": "1. FSV Mainz 05",
         "RB Leipzig": "RB Leipzig",
+        "SC Paderborn": "SC Paderborn 07",   # The Odds API's name
         "Schalke 04": "FC Schalke 04",
         "St Pauli": "FC St. Pauli",
         "Stuttgart": "VfB Stuttgart",
@@ -107,11 +125,14 @@ TEAM_NAME_MAPS = {
         "Almeria": "Almería",
         "Ath Bilbao": "Athletic Club",
         "Ath Madrid": "Atlético Madrid",
+        "Athletic Bilbao": "Athletic Club",   # The Odds API's name
         "Barcelona": "Barcelona",
         "Betis": "Real Betis",
+        "CA Osasuna": "Osasuna",   # The Odds API's name
         "Cadiz": "Cádiz",
         "Celta": "Celta Vigo",
         "Elche": "Elche",
+        "Elche CF": "Elche",   # The Odds API's name
         "Espanol": "Espanyol",
         "Getafe": "Getafe",
         "Girona": "Girona FC",
@@ -122,6 +143,7 @@ TEAM_NAME_MAPS = {
         "Osasuna": "Osasuna",
         "Oviedo": "Real Oviedo",
         "Real Madrid": "Real Madrid",
+        "Real Racing Club de Santander": "Racing de Santander",   # The Odds API's name
         "Sevilla": "Sevilla",
         "Sociedad": "Real Sociedad",
         "Valencia": "Valencia",
@@ -135,6 +157,7 @@ TEAM_NAME_MAPS = {
         "Brest": "Stade Brestois",
         "Clermont": "Clermont Foot",
         "Le Havre": "Le Havre",
+        "Le Mans FC": "Le Mans",   # The Odds API's name
         "Lens": "RC Lens",
         "Lille": "Lille",
         "Lorient": "Lorient",
@@ -147,6 +170,7 @@ TEAM_NAME_MAPS = {
         "Nice": "Nice",
         "Paris FC": "Paris FC",
         "Paris SG": "Paris Saint-Germain",
+        "Paris Saint Germain": "Paris Saint-Germain",   # The Odds API's name
         "Reims": "Stade de Reims",
         "Rennes": "Stade Rennais",
         "St Etienne": "Saint-Étienne",
