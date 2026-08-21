@@ -19,8 +19,14 @@ gaps should be checked and documented the same way before trusting its numbers):
            Betfair Exchange is complete through March 2026, mostly complete after
            (359/380 opening, 360/380 closing); Bet365 is complete (380/380).
 
-Odds are devigged (overround removed) via the standard multiplicative method:
-p_fair = (1/odds) / sum((1/odds) across home+draw+away).
+Odds are devigged (overround removed) via the power method (2026-08-20, replacing
+the earlier proportional method -- see devig()'s own docstring for why: proportional
+devig leaves a real favorite-longshot bias in p_*_fair, measured at calibration slope
+1.154 against realized outcomes, BUGS.md BUG-009). A bad/degenerate row (overround
+<= 1.0 -- no real book prices this way; a data glitch, not a market to correct) falls
+back to the old proportional formula for that row only, and is appended to
+DEVIG_FALLBACK_LOG_PATH so these stay visible across runs instead of scrolling off
+in stdout.
 
 Conflict-safe writes: soccer_market_odds has no natural upsert (add_soccer_market_odds
 is a plain insert; clear_soccer_market_odds + reinsert is the existing "upsert"
@@ -40,6 +46,8 @@ import csv
 import io
 import sqlite3
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
 from core.sports_db import (
     DATABASE_PATH,
@@ -50,6 +58,12 @@ from core.leagues import LEAGUES, FOOTBALLDATACOUK_SEASON_CODE
 from core.team_name_maps import canonical_team_name
 
 FD_URL = "https://www.football-data.co.uk/mmz4281/{code}/{league_code}.csv"
+
+# Durable, git-tracked record of devig()'s proportional-fallback rows (see that
+# function's docstring) -- these should be rare (a real book's overround is always
+# >1), so a running append-only log across every import run is more useful than a
+# print buried in one run's stdout, for noticing if they start happening often.
+DEVIG_FALLBACK_LOG_PATH = Path(__file__).parent / "devig_overround_warnings.log"
 
 # (source label, opening column names, closing column names)
 SOURCES = [
@@ -69,11 +83,69 @@ def fetch_csv_rows(league, season_code):
     return list(csv.DictReader(io.StringIO(text)))
 
 
-def devig(home_odds, draw_odds, away_odds):
-    """Multiplicative devig: p_fair = (1/odds) / sum(1/odds)."""
-    raw_h, raw_d, raw_a = 1 / home_odds, 1 / draw_odds, 1 / away_odds
-    total = raw_h + raw_d + raw_a
-    return raw_h / total, raw_d / total, raw_a / total
+def log_devig_fallback(home_odds, draw_odds, away_odds, overround, context=""):
+    """Append one line to DEVIG_FALLBACK_LOG_PATH -- see that constant's comment."""
+    ts = datetime.now(timezone.utc).isoformat()
+    with open(DEVIG_FALLBACK_LOG_PATH, "a") as f:
+        f.write(f"{ts}  overround={overround:.4f} <= 1.0, used proportional fallback  "
+                f"odds=({home_odds}, {draw_odds}, {away_odds})  {context}\n")
+
+
+def _proportional_devig(raw):
+    total = sum(raw)
+    return tuple(r / total for r in raw)
+
+
+def devig(home_odds, draw_odds, away_odds, context=""):
+    """Power-method devig (2026-08-20, replacing the old proportional method):
+    solve for the single exponent k > 0 such that sum((1/odds_i)^k) = 1, then
+    p_fair_i = (1/odds_i)^k. Unlike proportional devig (p_i = r_i / sum(r_i), which
+    shrinks every outcome by the SAME percentage), raising each r_i = 1/odds_i to a
+    power k > 1 shrinks a LONGSHOT's small r_i proportionally more than a favorite's
+    large r_i -- which is the correction actually needed: proportional devig was
+    measured leaving a real favorite-longshot bias in p_*_fair (calibration slope
+    1.154 against realized outcomes, i.e. longshots win even less often than its
+    fair-p implies -- BUGS.md BUG-009, 2026-08-20).
+
+    A real book's overround (sum of raw implied probabilities r_h+r_d+r_a) is always
+    > 1 -- that IS the vig. sum(r_i^k) is strictly decreasing in k (each r_i is in
+    (0, 1)), running from sum(r_i^0)=3 down to 0 as k -> infinity, so there is
+    exactly one root and it's found by ordinary bisection starting from k=1 (where
+    sum(r_i^1) = the overround, > 1) and doubling the upper bound until the sum
+    drops below 1.
+
+    If overround <= 1.0 (a data glitch -- no real sportsbook prices a 3-way market
+    at or under fair value), a root would still exist mathematically but at k <= 1,
+    which would INFLATE every probability's spread instead of correcting it -- the
+    opposite of what devig is for. That row falls back to the old proportional
+    formula instead, and is logged to DEVIG_FALLBACK_LOG_PATH (see log_devig_fallback)
+    so these are visible across runs, not just this one's stdout."""
+    raw = (1 / home_odds, 1 / draw_odds, 1 / away_odds)
+    overround = sum(raw)
+    if overround <= 1.0:
+        log_devig_fallback(home_odds, draw_odds, away_odds, overround, context)
+        return _proportional_devig(raw)
+
+    def f(k):
+        return sum(r ** k for r in raw)
+
+    lo, hi = 1.0, 2.0
+    while f(hi) > 1.0:
+        hi *= 2
+        if hi > 1e6:   # pathological input guard -- should be unreachable given the overround check above
+            return _proportional_devig(raw)
+
+    for _ in range(100):   # ample for float64 precision via bisection
+        mid = (lo + hi) / 2
+        if f(mid) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-12:
+            break
+
+    k = (lo + hi) / 2
+    return tuple(r ** k for r in raw)
 
 
 def get_team_id(cur, league, name):
@@ -156,7 +228,9 @@ def import_line_type(conn, cur, league, rows, season, source_label, line_type, h
     # docstring) -- the diff above is purely for visibility, done before the write.
     clear_soccer_market_odds(league, season, source_label, line_type, conn=conn)
     for match_id, (h_odds, d_odds, a_odds) in new_by_match.items():
-        p_h, p_d, p_a = devig(h_odds, d_odds, a_odds)
+        p_h, p_d, p_a = devig(h_odds, d_odds, a_odds,
+                              context=f"league={league} season={season} source={source_label} "
+                                      f"line_type={line_type} match_id={match_id}")
         add_soccer_market_odds(
             match_id=match_id, league=league, source=source_label, line_type=line_type,
             home_odds=h_odds, draw_odds=d_odds, away_odds=a_odds,
