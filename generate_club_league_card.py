@@ -13,10 +13,12 @@ roster, not a point-in-time reconstruction).
 
 Applies CLUB_LEAGUE_MIN_PICK_PROBABILITY as a guardrail (BUG-003's pattern, via the
 shared core.pick_guardrails -- BUG-009 2026-08-05 found this had never been ported
-from the WC card generator), plus CLUB_LEAGUE_MIN_MARKET_PROBABILITY on the market's
-own implied probability (BUG-009 re-diagnosis, 2026-08-20 -- see that constant's
-comment). No cap: swept on top of the xG-stretch fix and found close to inert
-(BUGS.md, BUG-009, 2026-08-07 addendum) -- the two floors are the validated
+from the WC card generator), plus a market-side floor on the market's own implied
+probability (BUG-009 re-diagnosis, 2026-08-20 -- see market_floor_for_league()'s
+comment) -- CLUB_LEAGUE_MIN_MARKET_PROBABILITY by default, with a per-league
+override for the two leagues that showed real, sustained signal for a different
+value (2026-08-21). No cap: swept on top of the xG-stretch fix and found close to
+inert (BUGS.md, BUG-009, 2026-08-07 addendum) -- the two floors are the validated
 guardrails here, not floor+cap.
 
 Only surfaces genuine positive-EV, guardrail-clear candidates (unlike the old
@@ -64,14 +66,45 @@ CLUB_LEAGUE_MIN_PICK_PROBABILITY = 0.25
 # as a longshot, model says >= 0.25) because a huge model-vs-market gap on a
 # corr-0.83 model is far more likely estimation noise than edge, and the
 # proportional devig's residual favorite-longshot bias makes long odds look fairer
-# than they are (BUGS.md, BUG-009, 2026-08-20 -- both mechanisms measured). Swept
-# 0.25-0.40 on stored poisson_v4_4 vs Bet365 closing (5 leagues, 3 seasons,
-# best-EV-per-match): improvement is large and improves EVERY season individually up
-# to ~0.30-0.32, flattening into thin-sample ROI noise beyond. 0.32 on this
-# vig-inclusive scale corresponds to the fair-probability 0.30 the diagnosis
-# validated (Bet365 1X2 overround ~5%): total loss -409.6 -> -71 units, ROI
-# -11.4% -> -4.3%. Not applied to the WC pipeline (different data, never swept there).
-CLUB_LEAGUE_MIN_MARKET_PROBABILITY = 0.32
+# than they are (BUGS.md, BUG-009, 2026-08-20 -- both mechanisms measured).
+#
+# Re-swept 2026-08-21 (post power-devig() + 2022-23 backfill for the 4 new leagues,
+# ~2x the data behind the original 0.32): implied 0.32-0.35 turned out to be a
+# specifically weak zone -- the market itself overstates outcomes there (its own
+# realized-vs-implied gap is the worst of any nearby band, present in every league/
+# season checked), and the model's usual overconfidence relative to the market gets
+# amplified on top of that. 0.35 is the largest floor before the curve flattens into
+# thin-sample noise on the pooled data (5 leagues x 4 seasons): bets 2660->2214,
+# profit -$157.40 -> -$58.86. Every league improves individually, including the one
+# already-profitable league -- see BUGS.md.
+CLUB_LEAGUE_MIN_MARKET_PROBABILITY = 0.35
+
+# Per-league override (2026-08-21): most leagues showed no reliable signal for a
+# different floor once checked with a smoothed sliding-window fit (not just the raw
+# per-league sweep table, which is noisy enough at ~1,000-1,300 candidates/league to
+# manufacture a fake "optimum" -- exactly the trap the 0.32-0.35 band investigation
+# above was caught in once, at the pooled level). Only two leagues showed a real,
+# wide, sustained positive-ROI zone under smoothing: Premier League (positive from
+# ~0.22 to ~0.42) and La Liga (negative until ~0.38, then positive). Both are
+# clamped to within +/-0.05 of CLUB_LEAGUE_MIN_MARKET_PROBABILITY -- deliberately
+# not their raw full-strength targets (Premier League's smoothed zone starts as low
+# as ~0.22-0.25) -- high-ROI tails in a backtest this size (EV>10% segments) are
+# more likely to be small-sample luck than a real, durable edge against professional
+# closing lines, so the clamp intentionally keeps these closer to the larger, more
+# stable pooled evidence rather than chasing one league's best-looking number.
+# Leagues not listed here use the shared floor above.
+CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE = {
+    "Premier League": 0.30,
+    "La Liga": 0.40,
+}
+
+
+def market_floor_for_league(league):
+    """The market-side guardrail floor to use for `league` -- its own override if
+    one exists (CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE), else the shared default
+    (CLUB_LEAGUE_MIN_MARKET_PROBABILITY). Single source of truth so the live card,
+    backtest_from_predictions.py, and model_metrics_report.py can't drift apart."""
+    return CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE.get(league, CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
 
 
 def load_team_ids(conn, league, season):
@@ -198,7 +231,7 @@ def main():
             candidates = build_candidates(row, result)
             for c in candidates:
                 c["excluded_by"] = guardrail_reasons(c["prob"], c["implied"], CLUB_LEAGUE_MIN_PICK_PROBABILITY,
-                                                     market_floor=CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
+                                                     market_floor=market_floor_for_league(args.league))
 
             clean = [c for c in candidates if not c["excluded_by"] and c["ev"] > 0]
             excluded_log.extend(c for c in candidates if c["excluded_by"] and c["ev"] > 0)
@@ -220,8 +253,9 @@ def main():
     ranked_matches.sort(key=lambda picks: picks[0]["ev"], reverse=True)
 
     def fmt_pick(rank_label, pick):
+        match_date = strength.match_calendar_date(pick["match_date"])
         return (
-            f"{rank_label:>3} {pick['home']} vs {pick['away']} | {pick['side']:<9} "
+            f"{rank_label:>3} {match_date} {pick['home']} vs {pick['away']} | {pick['side']:<9} "
             f"| odds {pick['odds']:+.0f} | model p {pick['prob']:.3f} | EV {pick['ev']:+.1%} | stake 1.00u"
         )
 
@@ -241,7 +275,8 @@ def main():
     if excluded_log:
         print(f"=== GUARDRAIL LOG ({len(excluded_log)} positive-EV candidates excluded) ===")
         for c in sorted(excluded_log, key=lambda c: c["ev"], reverse=True):
-            print(f"    {c['home']} vs {c['away']} | {c['side']:<9} | model p {c['prob']:.3f} "
+            match_date = strength.match_calendar_date(c["match_date"])
+            print(f"    {match_date} {c['home']} vs {c['away']} | {c['side']:<9} | model p {c['prob']:.3f} "
                   f"| EV {c['ev']:+.1%} | {' & '.join(c['excluded_by'])}")
 
     conn.close()

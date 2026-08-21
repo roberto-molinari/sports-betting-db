@@ -66,7 +66,8 @@ import compute_club_player_strength as strength
 import compare_model_vs_market_odds as cmvmo
 import backtest_from_predictions as bfp
 from generate_club_league_card import (CLUB_LEAGUE_MIN_PICK_PROBABILITY,
-                                       CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
+                                       CLUB_LEAGUE_MIN_MARKET_PROBABILITY,
+                                       market_floor_for_league)
 
 SNAPSHOT_DIR = Path(__file__).parent / "model_snapshots"
 DEFAULT_METHOD = "poisson_v4"
@@ -281,14 +282,22 @@ def pooled_bias(conn, leagues, seasons, method, sharp_source):
     return cmvmo.summarize(all_pairs) if all_pairs else None
 
 
-def _guardrail_header_line(guardrail_floor, guardrail_market_floor, suffix):
+def _guardrail_header_line(guardrail_floor, guardrail_market_floor, suffix, league=None):
     """One consistent 'Guardrail: ...' report-header line for whichever of the two
-    floors (model-probability, market-probability -- BUG-009 2026-08-20) are set."""
+    floors (model-probability, market-probability -- BUG-009 2026-08-20) are set.
+    guardrail_market_floor is truthy/None now (2026-08-21 per-league override) --
+    if `league` is given (single-league report), the actual resolved value for
+    that league is shown; otherwise (all-up, many leagues) it's labeled
+    per-league since no single number applies."""
     parts = []
     if guardrail_floor is not None:
         parts.append(f"floor={guardrail_floor:g}")
-    if guardrail_market_floor is not None:
-        parts.append(f"market_floor={guardrail_market_floor:g}")
+    if guardrail_market_floor:
+        if league is not None:
+            parts.append(f"market_floor={market_floor_for_league(league):g}")
+        else:
+            parts.append(f"market_floor=per-league (default {CLUB_LEAGUE_MIN_MARKET_PROBABILITY:g}, "
+                         f"see generate_club_league_card.CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE)")
     if not parts:
         return ("Guardrail: none -- ROI below is raw model ROI, every EV-positive candidate "
                 "regardless of probability (unchanged from before --guardrail existed)")
@@ -346,7 +355,8 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
     lines.append(f"Seasons: {seasons}")
     lines.append(f"Note: {note}")
     lines.append(_guardrail_header_line(guardrail_floor, guardrail_market_floor,
-                                        "(ROI below reflects only guardrail-clear candidates)"))
+                                        "(ROI below reflects only guardrail-clear candidates)",
+                                        league=league))
     lines.append(f"Scope: matches before {METRICS_MIN_MATCH_DATE} excluded from every metric "
                   f"(2022 cold-start burn-in -- BUGS.md WATCH entry, 2026-08-20; "
                   f"season 2022 is a deliberate partial season)")
@@ -685,7 +695,7 @@ def main():
                              "off: today's unchanged raw-model ROI.")
     args = parser.parse_args()
     guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
-    guardrail_market_floor = CLUB_LEAGUE_MIN_MARKET_PROBABILITY if args.guardrail else None
+    guardrail_market_floor = args.guardrail   # resolved per-league inside backtest_from_predictions
     note = args.note if args.note is not None else "(console-only preview -- not persisted)"
 
     conn = sqlite3.connect(DATABASE_PATH)

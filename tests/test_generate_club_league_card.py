@@ -179,3 +179,23 @@ def test_card_rerun_replaces_ungraded_picks_not_stack(db_path, conn, capsys):
     _run_card(capsys, db_path)   # re-run, same inputs -- must replace, not double
     cur.execute("SELECT COUNT(*) FROM soccer_club_league_picks")
     assert cur.fetchone()[0] == first_count
+
+
+# ── market_floor_for_league (2026-08-21 per-league override) ──────────────────────
+
+def test_market_floor_for_league_uses_override_when_present():
+    assert gclc.market_floor_for_league("Premier League") == 0.30
+    assert gclc.market_floor_for_league("La Liga") == 0.40
+
+
+def test_market_floor_for_league_falls_back_to_shared_default():
+    assert gclc.market_floor_for_league("Serie A") == gclc.CLUB_LEAGUE_MIN_MARKET_PROBABILITY
+    assert gclc.market_floor_for_league("A League Not In The Override Dict") == gclc.CLUB_LEAGUE_MIN_MARKET_PROBABILITY
+
+
+def test_per_league_overrides_within_5pp_of_shared_default():
+    # The clamp discipline this session settled on -- deviations from the shared
+    # floor should stay modest rather than chase one league's best-looking, likely
+    # noisiest number (BUGS.md, 2026-08-21).
+    for league, floor in gclc.CLUB_LEAGUE_MARKET_PROBABILITY_BY_LEAGUE.items():
+        assert abs(floor - gclc.CLUB_LEAGUE_MIN_MARKET_PROBABILITY) <= 0.05 + 1e-9

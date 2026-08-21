@@ -28,8 +28,7 @@ import sqlite3
 from core.sports_db import DATABASE_PATH
 from core.poisson_model import american_to_decimal, american_to_implied_prob, compute_ev
 from core.pick_guardrails import guardrail_reasons
-from generate_club_league_card import (CLUB_LEAGUE_MIN_PICK_PROBABILITY,
-                                       CLUB_LEAGUE_MIN_MARKET_PROBABILITY)
+from generate_club_league_card import CLUB_LEAGUE_MIN_PICK_PROBABILITY, market_floor_for_league
 
 DEFAULT_SPORTSBOOK = "Bet365"
 
@@ -102,14 +101,18 @@ def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPO
     simplification.
 
     guardrail_market_floor: same deal for the MARKET-side floor (BUG-009
-    re-diagnosis, 2026-08-20 -- CLUB_LEAGUE_MIN_MARKET_PROBABILITY): reject any
-    candidate whose vig-inclusive implied probability (from this sportsbook's own
-    moneyline, the same american_to_implied_prob the live card uses) is below it.
-    None (default) skips the check.
+    re-diagnosis, 2026-08-20 -- CLUB_LEAGUE_MIN_MARKET_PROBABILITY), truthy to
+    apply it: reject any candidate whose vig-inclusive implied probability (from
+    this sportsbook's own moneyline, the same american_to_implied_prob the live
+    card uses) is below it. Resolved PER LEAGUE via market_floor_for_league()
+    (2026-08-21 per-league override) rather than passed in as a literal value, so
+    this can never drift from what the live card generator actually applies.
+    None/False (default) skips the check.
 
     min_match_date: optional ISO-date lower bound on graded matches, passed to
     load_predictions -- see _min_date_clause's docstring. None (default) grades
     the whole season, unchanged."""
+    market_floor = market_floor_for_league(league) if guardrail_market_floor else None
     rows = load_predictions(conn, league, season, method, sportsbook=sportsbook,
                             min_match_date=min_match_date)
     total_staked = total_profit = 0.0
@@ -128,10 +131,10 @@ def grade_1x2(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPO
             ev = compute_ev(p_model, ml)
             if ev <= ev_threshold:
                 continue
-            if (guardrail_floor is not None or guardrail_market_floor is not None) and \
+            if (guardrail_floor is not None or market_floor is not None) and \
                     guardrail_reasons(p_model, american_to_implied_prob(ml),
                                       guardrail_floor if guardrail_floor is not None else 0.0,
-                                      market_floor=guardrail_market_floor):
+                                      market_floor=market_floor):
                 continue
             stake = 1.0
             won = (side == actual)
@@ -169,8 +172,8 @@ def run(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SPORTSBOO
                       guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
                       min_match_date=min_match_date)
     guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
-    if guardrail_market_floor is not None:
-        guardrail_note += f" | market floor {guardrail_market_floor:g}"
+    if guardrail_market_floor:
+        guardrail_note += f" | market floor {market_floor_for_league(league):g}"
     label = (f"{method} | {league} season {season} | vs {sportsbook} | "
              f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
@@ -185,7 +188,10 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
     guardrail_floor: see grade_1x2's docstring -- the live card generator applies
     the same floor to OVER/UNDER candidates as it does to HOME/DRAW/AWAY
     (build_candidates() screens both through one guardrail_reasons() call), so
-    this mirrors that rather than treating totals as ungated."""
+    this mirrors that rather than treating totals as ungated.
+    guardrail_market_floor: see grade_1x2's docstring -- truthy to apply, resolved
+    per league via market_floor_for_league()."""
+    market_floor = market_floor_for_league(league) if guardrail_market_floor else None
     rows = load_totals_predictions(conn, league, season, method, sportsbook=sportsbook,
                                    min_match_date=min_match_date)
     total_staked = total_profit = 0.0
@@ -206,10 +212,10 @@ def grade_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_
             ev = compute_ev(p_model, odds)
             if ev <= ev_threshold:
                 continue
-            if (guardrail_floor is not None or guardrail_market_floor is not None) and \
+            if (guardrail_floor is not None or market_floor is not None) and \
                     guardrail_reasons(p_model, american_to_implied_prob(odds),
                                       guardrail_floor if guardrail_floor is not None else 0.0,
-                                      market_floor=guardrail_market_floor):
+                                      market_floor=market_floor):
                 continue
             stake = 1.0
             won = (side == actual)
@@ -239,8 +245,8 @@ def run_totals(conn, league, season, method, ev_threshold, sportsbook=DEFAULT_SP
                          guardrail_floor=guardrail_floor, guardrail_market_floor=guardrail_market_floor,
                          min_match_date=min_match_date)
     guardrail_note = f" | guardrail floor {guardrail_floor:g}" if guardrail_floor is not None else ""
-    if guardrail_market_floor is not None:
-        guardrail_note += f" | market floor {guardrail_market_floor:g}"
+    if guardrail_market_floor:
+        guardrail_note += f" | market floor {market_floor_for_league(league):g}"
     label = (f"{method} | {league} season {season} | vs {sportsbook} | TOTALS | "
              f"EV threshold {ev_threshold:+.1%}{guardrail_note} | {stats['n_graded']} graded matches")
     print_grading_report(stats, label)
@@ -271,7 +277,7 @@ def main():
                              "Default off: unchanged raw-model ROI.")
     args = parser.parse_args()
     guardrail_floor = CLUB_LEAGUE_MIN_PICK_PROBABILITY if args.guardrail else None
-    guardrail_market_floor = CLUB_LEAGUE_MIN_MARKET_PROBABILITY if args.guardrail else None
+    guardrail_market_floor = args.guardrail   # resolved per-league inside grade_1x2/grade_totals
 
     conn = sqlite3.connect(DATABASE_PATH)
     if args.market in ("1x2", "both"):
