@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**70+ scripts live in the repo root.** Before running one you haven't used before,
+check `TOOLS.md` — it sorts every root script into "you'll actually run this" vs.
+internal/one-off/experimental, so picking one by a plausible-sounding name doesn't
+end in a confusing surprise.
+
 ## Commands
 
 ```bash
