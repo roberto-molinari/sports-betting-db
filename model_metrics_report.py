@@ -374,7 +374,7 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
         pooled_total += score * n
         pooled_n += n
     if pooled_n:
-        lines.append(f"  pooled: Brier = {pooled_total/pooled_n:.4f}  (n={pooled_n})")
+        lines.append(format_brier_line("pooled Brier", pooled_total / pooled_n, pooled_n, num_classes=3))
     lines.append("")
 
     lines.append("## Brier score, TOTALS/over-under (lower is better; naive baseline ~0.5 -- "
@@ -386,7 +386,7 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
         pooled_total += score * n
         pooled_n += n
     if pooled_n:
-        lines.append(f"  pooled: Brier = {pooled_total/pooled_n:.4f}  (n={pooled_n})")
+        lines.append(format_brier_line("pooled Brier", pooled_total / pooled_n, pooled_n, num_classes=2))
     lines.append("")
 
     lines.append(f"## Compression-bucket table (model p_home - {sharp_source} closing p_home, by market's own p_home)")
@@ -439,6 +439,45 @@ def build_report(conn, league, seasons, method, sharp_source, note, guardrail_fl
     return "\n".join(lines)
 
 
+def brier_naive_baseline(num_classes):
+    """The naive 'predict the uniform 1/K for every class, always' Brier score,
+    on our raw [0, 2] sum-of-squared-errors scale: (K-1)/K. K=2 (totals) -> 0.5,
+    K=3 (1X2) -> 0.667 -- these are the real 'no-skill' reference lines, and they
+    are NOT interchangeable: a 1X2 score has to beat 0.667, a totals score has to
+    beat 0.5. Borrowing one market's baseline for the other's score (or borrowing
+    an external binary benchmark table's 0.25 for a 3-class number) silently
+    misjudges the model."""
+    return (num_classes - 1) / num_classes
+
+
+def format_brier_line(label, b, n, num_classes=None, baseline=None, suffix=""):
+    """One Brier line in both conventions at once: our native [0, 2] sum-of-
+    squared-error scale (unchanged, matches every existing snapshot in
+    model_snapshots/) plus the [0, 1] single-term scale most external write-ups
+    and benchmark tables use. The two are NOT independently measured -- halving
+    is an exact rescale, always valid, because our sum-of-squared-errors score
+    is bounded [0, 2] for any number of outcome classes (a maximally wrong call
+    only ever misses on exactly two components: the class that should have been
+    1, and the class wrongly given a 1). Each scale is shown against its own
+    matching no-skill baseline, plus the signed delta between them (negative =
+    beats baseline, since lower Brier is better) -- asked for explicitly after
+    finding that an external dashboard's 0.25 baseline (a BINARY convention)
+    doesn't apply to our 3-class 1X2 number, whose real baseline is 0.333.
+
+    Pass num_classes (2 or 3) for a single-market number. Pass an explicit
+    `baseline` (already on the raw [0, 2] scale) instead when the number pools
+    markets with different class counts together (see pooled_brier_across_markets),
+    where a single num_classes value wouldn't be meaningful."""
+    if baseline is None:
+        baseline = brier_naive_baseline(num_classes)
+    scaled, baseline_scaled = b / 2, baseline / 2
+    delta = scaled - baseline_scaled
+    verdict = "beats" if delta < 0 else "worse than"
+    return (f"  {label}: {b:.4f}  (n={n}{suffix})\n"
+            f"    0-1 scale: {scaled:.4f}  vs no-skill baseline {baseline_scaled:.4f}  "
+            f"(Δ {delta:+.4f}, {verdict} baseline)")
+
+
 def pooled_brier_across_markets(conn, leagues, seasons, method):
     """True cross-market Brier: pools 1X2 and totals squared-error sums into ONE
     number. Legitimate, not just convenient -- both are sum-of-squared-probability-
@@ -483,7 +522,12 @@ def _all_up_block(conn, leagues, seasons, method, sharp_source, guardrail_floor=
     presented as if it covered both markets."""
     lines = []
     b, n = pooled_brier_across_markets(conn, leagues, seasons, method)
-    lines.append(f"  Brier: {b:.4f}  (n={n}, 1X2 + totals pooled)")
+    _, n1x2 = pooled_brier(conn, leagues, seasons, method, totals=False)
+    _, ntot = pooled_brier(conn, leagues, seasons, method, totals=True)
+    pooled_baseline = ((brier_naive_baseline(3) * n1x2 + brier_naive_baseline(2) * ntot) / n
+                        if n else float("nan"))
+    lines.append(format_brier_line("Brier", b, n, baseline=pooled_baseline,
+                                    suffix=", 1X2 + totals pooled"))
 
     bias = pooled_bias(conn, leagues, seasons, method, sharp_source)
     if bias:
@@ -507,9 +551,9 @@ def _both_markets_block(conn, leagues, seasons, method, sharp_source, guardrail_
     number -- the block used for the ALL-UP section and each BY LEAGUE entry."""
     lines = []
     b1x2, n1x2 = pooled_brier(conn, leagues, seasons, method, totals=False)
-    lines.append(f"  1X2 Brier:      {b1x2:.4f}  (n={n1x2})")
+    lines.append(format_brier_line("1X2 Brier", b1x2, n1x2, num_classes=3))
     btot, ntot = pooled_brier(conn, leagues, seasons, method, totals=True)
-    lines.append(f"  Totals Brier:   {btot:.4f}  (n={ntot})")
+    lines.append(format_brier_line("Totals Brier", btot, ntot, num_classes=2))
 
     bias = pooled_bias(conn, leagues, seasons, method, sharp_source)
     if bias:
@@ -538,7 +582,7 @@ def _single_market_block(conn, leagues, seasons, method, sharp_source, totals, g
     section, which is already scoped to a single market per subsection."""
     lines = []
     b, n = pooled_brier(conn, leagues, seasons, method, totals=totals)
-    lines.append(f"  Brier: {b:.4f}  (n={n})")
+    lines.append(format_brier_line("Brier", b, n, num_classes=2 if totals else 3))
 
     if totals:
         lines.append("  Bias:  not available (no sharp-book O/U data ingested -- FEATURE-015)")
