@@ -9,6 +9,106 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-021 — Routine match completions logged as loud, all-caps `CONFLICT` -- read as an error by a first-time user for something entirely expected — **FIXED 2026-08-24**
+
+- **Type:** UX / logging design (alarming language for a non-event) · **Severity:**
+  low (no data or behavior was wrong, just confusing output) · **Found:**
+  2026-08-24, user ran `club_league_scorecard.py --dry-run`, saw `CONFLICT`
+  lines for two ordinary Ligue 1 matches that had simply finished, and asked
+  "before fixing anything, tell me what went wrong" -- correctly suspecting a
+  regression that, on inspection, wasn't one (see BUG-019 for the other half
+  of that same report, which WAS a real, expected recurrence).
+
+**Root cause.** `import_league_matches.py`'s conflict-safe-write logging
+treated every detected diff the same way — printed as `CONFLICT ... stored=X
+api=Y`, regardless of whether the diff was a genuine source disagreement (a
+score changing on an ALREADY-completed match; a match_date changing —
+a postponement) or just a still-`scheduled` match getting its real result for
+the first time, which is the normal, everyday outcome of a refresh and not a
+disagreement about anything.
+
+**Fix.** New `is_routine_completion(existing, diffs)`: true only when the
+diff set is exactly `{match_status, score}` AND the match was previously
+`scheduled` (never `completed` before). Routine completions print nothing —
+still applied under `--allow-overwrite` exactly as before, just silently —
+and are counted in the run summary as `results_recorded=N` instead of
+`conflicts=N`. A genuine conflict (correction or postponement) still prints
+the loud `CONFLICT` line, unchanged. 4 new tests lock in the classification
+boundary (first-time score, already-completed correction, postponement with
+and without an accompanying first-time score).
+
+## BUG-020 — `club_league_scorecard.py`'s refresh step detected newly-completed matches but never applied their scores, leaving real picks stuck ungraded — **FIXED 2026-08-23**
+
+- **Type:** bug (missing flag threading) · **Severity:** medium (every league
+  except Serie A silently failed to grade on schedule; discovered via 15
+  picks reported "still ungraded" a full day after their matches finished) ·
+  **Found:** 2026-08-23, user ran `grade_club_league_picks.py` directly (not
+  the scorecard tool) and got 0/15 graded; tracing why led here.
+
+**Root cause.** `club_league_scorecard.py`'s `refresh_results()` calls
+`season_kickoff.import_fixtures()`, which shells out to
+`import_league_matches.py` -- a script whose conflict-safe-write design
+(see BUG-021 above) requires `--allow-overwrite` to actually WRITE a
+detected `scheduled -> completed` transition, by default only reporting it.
+`import_fixtures()` never passed that flag through, so every scorecard
+"refresh" correctly fetched fresh results but silently discarded them.
+Serie A's own sync path (`update_serie_a_results.py`) has no such gate — it
+always applies — which is why only the 4 newer leagues were affected.
+
+**Fix.** Threaded an `allow_overwrite` parameter through `import_fixtures()`
+(default `False`, preserving `season_kickoff.py`'s own report-only bootstrap
+behavior); `club_league_scorecard.py`'s call site now passes
+`allow_overwrite=True`, since applying a newly-completed match's real score
+is the entire point of "refresh." Confirmed idempotent and safe to call on
+every run (only ever writes `home_score`/`away_score`; a no-op re-run is
+counted `unchanged`). 4 new tests, including a regression test on
+`refresh_results()` itself asserting the exact call arguments.
+
+## BUG-019 — TheStatsAPI served two conflicting records for the same real Ligue 1 fixture (reversed home/away); silently ingested the wrong one — **FIXED + DETECTION ADDED 2026-08-23**
+
+- **Type:** data quality (source-provider duplicate) · **Severity:** high (would
+  have posted a HOME pick for a team that was actually AWAY) · **Found:**
+  2026-08-23, when a live odds re-import reported the Rennes/PSG matchday-1
+  fixture as "1 unmatched" after the user re-ran `import_league_betting_odds.py`.
+
+**Root cause.** TheStatsAPI's `matches` endpoint returned TWO records for one
+real fixture (Ligue 1 2026-27, matchday 1, same kickoff instant): `mt_022917220`
+(Paris Saint-Germain home, wrongly flagged `is_neutral: true`) and
+`mt_466109840` (Stade Rennais home, `is_neutral: false`, never previously
+ingested). Our earlier backfill had picked up the bad one — `match_id 17397`
+was stored with PSG as home. `import_league_betting_odds.py`'s `find_match_id()`
+looks up matches by exact `(home_id, away_id)`, so The Odds API's (correctly
+labeled) event couldn't match our (mislabeled) row and silently dropped as
+`no_match` — the only visible symptom, hours away from the root cause.
+
+**Verified externally** before touching anything: the match is played at
+Roazhon Park (Stade Rennais's home ground), confirming Rennes is genuinely
+home, PSG away — [ESPN's own gameId URL](https://www.espn.com/soccer/match/_/gameId/401876487/stade-rennais-paris-saint-germain)
+encodes it as `stade-rennais-paris-saint-germain`.
+
+**Fix.**
+1. Corrected `soccer_matches.match_id=17397` directly: swapped
+   `home_team_id`/`away_team_id`, repointed `thestatsapi_match_id` to the
+   correct record (`mt_466109840`). Confirmed zero downstream rows (odds,
+   predictions, picks) referenced the mislabeled row yet, so no further cleanup
+   needed.
+2. **Deliberately did NOT** make `find_match_id()` tolerant of a reversed
+   home/away pair — that would have silently matched odds to a mislabeled
+   match and posted a backwards pick (`generate_club_league_card.py`'s output
+   format is literally `HOME | AWAY`). The fix belongs in the data, not the
+   lookup.
+3. Added real, permanent guardrails so this class of problem surfaces at
+   import time instead of days later via a confusing downstream symptom:
+   - `import_league_matches.py`: `find_conflicting_pairing()` — a NEW
+     `thestatsapi_match_id` for a team pairing we already have a DIFFERENT
+     match id for, within 1 day, is flagged loudly (`DUPLICATE FIXTURE`, both
+     records' details printed) and NOT imported. Confirmed live: re-running
+     against Ligue 1 2026 now catches the stale `mt_022917220` record on every
+     future sync instead of silently ignoring it.
+   - `import_league_betting_odds.py`: `no_match`/`unknown_team` counts (both
+     the CSV and live-Odds-API paths) now print the specific team names/date
+     that failed to resolve, instead of only a silent aggregate count.
+
 ## BUG-018 — Backfill scripts insert one prediction row PER `soccer_betting_odds` row, so a multi-book match gets duplicate predictions, double-counting it in every downstream metric — **FIXED + DATA CLEANED 2026-08-20**
 
 - **Type:** bug (bare join, wrong cardinality assumption) · **Severity:** medium

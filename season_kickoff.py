@@ -102,13 +102,27 @@ def sync_league_membership(conn, league, names):
     return seen_ids
 
 
-def import_fixtures(league, season):
+def import_fixtures(league, season, allow_overwrite=False):
+    """allow_overwrite only affects the import_league_matches.py path (the 4
+    newer leagues) -- it threads through to that script's own --allow-overwrite
+    flag, applying a detected scheduled->completed/score conflict instead of
+    only reporting it (see import_league_matches.py's module docstring).
+    update_serie_a_results.py (Serie A's own path) has no such gate -- it always
+    applies fetched results directly, so this parameter is a no-op there.
+    Default False preserves this function's original report-only behavior for
+    existing callers (e.g. season_kickoff.py's own bootstrap run, where a human
+    reviewing conflicts before they're applied is the safer default); pass True
+    for a caller like club_league_scorecard.py's refresh step, where applying a
+    newly-completed match's real score is the entire point of "refresh" -- see
+    BUGS.md's entry on picks going ungraded because this was missed."""
     if LEAGUES[league]["thestatsapi_competition_id"] is None:
         subprocess.run([sys.executable, "update_serie_a_results.py", "--season", str(season)],
                        check=True)
     else:
-        subprocess.run([sys.executable, "import_league_matches.py",
-                        "--league", league, "--season", str(season)], check=True)
+        cmd = [sys.executable, "import_league_matches.py", "--league", league, "--season", str(season)]
+        if allow_overwrite:
+            cmd.append("--allow-overwrite")
+        subprocess.run(cmd, check=True)
 
 
 # Serie A has no thestatsapi_competition_id in core/leagues.py (deliberately --

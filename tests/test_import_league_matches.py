@@ -120,3 +120,94 @@ def test_resync_not_triggered_by_an_already_completed_match(db_path, conn):
     sports_db.update_soccer_match_result(match_id, 2, 1)
 
     assert league_matches.any_match_due_for_resync(conn, "Premier League", 2026) is False
+
+
+# ── Duplicate-fixture detection (2026-08-23 -- real Ligue 1 Rennes/PSG incident,
+#    see find_conflicting_pairing()'s docstring) ───────────────────────────────────
+
+def test_find_conflicting_pairing_flags_a_different_id_same_pairing_same_day(db_path, conn):
+    """The exact shape of the real incident: a second thestatsapi_match_id shows up
+    for a team pairing we already have a match id for, on the same day, with
+    home/away reversed."""
+    psg = sports_db.ensure_soccer_team("Paris Saint-Germain", "Ligue 1", "France")
+    rennes = sports_db.ensure_soccer_team("Stade Rennais", "Ligue 1", "France")
+    match_id = sports_db.add_soccer_match("Ligue 1", 2026, rennes, psg, "2026-08-23T18:45:00.000Z")
+    sports_db.set_thestatsapi_match_id(match_id, "mt_466109840", conn=conn)
+
+    dup = league_matches.find_conflicting_pairing(
+        conn, "Ligue 1", 2026, psg, rennes, "mt_022917220", "2026-08-23T18:45:00.000Z")
+    assert dup is not None
+    assert dup[0] == match_id
+    assert dup[1] == "mt_466109840"
+
+
+def test_find_conflicting_pairing_ignores_the_same_id(db_path, conn):
+    """A re-fetch of the SAME match (same thestatsapi_match_id) must never flag
+    itself as a duplicate -- that's just find_existing_match's normal job."""
+    psg = sports_db.ensure_soccer_team("Paris Saint-Germain", "Ligue 1", "France")
+    rennes = sports_db.ensure_soccer_team("Stade Rennais", "Ligue 1", "France")
+    match_id = sports_db.add_soccer_match("Ligue 1", 2026, rennes, psg, "2026-08-23T18:45:00.000Z")
+    sports_db.set_thestatsapi_match_id(match_id, "mt_466109840", conn=conn)
+
+    dup = league_matches.find_conflicting_pairing(
+        conn, "Ligue 1", 2026, rennes, psg, "mt_466109840", "2026-08-23T18:45:00.000Z")
+    assert dup is None
+
+
+def test_find_conflicting_pairing_does_not_flag_a_real_home_and_away_leg(db_path, conn):
+    """Two teams legitimately meet twice a season, months apart -- that must NOT be
+    flagged as a duplicate (this is exactly what DUPLICATE_FIXTURE_TOLERANCE_DAYS
+    exists to exclude)."""
+    psg = sports_db.ensure_soccer_team("Paris Saint-Germain", "Ligue 1", "France")
+    rennes = sports_db.ensure_soccer_team("Stade Rennais", "Ligue 1", "France")
+    match_id = sports_db.add_soccer_match("Ligue 1", 2026, psg, rennes, "2026-08-23T18:45:00.000Z")
+    sports_db.set_thestatsapi_match_id(match_id, "mt_022917298", conn=conn)
+
+    dup = league_matches.find_conflicting_pairing(
+        conn, "Ligue 1", 2026, rennes, psg, "mt_155794506", "2027-02-13T18:00:00.000Z")
+    assert dup is None
+
+
+def test_find_conflicting_pairing_scoped_to_league_and_season(db_path, conn):
+    """A same-day pairing in a DIFFERENT season must not be flagged -- team ids can
+    repeat across seasons and this isn't the same real-world ambiguity."""
+    psg = sports_db.ensure_soccer_team("Paris Saint-Germain", "Ligue 1", "France")
+    rennes = sports_db.ensure_soccer_team("Stade Rennais", "Ligue 1", "France")
+    match_id = sports_db.add_soccer_match("Ligue 1", 2025, rennes, psg, "2026-08-23T18:45:00.000Z")
+    sports_db.set_thestatsapi_match_id(match_id, "mt_466109840", conn=conn)
+
+    dup = league_matches.find_conflicting_pairing(
+        conn, "Ligue 1", 2026, psg, rennes, "mt_022917220", "2026-08-23T18:45:00.000Z")
+    assert dup is None
+
+
+# ── Routine completion vs. genuine conflict (2026-08-24 -- all-caps CONFLICT
+#    logging for an expected scheduled->completed transition read as an error
+#    to a first-time user; see BUGS.md and is_routine_completion()'s docstring) ──
+
+def test_first_time_score_is_a_routine_completion():
+    existing = (1, None, None, "2026-09-13T15:30:00.000Z", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "completed", 2, 1, "2026-09-13T15:30:00.000Z")
+    assert league_matches.is_routine_completion(existing, diffs) is True
+
+
+def test_score_correction_on_already_completed_match_is_not_routine():
+    """A source changing the score of a match ALREADY marked completed is a
+    real correction -- must stay flagged, not silently reclassified."""
+    existing = (1, 2, 1, "2026-09-13T15:30:00.000Z", "completed")
+    diffs = league_matches.compute_conflicts(existing, "completed", 3, 1, "2026-09-13T15:30:00.000Z")
+    assert league_matches.is_routine_completion(existing, diffs) is False
+
+
+def test_postponement_date_change_is_not_routine():
+    """A match_date change (postponement) must stay flagged even if it also
+    happens to come with a first-time score/status change."""
+    existing = (1, None, None, "2026-09-13T15:30:00.000Z", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "completed", 2, 1, "2026-09-20T15:30:00.000Z")
+    assert league_matches.is_routine_completion(existing, diffs) is False
+
+
+def test_pure_date_change_on_still_scheduled_match_is_not_routine():
+    existing = (1, None, None, "2026-09-13T15:30:00.000Z", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "scheduled", None, None, "2026-09-20T15:30:00.000Z")
+    assert league_matches.is_routine_completion(existing, diffs) is False

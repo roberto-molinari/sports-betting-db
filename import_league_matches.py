@@ -18,13 +18,30 @@ the whole league/season.
 
 Conflict-safe writes: for a match that already exists (matched by TheStatsAPI's own
 id), every fetched field is compared against what's stored. Identical -> no write.
-Different -> logged (old value vs. new) but not applied unless --allow-overwrite --
-a source correcting itself after the fact should be a visible, reviewed event.
+
+A still-SCHEDULED match getting its first real status/score (is_routine_completion())
+is NOT logged as a conflict -- that's the expected, everyday outcome of a refresh, not
+a disagreement -- though it's still gated behind --allow-overwrite the same as any
+other write, and counted in the run summary (results_recorded=N). Anything else that
+differs (a score changing on an ALREADY-completed match -- a source correcting itself
+after the fact -- or any match_date change -- a postponement) IS logged loudly
+(CONFLICT) and not applied unless --allow-overwrite: that genuinely deserves a human's
+attention. (2026-08-24, BUGS.md: this split was added after the routine case's
+all-caps CONFLICT logging read as an error to a first-time user.)
 
 Match dedup is by THESTATSAPI'S OWN match id, not (league, season, home, away) --
 a division's promotion playoff bracket can rematch the same two teams at the same
 venue after the regular season, which a team-pairing key would wrongly collapse
 into one match (real data loss, found 2026-08-03 backfilling Serie B).
+
+Duplicate-fixture detection (2026-08-23, BUGS.md): a NEW thestatsapi_match_id for
+a team pairing we already have a DIFFERENT match id for, within
+DUPLICATE_FIXTURE_TOLERANCE_DAYS, is flagged loudly and NOT imported -- the source
+itself can serve two conflicting records for one real match (same competition/
+season/matchday/kickoff instant, reversed home/away). This is deliberately not
+auto-resolved (see find_conflicting_pairing()'s docstring for the real incident
+this came from): which record is correct isn't decidable from our data alone, and
+getting HOME/AWAY backwards silently corrupts every pick posted off that match.
 
 Team resolution: TheStatsAPI's own team names are used as-is (no normalizing needed
 -- squads/player-stats draw from the same API, so naming is already consistent
@@ -50,6 +67,7 @@ from core.thestatsapi import Client, TheStatsAPIError
 from import_club_squads import resolve_season_id
 
 RESYNC_LOOKBACK_HOURS = 4
+DUPLICATE_FIXTURE_TOLERANCE_DAYS = 1
 
 
 def parse_args():
@@ -95,6 +113,53 @@ def compute_conflicts(existing, api_status, home_score, away_score, api_date):
     if db_date != api_date:
         diffs.append(("match_date", db_date, api_date))
     return diffs
+
+
+def is_routine_completion(existing, diffs):
+    """True when a diff set is nothing more than a still-scheduled match
+    getting its FIRST real result -- the normal, expected outcome of a
+    refresh, not a source disagreeing with itself. False for anything that
+    actually deserves a human's attention: a score changing on a match that
+    was ALREADY completed (a correction), or a match_date changing at all
+    (a postponement) -- see the module docstring's "Conflict-safe writes".
+
+    Added 2026-08-24 (BUGS.md) after CONFLICT-labeled, all-caps console
+    output for this routine case read as an error to a first-time user, who
+    reasonably asked why an EXPECTED event was being shouted about at all."""
+    _, _, _, _, db_status = existing
+    diff_fields = {field for field, _, _ in diffs}
+    return db_status == "scheduled" and diff_fields <= {"match_status", "score"}
+
+
+def find_conflicting_pairing(conn, league, season, home_id, away_id, api_match_id, api_date):
+    """A DIFFERENT thestatsapi_match_id for the SAME two teams within
+    DUPLICATE_FIXTURE_TOLERANCE_DAYS of this one -- two teams playing each other
+    twice within a single day is never legitimate (unlike a real home-leg/away-leg
+    pair, which is always weeks or months apart), so this can only be a genuine
+    source-data duplicate, not a rematch (see test_find_existing_match_does_not_
+    match_on_team_pairing_alone for why team-pairing alone is otherwise NOT used
+    as a dedup key).
+
+    Found live 2026-08-23: TheStatsAPI served two conflicting records for the same
+    real Ligue 1 matchday-1 Rennes/PSG fixture -- same competition/season/matchday/
+    kickoff instant, reversed home/away, one wrongly flagged is_neutral=true. Our
+    ingestion had silently kept the wrong one (PSG home) until a downstream odds-
+    import mismatch surfaced it days later -- this check catches it at import time
+    instead. Returns the conflicting (match_id, thestatsapi_match_id, home_team_id,
+    away_team_id, match_date, match_status) row, or None."""
+    api_dt = datetime.fromisoformat(api_date.replace("Z", "+00:00"))
+    window_start = (api_dt - timedelta(days=DUPLICATE_FIXTURE_TOLERANCE_DAYS)).isoformat()
+    window_end = (api_dt + timedelta(days=DUPLICATE_FIXTURE_TOLERANCE_DAYS)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT match_id, thestatsapi_match_id, home_team_id, away_team_id, match_date, match_status
+           FROM soccer_matches
+           WHERE league = ? AND season = ?
+             AND ((home_team_id = ? AND away_team_id = ?) OR (home_team_id = ? AND away_team_id = ?))
+             AND thestatsapi_match_id IS NOT NULL AND thestatsapi_match_id != ?
+             AND match_date >= ? AND match_date <= ?""",
+        (league, season, home_id, away_id, away_id, home_id, api_match_id, window_start, window_end))
+    return cur.fetchone()
 
 
 def any_match_due_for_resync(conn, league, season):
@@ -147,7 +212,7 @@ def main():
         print(f"API matches: {len(api_matches)}  imported-scope "
               f"({'all statuses' if import_all_statuses else 'finished only'}): {len(wanted)}")
 
-        created = unchanged = conflicts = applied = 0
+        created = unchanged = conflicts = applied = duplicate_fixtures = results_recorded = 0
         for m in wanted:
             home_api, away_api = m["home_team"], m["away_team"]
             for api_team in (home_api, away_api):
@@ -163,6 +228,20 @@ def main():
 
             existing = find_existing_match(conn, m["id"])
             if existing is None:
+                dup = find_conflicting_pairing(conn, args.league, args.season, home_id, away_id,
+                                               m["id"], m["utc_date"])
+                if dup is not None:
+                    duplicate_fixtures += 1
+                    dup_match_id, dup_api_id, dup_home_id, dup_away_id, dup_date, dup_status = dup
+                    dup_orientation = "same" if (dup_home_id, dup_away_id) == (home_id, away_id) else "REVERSED"
+                    print(f"  DUPLICATE FIXTURE: {args.league} {home_api['name']} vs {away_api['name']} "
+                          f"on {m['utc_date']} (api_id={m['id']}, is_neutral={m.get('is_neutral')}) "
+                          f"conflicts with existing match_id={dup_match_id} (api_id={dup_api_id}, "
+                          f"date={dup_date}, status={dup_status}, home/away {dup_orientation}) -- "
+                          f"the source is serving two records for what looks like ONE real match. "
+                          f"NOT imported -- verify externally which record is correct (e.g. actual "
+                          f"venue) before touching either row; see BUGS.md.")
+                    continue
                 if args.dry_run:
                     created += 1
                     continue
@@ -181,6 +260,16 @@ def main():
                 unchanged += 1
                 continue
 
+            if is_routine_completion(existing, diffs):
+                # Expected outcome of a refresh, not a disagreement -- no
+                # per-match noise (BUGS.md, 2026-08-24). Still counted below.
+                results_recorded += 1
+                if args.allow_overwrite and not args.dry_run:
+                    if home_score is not None and away_score is not None:
+                        update_soccer_match_result(match_id, home_score, away_score)
+                    applied += 1
+                continue
+
             conflicts += 1
             action = "applying (--allow-overwrite)" if args.allow_overwrite else "NOT applied, use --allow-overwrite"
             for field, old, new in diffs:
@@ -193,7 +282,14 @@ def main():
 
         applied_note = f"  applied={applied}" if args.allow_overwrite else ""
         print(f"\n{'(dry-run) ' if args.dry_run else ''}created={created}  unchanged={unchanged}  "
-              f"conflicts={conflicts}{applied_note}")
+              f"results_recorded={results_recorded}  conflicts={conflicts}  "
+              f"duplicate_fixtures={duplicate_fixtures}{applied_note}")
+        if results_recorded and not args.allow_overwrite:
+            print(f"  {results_recorded} match(es) finished and have a real score available -- "
+                  f"rerun with --allow-overwrite to record it (not a conflict, just not yet applied).")
+        if duplicate_fixtures:
+            print(f"  {duplicate_fixtures} DUPLICATE FIXTURE(S) found and skipped -- see details above, "
+                  f"resolve manually before they can block a real odds import (BUGS.md).")
     except TheStatsAPIError as exc:
         print(f"\nAborted: {exc}")
     finally:

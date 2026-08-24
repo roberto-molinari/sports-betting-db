@@ -32,6 +32,7 @@ from core.team_name_maps import canonical_team_name
 
 
 ODDS_API_DEFAULT_BOOK = "Pinnacle"
+FIND_MATCH_DATE_TOLERANCE_DAYS = 3
 
 
 
@@ -174,7 +175,7 @@ def find_match_id(match_index, home_id, away_id, target_date):
     candidates = match_index.get((home_id, away_id), [])
     for match_id, db_date_text in candidates:
         db_date = datetime.strptime(db_date_text, "%Y-%m-%d").date()
-        if abs((target_date - db_date).days) <= 3:
+        if abs((target_date - db_date).days) <= FIND_MATCH_DATE_TOLERANCE_DAYS:
             return match_id
     return None
 
@@ -316,6 +317,11 @@ def _import_rows(conn, league, reader, season, sportsbook, insert_missing, futur
 
         if not home_id or not away_id:
             unknown_team += 1
+            print(f"  UNKNOWN TEAM: {league} {row.get('HomeTeam')!r} vs {row.get('AwayTeam')!r} "
+                  f"on {match_dt.date()} -- {'HomeTeam' if not home_id else 'AwayTeam'} name "
+                  f"{'and AwayTeam name ' if not home_id and not away_id else ''}"
+                  f"not in core/team_name_maps.py and not an exact soccer_teams match. "
+                  f"This match's odds were NOT imported -- add the missing mapping and re-run.")
             continue
 
         match_id = find_match_id(match_index, home_id, away_id, match_dt.date())
@@ -328,6 +334,13 @@ def _import_rows(conn, league, reader, season, sportsbook, insert_missing, futur
                 matches_created += 1
             else:
                 no_match += 1
+                print(f"  NO MATCH: {league} {home_name} vs {away_name} on {match_dt.date()} -- "
+                      f"both teams resolved but no soccer_matches row found within "
+                      f"{FIND_MATCH_DATE_TOLERANCE_DAYS} days. This match's odds were NOT "
+                      f"imported -- either the fixture hasn't been ingested yet "
+                      f"(import_league_matches.py), or the two sources disagree on which "
+                      f"team is home/away for this fixture (see BUGS.md's duplicate-fixture "
+                      f"entry, 2026-08-23) -- verify before assuming this is a simple gap.")
                 continue
 
         home_decimal = parse_float_or_none(row.get("B365H"))
@@ -489,11 +502,22 @@ def import_odds_api(conn, league, season, preferred_sportsbook):
 
         if not home_id or not away_id:
             unknown_team += 1
+            print(f"  UNKNOWN TEAM: {league} {event.get('home_team')!r} vs {event.get('away_team')!r} "
+                  f"on {match_dt.date()} -- The Odds API's team name isn't in "
+                  f"core/team_name_maps.py and doesn't exactly match soccer_teams. This "
+                  f"match's odds were NOT imported -- add the missing mapping and re-run.")
             continue
 
         match_id = find_match_id(match_index, home_id, away_id, match_dt.date())
         if match_id is None:
             no_match += 1
+            print(f"  NO MATCH: {league} {home_name} vs {away_name} on {match_dt.date()} -- "
+                  f"both teams resolved but no soccer_matches row found within "
+                  f"{FIND_MATCH_DATE_TOLERANCE_DAYS} days. This match's odds were NOT "
+                  f"imported -- either the fixture hasn't been ingested yet "
+                  f"(import_league_matches.py), or the two sources disagree on which team "
+                  f"is home/away for this fixture (see BUGS.md's duplicate-fixture entry, "
+                  f"2026-08-23) -- verify before assuming this is a simple gap.")
             continue
 
         bookmaker = choose_bookmaker(event.get("bookmakers", []), effective_sportsbook)
