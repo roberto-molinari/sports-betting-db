@@ -31,9 +31,10 @@ def grade_picks_in_window(conn, start_utc=None, end_utc=None, dry_run=False):
     ungraded picks in scope whose match has no final score yet, useful for
     telling the caller "not everything could be graded yet" rather than
     silently under-reporting. graded_details is
-    [(league, odds, result, method), ...] for whatever was (or, in dry-run,
-    would be) graded this call -- lets a caller preview a scorecard without
-    anything being persisted.
+    [(league, side, odds, result, method, home, away), ...] for whatever was
+    (or, in dry-run, would be) graded this call -- lets a caller preview a
+    scorecard (including which specific match a pick was on, e.g. for a
+    "biggest winner" summary) without anything being persisted.
 
     dry_run: compute results as normal but skip set_club_league_pick_result()
     -- nothing written to soccer_club_league_picks.result. Match results
@@ -46,9 +47,12 @@ def grade_picks_in_window(conn, start_utc=None, end_utc=None, dry_run=False):
         window_params = (format_db_timestamp(start_utc), format_db_timestamp(end_utc))
 
     cur.execute(f"""
-        SELECT p.pick_id, p.league, p.side, p.odds, p.method, m.home_score, m.away_score
+        SELECT p.pick_id, p.league, p.side, p.odds, p.method, m.home_score, m.away_score,
+               ht.name, at.name
         FROM soccer_club_league_picks p
         JOIN soccer_matches m ON m.match_id = p.match_id
+        JOIN soccer_teams ht ON ht.team_id = m.home_team_id
+        JOIN soccer_teams at ON at.team_id = m.away_team_id
         WHERE p.result IS NULL
           AND m.home_score IS NOT NULL AND m.away_score IS NOT NULL
           {window_clause}
@@ -57,12 +61,12 @@ def grade_picks_in_window(conn, start_utc=None, end_utc=None, dry_run=False):
 
     graded = 0
     graded_details = []
-    for pick_id, league, side, odds, method, hs, as_ in rows:
+    for pick_id, league, side, odds, method, hs, as_, home, away in rows:
         outcome = {"regulation_home": hs, "regulation_away": as_}
         result = grade_pick(side, outcome)
         if not dry_run:
             set_club_league_pick_result(pick_id, result, conn=conn)
-        graded_details.append((league, odds, result, method))
+        graded_details.append((league, side, odds, result, method, home, away))
         graded += 1
     if not dry_run:
         conn.commit()

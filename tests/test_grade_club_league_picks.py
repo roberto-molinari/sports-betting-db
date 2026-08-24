@@ -87,7 +87,7 @@ def test_dry_run_computes_but_does_not_persist(db_path, conn):
     graded, pending, details = grade_picks_in_window(conn, dry_run=True)
     assert graded == 1
     assert pending == 0
-    assert details == [("Serie A", -110, "win", None)]
+    assert details == [("Serie A", "HOME", -110, "win", None, "Home FC", "Away FC")]
 
     cur = conn.cursor()
     cur.execute("SELECT result FROM soccer_club_league_picks WHERE pick_id = ?", (pick_id,))

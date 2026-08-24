@@ -1,13 +1,16 @@
 """Tests for club_league_scorecard.py's pure reporting logic (2026-08-21,
-docs/PRE-AND-POST-MATCHDAY-EXPERIENCE.md) -- refresh_results() itself isn't
-tested here (it shells out to live-data import scripts); scorecard()/
-_pick_stats() are the parts worth locking in."""
+docs/PRE-AND-POST-MATCHDAY-EXPERIENCE.md) -- refresh_results()'s actual
+subprocess calls aren't tested here (it shells out to live-data import
+scripts), but its call to import_fixtures() IS -- see test_refresh_results_
+applies_newly_completed_matches below (BUGS.md, 2026-08-23: refresh was
+silently detect-only, never applying a newly completed match's score)."""
 from unittest.mock import patch
 
 import pytest
 
 import core.sports_db as sports_db
-from club_league_scorecard import scorecard, _pick_stats
+from club_league_scorecard import (scorecard, _pick_stats, _pick_profit, _biggest_winner,
+                                   refresh_results, print_scorecard, print_scorecard_post_friendly)
 from core.matchday import matchday_utc_window
 
 
@@ -95,7 +98,7 @@ def test_scorecard_merges_dry_run_extra_picks_without_persisted_rows(db_path, co
     start, end = matchday_utc_window("2025-09-22")
     # simulates what grade_picks_in_window(..., dry_run=True) would return --
     # a pick that was never actually written to soccer_club_league_picks.result
-    extra = [("Premier League", -110, "loss", "poisson_v4_4")]
+    extra = [("Premier League", "AWAY", -110, "loss", "poisson_v4_4", "PL Home", "PL Away")]
     card = scorecard(conn, start, end, extra_picks=extra)
 
     assert card["overall"]["wins"] == 1
@@ -121,8 +124,142 @@ def test_methods_seen_flags_mixed_model_versions(db_path, conn, capsys):
     card = scorecard(conn, start, end)
     assert card["methods_seen"] == {"poisson_v4_4", "poisson_v4_5"}
 
-    from club_league_scorecard import print_scorecard
     print_scorecard("test", card)
     out = capsys.readouterr().out
     assert "WARNING" in out
     assert "poisson_v4_4" in out and "poisson_v4_5" in out
+
+
+def test_refresh_results_applies_newly_completed_matches(db_path, conn):
+    """refresh_results() must call import_fixtures() with allow_overwrite=True
+    -- the whole point of a "refresh" is to apply a match's real, newly-
+    available score, not just detect and report it (import_league_matches.py's
+    own default is report-only, meant for a human-reviewed one-off run).
+    Regression test for the exact bug: a scorecard run left 15 picks stuck
+    ungraded because this was missed."""
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        home = sports_db.ensure_soccer_team("Refresh Home", "Serie A")
+        away = sports_db.ensure_soccer_team("Refresh Away", "Serie A")
+        sports_db.add_soccer_match("Serie A", 2025, home, away, "2025-09-22T18:00:00.000Z")
+
+    start, end = matchday_utc_window("2025-09-22")
+
+    with patch("club_league_scorecard.import_fixtures") as mock_import:
+        refresh_results(conn, start, end)
+
+    mock_import.assert_called_once_with("Serie A", 2025, allow_overwrite=True)
+
+
+# ── Biggest winner (2026-08-23 -- "the day's biggest winner" by ROI) ──────────
+
+def test_pick_profit_win_loss_push():
+    assert _pick_profit(+150, "win") == pytest.approx(1.5)
+    assert _pick_profit(-110, "loss") == pytest.approx(-1.0)
+    assert _pick_profit(-110, "push") == 0.0
+
+
+def test_biggest_winner_picks_the_highest_profit_win():
+    """Profit == ROI here (flat 1-unit stake), so the highest-profit win IS
+    the highest-ROI pick -- a big underdog win must beat a small-favorite win
+    even though the favorite might have a "safer" record elsewhere."""
+    picks = [
+        {"league": "Serie A", "side": "HOME", "odds": -535, "result": "win",
+         "home": "Inter", "away": "Monza", "profit": _pick_profit(-535, "win")},
+        {"league": "Premier League", "side": "AWAY", "odds": +221, "result": "win",
+         "home": "Nottingham Forest", "away": "Leeds United", "profit": _pick_profit(221, "win")},
+        {"league": "La Liga", "side": "HOME", "odds": +144, "result": "loss",
+         "home": "Valencia", "away": "Celta Vigo", "profit": _pick_profit(144, "loss")},
+    ]
+    winner = _biggest_winner(picks)
+    assert winner["home"] == "Nottingham Forest" and winner["away"] == "Leeds United"
+    assert winner["profit"] == pytest.approx(2.21)
+
+
+def test_biggest_winner_ignores_losses_and_pushes():
+    picks = [
+        {"league": "Serie A", "side": "HOME", "odds": +500, "result": "loss",
+         "home": "A", "away": "B", "profit": _pick_profit(500, "loss")},
+        {"league": "Serie A", "side": "UNDER 2.5", "odds": -110, "result": "push",
+         "home": "C", "away": "D", "profit": _pick_profit(-110, "push")},
+    ]
+    assert _biggest_winner(picks) is None
+
+
+def test_biggest_winner_none_when_no_picks_at_all():
+    assert _biggest_winner([]) is None
+
+
+def test_scorecard_reports_biggest_winner_across_leagues(db_path, conn):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "win", -535)       # small win
+        _seed_graded_pick(conn, "Premier League", "AWAY", "win", +221)  # bigger win
+        _seed_graded_pick(conn, "La Liga", "HOME", "loss", +144)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+
+    bw = card["biggest_winner"]
+    assert bw is not None
+    assert bw["league"] == "Premier League"
+    assert bw["odds"] == 221
+
+
+def test_scorecard_biggest_winner_none_when_nothing_won(db_path, conn):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "loss", +150)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+    assert card["biggest_winner"] is None
+
+
+def test_print_scorecard_shows_biggest_winner(db_path, conn, capsys):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "win", -535)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+    print_scorecard("test", card)
+    out = capsys.readouterr().out
+    assert "Biggest winner" in out
+    assert "Serie A Home" in out and "Serie A Away" in out
+
+
+def test_print_scorecard_no_winner_message(db_path, conn, capsys):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "loss", +150)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+    print_scorecard("test", card)
+    out = capsys.readouterr().out
+    assert "no picks won" in out
+
+
+def test_print_scorecard_post_friendly_format(db_path, conn, capsys):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "win", -535)
+        _seed_graded_pick(conn, "Premier League", "AWAY", "loss", +150)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+    print_scorecard_post_friendly("matchday 2025-09-22", card)
+    out = capsys.readouterr().out
+
+    assert "Results" in out
+    assert "Serie A: 1-0-0" in out
+    assert "Premier League: 0-1-0" in out
+    assert "Overall: 1-1-0" in out
+    assert "Biggest winner" in out
+    assert "Serie A Home" in out and "Serie A Away" in out
+
+
+def test_print_scorecard_post_friendly_no_winner(db_path, conn, capsys):
+    with patch("core.sports_db.DATABASE_PATH", db_path):
+        _seed_graded_pick(conn, "Serie A", "HOME", "loss", +150)
+
+    start, end = matchday_utc_window("2025-09-22")
+    card = scorecard(conn, start, end)
+    print_scorecard_post_friendly("matchday 2025-09-22", card)
+    out = capsys.readouterr().out
+    assert "No winning picks today" in out
