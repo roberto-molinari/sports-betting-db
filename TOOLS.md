@@ -27,6 +27,11 @@ The active system (Serie A + Premier League + Bundesliga + La Liga + Ligue 1).
   winner) instead of the detailed table.
 - **`model_metrics_report.py`** — Brier/bias/ROI report for a model version,
   optionally persisted to `model_snapshots/`.
+- **`export_club_league_picks_json.py`** — run once daily after
+  `club_league_scorecard.py` grades that day's picks: regenerates
+  `web_export/club_league_picks.json`, the flat per-pick data file behind
+  the interactive ROI report page (site lives in a separate repo — copy the
+  output there and deploy). Graded picks only, full history every run.
 
 ## Club-league model — setup & periodic ingestion
 
