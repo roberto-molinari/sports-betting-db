@@ -14,10 +14,27 @@ is grouped so you can still find it, without it competing for attention.
 
 The active system (Serie A + Premier League + Bundesliga + La Liga + Ligue 1).
 
+**Generating a card, in order:**
+1. `matchday_summary.py --matchday-date <date>` — see what's on the slate and
+   which leagues are still missing odds for that date.
+2. If a league is missing odds: `import_league_betting_odds.py --league
+   "<League>" --season <year> --future-only` — pulls live current-week odds
+   from The Odds API and inserts/updates just the upcoming matches (`<year>`
+   is the season the date falls in, e.g. 2025 for the 2025-26 season). This
+   is the live-odds path — different from `--download`, which pulls
+   historical/backtest CSVs from football-data.co.uk instead.
+3. `generate_club_league_card.py --league "<League>" --matchday-date <date>`
+   — generate the card now that odds exist. Skipping step 2 when odds are
+   missing just means fewer/no picks come out, not an error.
+
 - **`matchday_summary.py`** — what's on the slate for a date/range, which
-  leagues have odds yet. Run this first.
+  leagues have odds yet. Run this first (step 1 above).
+- **`import_league_betting_odds.py`** — pull live odds ahead of a card
+  (step 2 above; `--future-only`), or backfill historical odds for
+  backtesting (`--download --season <year>`, no `--future-only`).
 - **`generate_club_league_card.py`** — generate today's picks for one league
   (`--post-friendly` for the copy-paste format, `--dry-run` to preview).
+  Step 3 above.
 - **`club_league_picks_report.py`** — list every stored pick for a matchday/
   range, all leagues: pick/odds/EV/stars, plus result/ROI once graded.
   Read-only — doesn't refresh or grade anything.
@@ -45,8 +62,9 @@ automatically inside tools from the section above.
 - **`import_club_squads.py`** / **`import_club_player_stats.py`** — after a
   transfer window or roster change, to refresh the player data the model
   blends in.
-- **`import_league_betting_odds.py`** — to pull fresh live odds ahead of a
-  card (e.g. a match `matchday_summary.py` flagged as missing odds).
+- `import_league_betting_odds.py` — see the day-to-day section above (step 2)
+  for the live-odds command; this is also where you'd reach for the
+  `--download` (historical CSV) form for backtest work.
 
 **Already run for you — use these directly only for a manual backfill or fix:**
 - `import_league_matches.py` — `season_kickoff.py`'s bootstrap and

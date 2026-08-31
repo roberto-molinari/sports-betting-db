@@ -122,6 +122,7 @@ TEAM_NAME_MAPS = {
     },
     "La Liga": {
         "Alaves": "Deportivo Alavés",
+        "Alavés": "Deportivo Alavés",   # The Odds API's name
         "Almeria": "Almería",
         "Ath Bilbao": "Athletic Club",
         "Ath Madrid": "Atlético Madrid",

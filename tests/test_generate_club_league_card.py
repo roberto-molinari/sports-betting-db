@@ -115,6 +115,21 @@ def test_card_uses_league_param_not_hardcoded(db_path, conn, capsys):
     assert "MATCHES 0" in out_wrong_league
 
 
+def test_card_prints_expected_goals_for_every_match_including_excluded_picks(db_path, conn, capsys):
+    """The EXPECTED GOALS block must list every priced match in the window --
+    even StrongFC vs WeakFC here, whose only positive-EV candidate (the away
+    longshot) gets excluded by the probability floor and never becomes a
+    printed pick (see test_card_excludes_subfloor_candidate_and_logs_it)."""
+    _seed_lopsided_league(conn)
+    out = _run_card(capsys, db_path)
+
+    assert "EXPECTED GOALS" in out
+    eg_line = next(line for line in out.splitlines() if "StrongFC vs WeakFC" in line
+                    and " - " in line and "|" in line)
+    home_str, away_str = eg_line.split("|")[1].split(" - ")
+    assert float(home_str) > float(away_str)   # StrongFC at home vs. weak opponent
+
+
 def test_card_only_surfaces_positive_ev_guardrail_clear_picks(db_path, conn, capsys):
     _seed_lopsided_league(conn)
     out = _run_card(capsys, db_path)

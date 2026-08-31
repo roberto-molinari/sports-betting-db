@@ -243,6 +243,7 @@ def main():
 
     ranked_matches = []
     excluded_log = []
+    expected_goals = []
     generated_at = datetime.now(timezone.utc).isoformat()
 
     dates = sorted({strength.match_calendar_date(r["match_date"]) for r in rows})
@@ -278,6 +279,11 @@ def main():
                 away_advantage=avg_home / avg_away,
             )
 
+            expected_goals.append({
+                "match_date": row["match_date"], "home": row["home"], "away": row["away"],
+                "lambda_home": result["lambda_H"], "lambda_away": result["lambda_A"],
+            })
+
             candidates = build_candidates(row, result)
             for c in candidates:
                 c["excluded_by"] = guardrail_reasons(c["prob"], c["implied"], CLUB_LEAGUE_MIN_PICK_PROBABILITY,
@@ -306,6 +312,14 @@ def main():
         print_post_friendly(args.league, args.matchday_date, ranked_matches, len(rows))
         conn.close()
         return
+
+    if expected_goals:
+        print("=== EXPECTED GOALS (model's lambda_home/lambda_away, before odds/EV/guardrails) ===")
+        for eg in expected_goals:
+            match_date = strength.match_calendar_date(eg["match_date"])
+            print(f"    {match_date} {eg['home']} vs {eg['away']} | "
+                  f"{eg['lambda_home']:.2f} - {eg['lambda_away']:.2f}")
+        print()
 
     def fmt_pick(rank_label, pick):
         match_date = strength.match_calendar_date(pick["match_date"])

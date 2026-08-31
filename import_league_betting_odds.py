@@ -43,7 +43,8 @@ def parse_args():
     parser.add_argument(
         "--download",
         action="store_true",
-        help="Download the latest odds CSV for the given season(s) from football-data.co.uk."
+        help="Download the odds CSV for the given season(s) from football-data.co.uk AND import it "
+             "in the same run (not download-only -- use this instead of a local CSV file)."
     )
     parser.add_argument(
         "--season",
@@ -62,16 +63,39 @@ def parse_args():
         help="Preferred sportsbook to store in soccer_betting_odds."
     )
     parser.add_argument(
-        "--insert-missing",
+        "--insert-missing-matches",
+        dest="insert_missing",
         action="store_true",
-        help="Insert missing soccer_matches records from CSV rows that include a result (FTHG/FTAG)."
+        help="Insert missing soccer_matches records from CSV rows that include a result (FTHG/FTAG). "
+             "The odds themselves are always inserted regardless of this flag -- this only controls "
+             "whether a not-yet-ingested fixture gets created from the CSV row."
     )
     parser.add_argument(
         "--future-only",
         action="store_true",
         help="Import odds only for matches on/after today (useful for next matchday updates)."
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if not args.download and not args.files and not args.future_only:
+        parser.print_help()
+        parser.exit(2, "\nerror: provide local CSV files, or use --download, or use --future-only "
+                        "(live odds from The Odds API).\n")
+
+    if args.download and args.files:
+        parser.error("--download cannot be used together with local CSV files.")
+
+    if args.future_only and (not args.season or len(args.season) != 1):
+        parser.error("--future-only requires exactly one --season value.")
+
+    if args.download and args.future_only and not args.files:
+        parser.error("--download and --future-only can't be combined without local CSV files -- "
+                      "they're two different sources (football-data.co.uk vs. The Odds API) and "
+                      "--future-only alone would silently take over, ignoring --download. Use "
+                      "--future-only on its own for live odds, or --download on its own for a "
+                      "full season's historical odds.")
+
+    return args
 
 
 def season_to_code(season):
@@ -668,12 +692,8 @@ def main():
             conn.close()
         return
 
-    # Local file import (default)
-    if args.files:
-        imports = [(base_dir / file_name, args.season[0] if args.season else None) for file_name in args.files]
-    else:
-        print("No files specified and --download not used. Exiting.")
-        return
+    # Local file import
+    imports = [(base_dir / file_name, args.season[0] if args.season else None) for file_name in args.files]
 
     for csv_path, season in imports:
         if not season:

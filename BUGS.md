@@ -9,6 +9,89 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-024 — A source-side match reschedule (match_date CONFLICT) was detected but had no write path at all, even under `--allow-overwrite` — silently dropped a real, live Premier League match from the card window — **FIXED 2026-08-31**
+
+- **Type:** missing write path (a whole conflict category was detectable but
+  not actionable) · **Severity:** medium (a real match invisible to the live
+  card, not a data-quality nuisance) · **Found:** 2026-08-31, user reported
+  "there's a Premier League match today (Aston Villa v. Arsenal) but the
+  model thinks there are zero matches."
+
+**Root cause.** `soccer_matches` had match_id 17242 (Aston Villa v Arsenal)
+dated `2026-08-29T14:00:00.000Z`. TheStatsAPI's real record is
+`2026-08-31T19:00:00.000Z` (confirmed against the actual kickoff via web
+search) — the source rescheduled the match at some point after our original
+import. `import_league_matches.py`'s conflict detection caught this
+correctly every run (`CONFLICT ... match_date stored=... api=...`), but the
+apply branch under `--allow-overwrite` only ever called
+`update_soccer_match_result()` — which writes score/status, not date — so a
+match_date-only conflict (no score diff, since the match hadn't been played)
+matched neither of that function's score-not-None guards and nothing was
+ever written. The run still printed "applying" and counted `applied=1`, a
+false positive that made the conflict look resolved when it silently
+wasn't. Because `generate_club_league_card.py`/`matchday_summary.py` both
+filter matches by date window, the match simply vanished from "today" with
+no error anywhere.
+
+**Fix.** Added `update_soccer_match_date()` to `core/sports_db.py` (mirrors
+`update_soccer_match_result()`'s pattern). `import_league_matches.py`'s
+conflict-apply branch now checks which fields actually differ and calls the
+right updater per field (score via `update_soccer_match_result`, date via
+`update_soccer_match_date`) instead of assuming every conflict is a score
+correction. New test locks in that a match_date conflict actually persists.
+Verified live: re-ran `--league "Premier League" --season 2026
+--allow-overwrite`, match_id 17242's stored date is now
+`2026-08-31T19:00:00.000Z`, and it now appears in `matchday_summary.py`'s
+output for today.
+
+**Sweep for other affected matches (same day, all leagues):** ran
+`import_league_matches.py` (dry, no `--allow-overwrite`) for every
+TheStatsAPI-sourced league/feeder division (Premier League, Bundesliga, La
+Liga, Ligue 1, Serie B, Championship, 2. Bundesliga, LaLiga 2, Ligue 2) plus
+`update_serie_a_results.py` (Serie A's separate football-data.org pipeline)
+— **zero other conflicts found**. Aston Villa v Arsenal was the only match
+affected.
+
+## BUG-023 — `import_league_betting_odds.py --download --future-only` silently ignored `--download`, running the live-odds path instead with no warning — **FIXED 2026-08-28**
+
+- **Type:** argument-validation gap (silent precedence, not an error) ·
+  **Severity:** low (would surprise a user expecting the download path to
+  run, no data corruption) · **Found:** 2026-08-28, while answering a user
+  question about how `--download` and `--future-only` differ -- traced
+  `main()`'s branch order and found `--future-only` (with no local files)
+  returns early unconditionally, before `args.download` is ever checked.
+
+**Fix.** `parse_args()` now rejects `--download` + `--future-only` together
+(without local CSV files) outright, explaining they're two different
+sources (football-data.co.uk vs. The Odds API) and pointing at using each on
+its own. `--future-only` combined with local CSV files is unaffected (that's
+a real, different code path -- a future-only filter over a local file's
+rows) and still works as before.
+
+## BUG-022 — `import_league_betting_odds.py --future-only` rejected as invalid unless `--download` or a CSV file was also given, even though `--future-only` is its own valid mode — **FIXED 2026-08-28**
+
+- **Type:** argument-validation bug (upfront check didn't know about a real
+  mode) · **Severity:** low (blocked a legit command, no data impact) ·
+  **Found:** 2026-08-28, user ran `--league "Serie A" --future-only --season
+  2026` (per TOOLS.md's own documented live-odds step) and hit `error:
+  provide local CSV files or use --download.` — a real command failing
+  exactly as documented.
+
+**Root cause.** `parse_args()`'s upfront validation only recognized two
+input modes (`--download` or local CSV `files`) and rejected everything
+else, without knowing `--future-only` triggers a third, independent mode
+(`import_odds_api()`, live odds from The Odds API) that needs neither. The
+error message compounded this by suggesting `--download`, which pulls
+historical football-data.co.uk CSVs, not live current-week odds — the wrong
+fix even if followed.
+
+**Fix.** `parse_args()` now accepts `--future-only` as satisfying the
+input-mode requirement, and moved the existing "`--future-only` needs
+exactly one `--season`" check (previously only enforced deep in `main()`)
+up next to it so it fails fast with a clear message. Verified live:
+`--league "Serie A" --future-only --season 2026` now runs and pulled 20 real
+Pinnacle/1xBet odds rows for that weekend's matches.
+
 ## BUG-021 — Routine match completions logged as loud, all-caps `CONFLICT` -- read as an error by a first-time user for something entirely expected — **FIXED 2026-08-24**
 
 - **Type:** UX / logging design (alarming language for a non-event) · **Severity:**

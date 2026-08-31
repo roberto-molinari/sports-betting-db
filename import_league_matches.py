@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.leagues import LEAGUES, has_odds_source
 from core.sports_db import DATABASE_PATH, ensure_soccer_team, add_soccer_match, \
-    set_thestatsapi_match_id, update_soccer_match_result
+    set_thestatsapi_match_id, update_soccer_match_result, update_soccer_match_date
 from core.thestatsapi import Client, TheStatsAPIError
 from import_club_squads import resolve_season_id
 
@@ -276,8 +276,11 @@ def main():
                 print(f"  CONFLICT match_id={match_id} ({args.league} {home_api['name']} vs "
                       f"{away_api['name']}): {field} stored={old!r} api={new!r} -- {action}")
             if args.allow_overwrite and not args.dry_run:
-                if home_score is not None and away_score is not None:
+                diff_fields = {field for field, _, _ in diffs}
+                if "score" in diff_fields and home_score is not None and away_score is not None:
                     update_soccer_match_result(match_id, home_score, away_score)
+                if "match_date" in diff_fields:
+                    update_soccer_match_date(match_id, m["utc_date"])
                 applied += 1
 
         applied_note = f"  applied={applied}" if args.allow_overwrite else ""

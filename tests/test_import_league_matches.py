@@ -29,6 +29,24 @@ def test_find_existing_match_returns_none_when_absent(db_path, conn):
     assert league_matches.find_existing_match(conn, "mt_does_not_exist") is None
 
 
+def test_update_soccer_match_date_persists_a_corrected_kickoff(db_path, conn):
+    """BUG-024 (2026-08-31): a flagged match_date CONFLICT (a source-side
+    reschedule) had no write path at all -- --allow-overwrite claimed to
+    apply it but the only apply call was update_soccer_match_result, which
+    only ever touches score/status, so the stale date silently stuck around
+    (a real live case: Aston Villa v Arsenal stayed dated two days early and
+    dropped out of the matchday window entirely)."""
+    home = sports_db.ensure_soccer_team("Aston Villa", "Premier League", "England")
+    away = sports_db.ensure_soccer_team("Arsenal", "Premier League", "England")
+    match_id = sports_db.add_soccer_match("Premier League", 2026, home, away, "2026-08-29T14:00:00.000Z")
+
+    sports_db.update_soccer_match_date(match_id, "2026-08-31T19:00:00.000Z")
+
+    cur = conn.cursor()
+    cur.execute("SELECT match_date FROM soccer_matches WHERE match_id = ?", (match_id,))
+    assert cur.fetchone()[0] == "2026-08-31T19:00:00.000Z"
+
+
 def test_find_existing_match_finds_by_thestatsapi_match_id(db_path, conn):
     home = sports_db.ensure_soccer_team("Cremonese", "Serie B", "Italy")
     away = sports_db.ensure_soccer_team("Spezia", "Serie B", "Italy")

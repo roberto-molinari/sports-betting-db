@@ -23,17 +23,22 @@ Scope decisions (locked in with the user before building this):
 
 Cadence: run this once daily, after club_league_scorecard.py has graded that
 day's picks -- not wired into the scorecard tool itself (separate concern,
-matching this repo's "one tool, one job" convention). Then copy the output
-file into the site repo and commit/deploy there (manual for now; no
-cross-repo automation exists yet).
+matching this repo's "one tool, one job" convention). The output file is then
+uploaded straight to the S3 bucket the site's interactive ROI report page
+reads from (2026-08-28) -- no more manual copy/deploy step. Pass
+--skip-upload to only write the local file (e.g. for a dry run, or when the
+`aws` CLI/credentials aren't set up).
 
 Usage:
     python export_club_league_picks_json.py
     python export_club_league_picks_json.py --output web_export/club_league_picks.json
+    python export_club_league_picks_json.py --skip-upload
 """
 import argparse
 import json
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from core.sports_db import DATABASE_PATH
@@ -41,6 +46,8 @@ from core.matchday import matchday_for_match
 from club_league_scorecard import _pick_profit
 
 DEFAULT_OUTPUT = Path(__file__).parent / "web_export" / "club_league_picks.json"
+S3_DESTINATION = "s3://minvest-data-bucket"
+S3_CACHE_CONTROL = "public, max-age=60"
 
 
 def market_for_side(side):
@@ -82,10 +89,25 @@ def build_export(rows):
     return export
 
 
+def upload_to_s3(file_path):
+    """Uploads file_path to S3_DESTINATION, mirroring the exact command this
+    was locked in with (2026-08-28). Raises on any failure -- an upload that
+    silently didn't happen is worse than a loud one that stops the run,
+    since a stale report file has no other signal to catch it."""
+    if shutil.which("aws") is None:
+        raise RuntimeError("aws CLI not found on PATH -- install/configure it, or pass --skip-upload.")
+    subprocess.run(
+        ["aws", "s3", "cp", str(file_path), S3_DESTINATION, "--cache-control", S3_CACHE_CONTROL],
+        check=True,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
                         help=f"Output JSON file path (default: {DEFAULT_OUTPUT}).")
+    parser.add_argument("--skip-upload", action="store_true",
+                        help=f"Write the local file only -- don't upload to {S3_DESTINATION}.")
     return parser.parse_args()
 
 
@@ -107,6 +129,12 @@ def main():
     print(f"  leagues: {', '.join(leagues) if leagues else '(none)'}")
     print(f"  date range: {dates[0]} to {dates[-1]}" if dates else "  date range: (no data)")
     print(f"  file size: {len(text.encode())} bytes")
+
+    if args.skip_upload:
+        print("  upload: skipped (--skip-upload)")
+    else:
+        upload_to_s3(args.output)
+        print(f"  upload: {S3_DESTINATION} (cache-control: {S3_CACHE_CONTROL})")
 
 
 if __name__ == "__main__":

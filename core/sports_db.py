@@ -750,6 +750,25 @@ def update_soccer_match_result(match_id, home_score, away_score,
         conn.close()
 
 
+def update_soccer_match_date(match_id, match_date):
+    """Correct a soccer match's kickoff date/time -- e.g. a source-side
+    reschedule (TV move, postponement) caught by import_league_matches.py's
+    conflict detection (BUG-024, 2026-08-31: this had no write path at all --
+    a flagged match_date conflict never actually got applied, even under
+    --allow-overwrite, because the only apply path was update_soccer_match_result,
+    which only ever touches score/status)."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE soccer_matches SET match_date = ? WHERE match_id = ?",
+            (match_date, match_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def add_soccer_betting_odds(match_id, sportsbook, odds_date,
                              home_moneyline=None, draw_moneyline=None,
                              away_moneyline=None,
