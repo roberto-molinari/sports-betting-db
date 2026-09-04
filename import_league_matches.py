@@ -87,6 +87,25 @@ def parse_args():
     return parser.parse_args()
 
 
+def _dates_equal(db_date, api_date):
+    """Compare two ISO-ish timestamp strings by actual instant, not literal text --
+    found live 2026-09-04 migrating Serie A: its rows (previously sourced from
+    football-data.org, various historical ingestion passes) store match_date in a
+    handful of formatting variants ("...T18:45:00Z", "...T18:45:00+00:00",
+    "...T00:00:00Z" for date-only rows) that don't match TheStatsAPI's own
+    ("...T18:45:00.000Z") byte-for-byte despite being the identical instant --
+    every one of Serie A's 60 currently-stamped matches falsely flagged as a
+    match_date CONFLICT on this script's very first real run for that league.
+    Falls back to a literal string compare if either side doesn't parse (never
+    silently treats a genuinely malformed date as equal)."""
+    if db_date == api_date:
+        return True
+    try:
+        return datetime.fromisoformat(db_date) == datetime.fromisoformat(api_date)
+    except ValueError:
+        return False
+
+
 def find_existing_match(conn, thestatsapi_match_id):
     """Return (match_id, home_score, away_score, match_date, match_status) for this
     TheStatsAPI match id if we already have it, else None."""
@@ -110,7 +129,7 @@ def compute_conflicts(existing, api_status, home_score, away_score, api_date):
         diffs.append(("match_status", db_status, api_status))
     if api_status == "completed" and (db_home != home_score or db_away != away_score):
         diffs.append(("score", f"{db_home}-{db_away}", f"{home_score}-{away_score}"))
-    if db_date != api_date:
+    if not _dates_equal(db_date, api_date):
         diffs.append(("match_date", db_date, api_date))
     return diffs
 
@@ -181,8 +200,7 @@ def main():
     entry = LEAGUES[args.league]
     comp_id = entry["thestatsapi_competition_id"]
     if comp_id is None:
-        sys.exit(f"'{args.league}' has no thestatsapi_competition_id configured in core/leagues.py "
-                 f"(it's still sourced from football-data.org -- see BUGS.md's Serie A fast-follow entry).")
+        sys.exit(f"'{args.league}' has no thestatsapi_competition_id configured in core/leagues.py.")
     import_all_statuses = has_odds_source(args.league)
 
     conn = sqlite3.connect(DATABASE_PATH)

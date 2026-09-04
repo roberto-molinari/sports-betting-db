@@ -6,9 +6,10 @@ single matchday or a day range.
 
 Steps, in order:
   1. Refresh results for every league with matches in the window, reusing
-     season_kickoff.py's import_fixtures() (import_league_matches.py for the
-     4 newer leagues, update_serie_a_results.py for Serie A) -- a refresh
-     failure for one league is logged and skipped, not fatal to the rest.
+     season_kickoff.py's import_fixtures() (import_league_matches.py for
+     every league now -- Serie A migrated onto this same pipeline
+     2026-09-04, BUGS.md) -- a refresh failure for one league is logged and
+     skipped, not fatal to the rest.
      Called with allow_overwrite=True (2026-08-23, BUGS.md) -- a scheduled
      match transitioning to completed with a real score is exactly what
      "refresh" means here, so it must actually be APPLIED, not just detected

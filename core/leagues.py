@@ -10,9 +10,15 @@ which also stay in code so model_metrics_report.py can record their exact values
 Fields:
   country                     matches soccer_teams.country; used by
                                ensure_soccer_team's cross-country collision check.
-  thestatsapi_competition_id  used by import_league_matches.py. None for Serie A,
-                               which stays on football-data.org until the tracked
-                               fast-follow migration (BUGS.md).
+  thestatsapi_competition_id  used by import_league_matches.py. Serie A's
+                               (comp_5840, registered 2026-09-04) is the last of
+                               the 5 top-flight leagues to switch onto this --
+                               its existing soccer_matches rows had to be
+                               reconciled/id-stamped first
+                               (migrate_serie_a_thestatsapi_ids.py, BUGS.md) since
+                               import_league_matches.py's dedup is keyed purely
+                               on this id; registering it before that step would
+                               have caused duplicate inserts.
   footballdatacouk_code       football-data.co.uk's CSV code (e.g. "E0"). None for
                                every feeder division -- no odds tracked there yet.
   odds_api_sport_key          The Odds API's sport key. None for the same reason.
@@ -32,7 +38,7 @@ The Odds API; E1/D2/SP2/F2/I2 on football-data.co.uk.
 LEAGUES = {
     "Serie A": {
         "country": "Italy",
-        "thestatsapi_competition_id": None,
+        "thestatsapi_competition_id": "comp_5840",
         "footballdatacouk_code": "I1",
         "odds_api_sport_key": "soccer_italy_serie_a",
         "lower_division": "Serie B",

@@ -130,6 +130,35 @@ def test_compute_conflicts_flags_a_postponed_match_date_change():
     assert diffs == [("match_date", "2026-09-13T15:30:00.000Z", "2026-09-20T15:30:00.000Z")]
 
 
+def test_compute_conflicts_treats_equivalent_date_formats_as_unchanged():
+    """Found live 2026-09-04 migrating Serie A: its rows (previously sourced
+    from football-data.org) store match_date without the ".000" milliseconds
+    TheStatsAPI's own format always has -- a literal string compare falsely
+    flagged every single Serie A match as a match_date CONFLICT on this
+    script's first real run for that league, even though the instant is
+    identical."""
+    existing = (1, None, None, "2026-09-13T15:30:00Z", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "scheduled", None, None, "2026-09-13T15:30:00.000Z")
+    assert diffs == []
+
+
+def test_compute_conflicts_still_flags_a_real_date_change_despite_format_normalization():
+    """The normalization must not swallow genuine postponements -- a real
+    instant change has to keep being flagged even when both sides happen to
+    use TheStatsAPI's own format."""
+    existing = (1, None, None, "2026-09-13T15:30:00.000Z", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "scheduled", None, None, "2026-09-20T15:30:00.000Z")
+    assert diffs == [("match_date", "2026-09-13T15:30:00.000Z", "2026-09-20T15:30:00.000Z")]
+
+
+def test_compute_conflicts_falls_back_to_string_compare_on_unparseable_date():
+    """A malformed date must not crash the comparison, and must never be
+    silently treated as a match just because parsing failed."""
+    existing = (1, None, None, "not-a-real-date", "scheduled")
+    diffs = league_matches.compute_conflicts(existing, "scheduled", None, None, "2026-09-20T15:30:00.000Z")
+    assert diffs == [("match_date", "not-a-real-date", "2026-09-20T15:30:00.000Z")]
+
+
 def test_resync_not_triggered_by_an_already_completed_match(db_path, conn):
     home = sports_db.ensure_soccer_team("Team Done", "Premier League", "England")
     away = sports_db.ensure_soccer_team("Team DoneOpp", "Premier League", "England")

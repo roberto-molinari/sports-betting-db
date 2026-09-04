@@ -1,8 +1,9 @@
 """
 Per-league team-name maps: a source's own team-name spelling -> the canonical
-name already stored in soccer_teams (TheStatsAPI-sourced for every league
-except Serie A, which stays on football-data.org until the tracked fast-follow
-migration -- see BUGS.md and core/leagues.py).
+name already stored in soccer_teams. Unrelated to which source populates
+soccer_matches (see core/leagues.py) -- this module is purely about matching
+ODDS-source team names (football-data.co.uk / The Odds API) onto whatever
+name is already canonical for that team, regardless of how it got there.
 
 Two source vocabularies share one map per league (canonical_team_name() is
 used by both): football-data.co.uk's short CSV names (historical odds,

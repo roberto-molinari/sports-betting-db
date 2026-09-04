@@ -1,4 +1,10 @@
 """
+SUPERSEDED 2026-09-04 (BUGS.md) -- Serie A migrated onto the same TheStatsAPI
+pipeline every other league already uses (import_league_matches.py). Nothing
+in this codebase calls this script automatically anymore (season_kickoff.py /
+club_league_scorecard.py both moved to import_league_matches.py for Serie A
+too). Left here for reference/manual one-off use only.
+
 Unified Serie A Results Updater
 ===============================
 Syncs the local database with the latest Serie A match results for a given season.

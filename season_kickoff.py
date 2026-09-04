@@ -12,9 +12,9 @@ For each division, in order:
      in the codebase allowed to change a team's league label (see BUGS.md
      FEATURE-019 -- ensure_soccer_team() itself deliberately never does this,
      to avoid an order-dependent correctness risk).
-  3. Import that season's fixtures, via the existing scripts
-     (import_league_matches.py for the 8 TheStatsAPI divisions,
-     update_serie_a_results.py for Serie A).
+  3. Import that season's fixtures via import_league_matches.py (every
+     division is on TheStatsAPI now -- Serie A was the last holdout,
+     migrated 2026-09-04, BUGS.md).
   4. Refresh squads (import_club_squads.py) -- transfer windows close right
      around season start, so last season's rosters are meaningfully stale.
   5. List any teams whose odds data didn't match this division's team names
@@ -45,31 +45,18 @@ from core.team_name_maps import canonical_team_name
 from core.thestatsapi import Client
 from import_club_squads import resolve_season_id
 import import_league_betting_odds as ilbo
-import update_serie_a_results as usr
 
 SENTINEL_LEAGUE = "(unknown - not seen this season)"
 
 
 def season_team_list(client, conn, league, season):
-    """Return [(name, ...)] for every team in `league` this season, from the
-    real data source -- TheStatsAPI's teams endpoint for the 8 divisions that
-    have one, football-data.org's teams endpoint for Serie A (the one division
-    still on that source). Returns None (not an empty list) if the season
+    """Return [(name, ...)] for every team in `league` this season, from
+    TheStatsAPI's teams endpoint -- every division in LEAGUES has a
+    thestatsapi_competition_id now (Serie A was the last holdout, migrated
+    2026-09-04, BUGS.md). Returns None (not an empty list) if the season
     doesn't resolve at all yet -- the caller's signal to skip this division
     cleanly rather than treating "nothing published yet" as "zero teams"."""
     cfg = LEAGUES[league]
-    if cfg["thestatsapi_competition_id"] is None:
-        api_key = os.getenv("FOOTBALL_DATA_API_KEY")
-        if not api_key:
-            print(f"  [{league}] FOOTBALL_DATA_API_KEY not set, skipping.")
-            return None
-        try:
-            teams, _ = usr.fetch_season_data(api_key, season)
-        except Exception as e:
-            print(f"  [{league}] season {season} not available yet ({e}), skipping.")
-            return None
-        return [usr.API_TEAM_NAME_MAP.get(t["name"], t["name"]) for t in teams]
-
     try:
         season_id = resolve_season_id(client, cfg["thestatsapi_competition_id"], season)
     except SystemExit as e:
@@ -103,44 +90,43 @@ def sync_league_membership(conn, league, names):
 
 
 def import_fixtures(league, season, allow_overwrite=False):
-    """allow_overwrite only affects the import_league_matches.py path (the 4
-    newer leagues) -- it threads through to that script's own --allow-overwrite
-    flag, applying a detected scheduled->completed/score conflict instead of
-    only reporting it (see import_league_matches.py's module docstring).
-    update_serie_a_results.py (Serie A's own path) has no such gate -- it always
-    applies fetched results directly, so this parameter is a no-op there.
-    Default False preserves this function's original report-only behavior for
-    existing callers (e.g. season_kickoff.py's own bootstrap run, where a human
-    reviewing conflicts before they're applied is the safer default); pass True
-    for a caller like club_league_scorecard.py's refresh step, where applying a
-    newly-completed match's real score is the entire point of "refresh" -- see
-    BUGS.md's entry on picks going ungraded because this was missed."""
-    if LEAGUES[league]["thestatsapi_competition_id"] is None:
-        subprocess.run([sys.executable, "update_serie_a_results.py", "--season", str(season)],
-                       check=True)
-    else:
-        cmd = [sys.executable, "import_league_matches.py", "--league", league, "--season", str(season)]
-        if allow_overwrite:
-            cmd.append("--allow-overwrite")
-        subprocess.run(cmd, check=True)
+    """allow_overwrite threads through to import_league_matches.py's own
+    --allow-overwrite flag, applying a detected scheduled->completed/score
+    conflict instead of only reporting it (see that script's module
+    docstring). Default False preserves this function's original report-only
+    behavior for existing callers (e.g. season_kickoff.py's own bootstrap
+    run, where a human reviewing conflicts before they're applied is the
+    safer default); pass True for a caller like club_league_scorecard.py's
+    refresh step, where applying a newly-completed match's real score is the
+    entire point of "refresh" -- see BUGS.md's entry on picks going ungraded
+    because this was missed.
 
-
-# Serie A has no thestatsapi_competition_id in core/leagues.py (deliberately --
-# it stays on football-data.org for MATCHES), but its SQUAD data still comes
-# from TheStatsAPI under a real id that a bare name search can't disambiguate
-# ("Serie A" also matches "LigaPro Serie A (Ecuador)"). Confirmed live
-# 2026-08-19; not in the shared registry since that field's meaning there is
-# specifically about the match-import source, and overloading it would make
-# import_league_matches.py wrongly skip the football-data.org path for
-# Serie A's matches.
-SERIE_A_SQUAD_COMPETITION_ID = "comp_5840"
+    Serie A (2026-09-04, BUGS.md): migrate_serie_a_thestatsapi_ids.py runs
+    FIRST, every time, before import_league_matches.py -- not a one-time
+    step. TheStatsAPI publishes a season's fixtures progressively (every
+    league shows this), and a handful of Serie A's own stored dates have
+    drifted up to 2 days from TheStatsAPI's real kickoff date once a fixture
+    plays out (a football-data.org quirk from Serie A's PRIOR pipeline, see
+    BUGS.md) -- wider than import_league_matches.py's own
+    DUPLICATE_FIXTURE_TOLERANCE_DAYS (1 day). Without this, a newly-published
+    Serie A fixture whose real date drifts >1 day from our already-existing
+    placeholder row could slip past that script's own duplicate-fixture
+    detection and get inserted as a genuine duplicate match. Stamping first
+    (its own 3-day tolerance, verified against every historical case) links
+    the newly-published fixture to the EXISTING row instead, so
+    import_league_matches.py sees it as already-known, not new."""
+    if league == "Serie A":
+        subprocess.run([sys.executable, "migrate_serie_a_thestatsapi_ids.py", "--apply"], check=True)
+    cmd = [sys.executable, "import_league_matches.py", "--league", league, "--season", str(season)]
+    if allow_overwrite:
+        cmd.append("--allow-overwrite")
+    subprocess.run(cmd, check=True)
 
 
 def refresh_squads(league, season):
-    cmd = [sys.executable, "import_club_squads.py", "--league", league, "--season", str(season)]
-    if league == "Serie A":
-        cmd += ["--competition-id", SERIE_A_SQUAD_COMPETITION_ID]
-    subprocess.run(cmd, check=True)
+    subprocess.run(
+        [sys.executable, "import_club_squads.py", "--league", league, "--season", str(season)],
+        check=True)
 
 
 def list_odds_name_gaps(conn, league):

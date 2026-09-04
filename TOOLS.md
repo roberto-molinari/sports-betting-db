@@ -68,11 +68,24 @@ automatically inside tools from the section above.
 
 **Already run for you — use these directly only for a manual backfill or fix:**
 - `import_league_matches.py` — `season_kickoff.py`'s bootstrap and
-  `club_league_scorecard.py`'s refresh step both call this already. Run it
-  yourself only to backfill a league/season that hasn't been bootstrapped, or
-  to force a resync outside the normal flow.
-- `update_serie_a_results.py` — same idea, Serie A-specific (its results sync
-  isn't on the TheStatsAPI pipeline yet, see `BUGS.md`).
+  `club_league_scorecard.py`'s refresh step both call this already, for
+  every league including Serie A (migrated onto this same TheStatsAPI
+  pipeline 2026-09-04, `BUGS.md`). Run it yourself only to backfill a
+  league/season that hasn't been bootstrapped, or to force a resync outside
+  the normal flow.
+- `migrate_serie_a_thestatsapi_ids.py` — Serie A-only, and only relevant
+  while its 2026-27 fixtures are still being published progressively by
+  TheStatsAPI: links a newly-published fixture to its existing placeholder
+  row before `import_league_matches.py` runs, so a real (but small) date
+  drift between Serie A's old data source and TheStatsAPI's own dates can't
+  slip past that script's duplicate-fixture detection. Already called
+  automatically for Serie A inside `import_fixtures()`
+  (`season_kickoff.py`) -- run it yourself only to check/re-check the link
+  state directly (defaults to a dry-run report).
+
+`update_serie_a_results.py` — **superseded 2026-09-04** (`BUGS.md`); Serie A
+is fully on the TheStatsAPI pipeline above now. Left in the repo for
+reference/manual one-off use only, not called by anything else anymore.
 
 **Model-work only, not routine ops** (needed when validating a new method or
 doing a calibration pass, not for posting today's picks):

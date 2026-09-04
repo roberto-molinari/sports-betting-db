@@ -155,10 +155,8 @@ def main():
     # multiple competitions, e.g. "Bundesliga" also matches "Austrian
     # Bundesliga"), so every squad refresh for those leagues failed and
     # required manual disambiguation. Explicit --competition-id still wins if
-    # passed. Serie A has no registry entry here (thestatsapi_competition_id
-    # is deliberately None -- it stays on football-data.org for MATCHES, see
-    # core/leagues.py) even though its SQUAD data does come from TheStatsAPI
-    # under a different id -- still needs manual --competition-id for now.
+    # passed. Every league in the registry (Serie A included as of
+    # 2026-09-04, BUGS.md) now has a real thestatsapi_competition_id.
     if args.competition_id is None:
         args.competition_id = LEAGUES.get(args.league, {}).get("thestatsapi_competition_id")
     try:

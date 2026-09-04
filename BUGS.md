@@ -9,6 +9,59 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-025 follow-on, deliverable 1 of 2 — Serie A -> TheStatsAPI migration, step 2: cut over the ongoing pipeline — **DONE 2026-09-04**
+
+Registered Serie A's `thestatsapi_competition_id` (`comp_5840`) in
+`core/leagues.py` -- only after step 1's stamping was independently verified
+stable, since registering it earlier would have let `import_league_matches.py`
+(whose dedup is keyed purely on `thestatsapi_match_id`) insert a duplicate
+row for every not-yet-stamped match. `season_kickoff.py`'s `import_fixtures()`
+now always runs `migrate_serie_a_thestatsapi_ids.py --apply` before
+`import_league_matches.py` for Serie A specifically (not a one-time step --
+TheStatsAPI publishes a season's fixtures progressively, and a newly-
+published Serie A fixture's date can drift further from our old placeholder
+row than `import_league_matches.py`'s own 1-day duplicate-fixture tolerance
+allows for). Removed the now-dead football-data.org branch from
+`season_team_list()` (every league in the registry has a real competition id
+now) and the redundant Serie-A-specific `--competition-id` special-case in
+`refresh_squads()` (the registry now supplies it automatically, same as every
+other league). `update_serie_a_results.py` is superseded, left in the repo
+for manual one-off use only -- nothing calls it automatically anymore.
+
+**A second real bug found running the actual cutover, not before shipping
+it:** forced a real end-to-end `import_league_matches.py --league "Serie A"`
+run (bypassing the resync-skip optimization to test it directly, since no
+match had crossed the 4-hour-past-kickoff threshold yet) and every single one
+of the 60 currently-stamped matches came back as a `match_date` CONFLICT --
+even ones whose printed stored/API values looked identical. Root cause:
+`compute_conflicts()` compared `match_date` by literal string equality.
+Serie A's rows (previously sourced from football-data.org across several
+historical ingestion passes) store the date in a few different but
+equivalent formats (`"...T18:45:00Z"`, `"...T18:45:00+00:00"`,
+`"...T00:00:00Z"` for old date-only rows) that never happened to be compared
+against TheStatsAPI's own format (`"...T18:45:00.000Z"`) before -- same
+instant, different bytes, silently never caught since this was Serie A's
+FIRST run against this comparison at all. Every other league was unaffected
+because their `match_date` was always populated FROM TheStatsAPI's own
+format in the first place, so this was invisible until Serie A's own history
+crossed paths with it. **Fix:** new `_dates_equal()` parses both sides with
+`datetime.fromisoformat()` before comparing (falls back to a literal string
+compare, never silently "equal", if either side doesn't parse) -- fixes it
+for every league, not just Serie A. New tests lock in: format-equivalent
+dates are NOT flagged, a genuine date change still IS flagged, and an
+unparseable date doesn't crash and isn't silently treated as a match.
+
+**Verified live, in order:** (1) re-ran `import_league_matches.py --league
+"Serie A" --season 2026` after the date-format fix -- `created=0` (no
+duplicates), `unchanged=46`, 13 genuine date conflicts (a real schedule shift
+for a batch of October fixtures plus a few kickoff-time changes) correctly
+flagged, 1 newly-finished match correctly classified as a routine completion
+rather than a conflict. (2) Re-ran the same league/season for Premier League
+as a regression check -- 0 conflicts, confirming the date-format fix doesn't
+introduce false conflicts elsewhere. (3) Applied `--allow-overwrite` for
+Serie A: `applied=14`, row count still exactly 380 (no duplicates), Genoa v
+Como's real 1-4 result recorded.
+
 ## BUG-025 follow-on, deliverable 1 of 2 — Serie A -> TheStatsAPI migration, step 1: stamp `thestatsapi_match_id` onto existing rows — **DONE 2026-09-04**
 
 Per BUG-025's tracked follow-on (Serie A must migrate onto TheStatsAPI before
