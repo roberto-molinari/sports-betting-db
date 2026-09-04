@@ -9,6 +9,96 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-025 — `generate_club_league_card.py` silently skipped the totals market for any posted line other than 2.5 — real, current +EV opportunities never even got evaluated — **REVERTED 2026-09-01 pending real validation (see below); diagnosis and finding still stand**
+
+- **Type:** missing market coverage (not a wrong number, a market never priced
+  at all) · **Severity:** medium (live opportunities silently dropped, no
+  error anywhere to notice by) · **Found:** 2026-09-01, investigating why
+  Ligue 1's PSG v Monaco card came back with no picks and no guardrail-log
+  detail at all -- traced to the match's posted total being 3.25, not 2.5.
+
+**Root cause.** The 2.5-only filter (`abs(float(ou_line) - 2.5) > 1e-9` ->
+`ou_line = None`, added when this script was first written 2026-08-07) was
+never a deliberate market-scope decision -- it matched reality at the time:
+Bet365's historical CSV data (football-data.co.uk, the only totals source
+that existed then) posts a total of exactly 2.5 for 100% of rows across
+every league/season checked (BUGS.md, 2026-08-07 totals-backtesting entry).
+Once live odds (The Odds API) started flowing through `--future-only`, real
+lines vary a lot -- checked live across all 5 leagues' matches since
+2026-08-01: only ~34% of posted lines are 2.5 (69/200); the rest range
+1.75-4.0. Every one of those non-2.5 matches had its totals market silently
+skipped, with no log line indicating anything was excluded (a candidate that
+was never built doesn't show up in the GUARDRAIL LOG, which only lists
+candidates that existed and got excluded) -- this is also what made the
+"why did PSG v Monaco come back empty" investigation confusing in the first
+place: nothing was wrong with the 1X2 candidates that were shown, the
+missing UNDER 3.25 candidate (p=0.653, EV +32.6%) never existed to begin
+with.
+
+**Initial fix (2026-09-01), since reverted.** Removed the 2.5-only filter --
+`analyse_match_wc()`'s totals math (`totals_probs()` over the Poisson grid)
+already handles any line correctly, and `core.grading.grade_pick()` already
+parses an arbitrary line back out of the `"OVER <line>"/"UNDER <line>"` side
+string (including integer-line pushes) -- neither the pricing math nor the
+grading path was ever the limiting factor, only this one filter.
+`build_candidates()` labeled totals candidates with whatever line was
+actually posted (`format_ou_line()`: `3.0 -> "3"`, `3.25 -> "3.25"`) instead
+of a hardcoded `"OVER 2.5"`/`"UNDER 2.5"`. Verified live: PSG v Monaco (line
+3.25) surfaced `UNDER 3.25 | odds +103 | model p 0.653 | EV +32.6%`.
+
+**Open validation gap.** Every piece of backtested evidence for the totals
+market's edge (BUGS.md, 2026-08-07: +8.2% ROI 2025 / +0.5% 2024) was measured
+ONLY at line 2.5 -- that's the only line that exists anywhere in the
+historical Bet365 CSV data used for backtesting, across every league/season.
+The initial fix meant the live card would generate real picks at lines the
+model's totals edge had never been validated against (e.g. 3.25, 1.75).
+
+**Early look at that question (2026-09-01).** soccer_model_predictions had
+zero season-2026 rows (the backfill script had only ever been run for closed
+historical seasons) -- backfilled all 5 leagues (poisson_v4_4, live-shipped
+defaults) to get real predictions against this season's actual results so
+far, then graded totals via backtest_from_predictions.py against Pinnacle
+(not Bet365 -- the live Odds API import path stores this season's non-2.5-
+line odds under Pinnacle/"User Book", zero under Bet365). Pooled across all
+5 leagues, EV>0%, split by whether the posted line was 2.5:
+
+| Line | Bets | Win rate | ROI |
+|---|---|---|---|
+| == 2.5 | 34 | 58.8% | **+17.5%** |
+| != 2.5 | 42 | 45.2% | **-12.5%** |
+| pooled | 76 | 51.3% | +0.9% |
+
+Directionally exactly the concern above -- the 2.5 line still looks good,
+non-2.5 lines look bad, split roughly breakeven pooled. **Not remotely
+conclusive**: this is 3-4 weeks of one in-progress season, per-league n is
+tiny (Bundesliga: 7 bets, one swing result moves ROI ±50%+).
+
+**Found a much better path to real validation, same session:** TheStatsAPI's
+`/matches/{match_id}/odds` endpoint (already the source for teams/matches/
+squads/player-stats in 4 of 5 leagues) returns a FULL totals ladder per
+match -- every half-goal line (0.5 through 7.5+) simultaneously, Bet365 odds,
+confirmed live against real completed matches from last season. That means a
+real multi-line, two-season historical backtest is possible: ~2,755
+completed matches (Premier League/Bundesliga/La Liga/Ligue 1, seasons 2024+
+2025, all already carry a thestatsapi_match_id) at one API call each, well
+within the 120 req/min rate limit (~23 minutes total). Serie A is excluded --
+it's still on the football-data.org pipeline with no thestatsapi_match_id.
+
+**Decision (2026-09-01): REVERTED the fix.** Generating real live picks
+against untested lines wasn't worth it given a real path to actually
+validating this exists and is cheap to execute. Reverted
+`generate_club_league_card.py`/its tests to the original 2.5-only behavior
+byte-for-byte (confirmed via `git diff`) -- the live card is back to exactly
+how it's behaved for the last few weeks. Two follow-on deliverables tracked,
+each its own commit:
+  1. Migrate Serie A onto the TheStatsAPI pipeline (the long-tracked
+     fast-follow from the original multi-league expansion plan) so all 5
+     leagues, not 4, can eventually get this validation and any other
+     TheStatsAPI-only capability.
+  2. Pull the TheStatsAPI odds ladder for the ~2,755 historical matches,
+     build a real multi-line totals backtest, and only THEN re-enable
+     non-2.5 lines in the live card if the numbers support it.
+
 ## BUG-024 — A source-side match reschedule (match_date CONFLICT) was detected but had no write path at all, even under `--allow-overwrite` — silently dropped a real, live Premier League match from the card window — **FIXED 2026-08-31**
 
 - **Type:** missing write path (a whole conflict category was detectable but

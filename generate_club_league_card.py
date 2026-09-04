@@ -255,7 +255,13 @@ def main():
 
         for row in date_rows:
             # Totals only priced when the posted line is 2.5 -- analyse_match_wc's
-            # p_over/p_under are computed at whatever ou_line is passed in.
+            # p_over/p_under are computed at whatever ou_line is passed in. Deliberately
+            # NOT generalized to arbitrary lines yet (reverted 2026-09-01, BUG-025):
+            # every backtested totals ROI number that justifies this market's inclusion
+            # was measured only at line 2.5 (the only line football-data.co.uk's
+            # historical Bet365 CSVs ever carried) -- see BUGS.md, BUG-025 for the plan
+            # to validate non-2.5 lines properly (TheStatsAPI's odds ladder) before
+            # re-enabling this.
             ou_line = row["over_under"]
             if ou_line is not None and abs(float(ou_line) - 2.5) > 1e-9:
                 ou_line = None
