@@ -9,6 +9,58 @@ Severity: **high** (materially wrong picks across many teams) ·
 
 ---
 
+## BUG-025 follow-on, deliverable 1 of 2 — Serie A -> TheStatsAPI migration, step 1: stamp `thestatsapi_match_id` onto existing rows — **DONE 2026-09-04**
+
+Per BUG-025's tracked follow-on (Serie A must migrate onto TheStatsAPI before
+it can get the same non-2.5 totals validation the other 4 leagues will).
+Backed up `sports_betting.db` first (`db_backups/`, gitignored) given this
+writes to real historical data.
+
+**Surprise found before writing anything:** assumed (from `core/leagues.py`'s
+comment, "Serie A ... stays on football-data.org ... even though its SQUAD
+data does come from TheStatsAPI under a different id") that Serie A's
+`soccer_matches` rows had NO `thestatsapi_match_id` at all. Actually: seasons
+2022-2025 (1,521 rows) already had one, apparently stamped by some earlier
+process this session has no record of. Only season 2026 (the current
+in-progress one, 380 rows) was genuinely unstamped.
+
+**Independently re-verified all 1,521 already-stamped historical rows anyway**
+(team-pairing + closest-date match against a fresh TheStatsAPI pull, plus a
+score check for every completed match) rather than trusting them blind:
+1,520 agreed exactly. **The one disagreement was a real wrong stamp**, not
+noise -- match_id 6997 (Spezia v Hellas Verona, 2022-23 season) was stamped
+to `mt_405804585` (2023-03-05, 0-0, a regular-season match), but our row's
+own stored date/score (2023-06-11, 1-3) matches a DIFFERENT TheStatsAPI
+match, `mt_012108033` (`stage_name: "final"`, matchday 29) -- the two teams
+met twice that season with the same orientation, apparently a genuine
+relegation-decider replay (this is also the "extra" 381st fixture noted in
+season 2022's count). Corrected the stamp on match_id 6997 directly.
+
+**Migration script:** `migrate_serie_a_thestatsapi_ids.py` (new) --
+team-name map (9 Serie A teams need one, e.g. "AC Milan"->"Milan", the rest
+match exactly) + closest-date match within a tolerance (Serie A's stored
+dates drift up to 2 days from TheStatsAPI's real kickoff in a handful of
+2025-26 matches -- a football-data.org quirk, every case checked was
+score-identical) + a hard score check before stamping any completed match
+(never silently trusts a date/team match alone). Defaults to dry-run;
+`--apply` required to write, and refuses to write at all if it finds a score
+mismatch or a reused TheStatsAPI id anywhere in the run. Ran `--apply`:
+stamped 60 of season 2026's 60 currently-published fixtures; the other 320
+found no confident match, which is expected, not a bug -- TheStatsAPI
+publishes a season's fixtures progressively (confirmed live: Premier League/
+Bundesliga/La Liga/Ligue 1 all show the exact same partial-current-season
+pattern today, in both TheStatsAPI's own data and our existing DB rows).
+
+**Deliberately NOT done here:** `core/leagues.py`'s `thestatsapi_competition_id`
+for Serie A is still `None`. Registering it now, before this step is
+verified stable, would be the actual risk -- `import_league_matches.py`'s
+dedup is keyed purely on `thestatsapi_match_id`
+(`find_existing_match()`), so any run for Serie A before every row is safely
+stamped would treat unstamped rows as brand new and insert duplicates. That
+registration + removing `season_kickoff.py`'s Serie A guardrail + retiring
+`update_serie_a_results.py` is deliverable 2, tracked separately, not
+executed yet.
+
 ## BUG-025 — `generate_club_league_card.py` silently skipped the totals market for any posted line other than 2.5 — real, current +EV opportunities never even got evaluated — **REVERTED 2026-09-01 pending real validation (see below); diagnosis and finding still stand**
 
 - **Type:** missing market coverage (not a wrong number, a market never priced

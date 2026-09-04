@@ -40,3 +40,8 @@ web_export/
 # Editor/IDE-local config and scratch files
 .vscode/
 *.session.sql
+
+# Local pre-change DB snapshots (sports_betting.db is already tracked in git,
+# so history is recoverable there too -- these are just a fast local revert
+# during a risky migration, not meant to be committed)
+db_backups/
